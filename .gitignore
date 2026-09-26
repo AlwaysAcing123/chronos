@@ -1,0 +1,37 @@
+# Build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+Testing/
+compile_commands.json
+
+# Market data and licensed artifacts
+data/raw/
+data/normalized/
+data/downloads/
+*.dbn
+*.dbn.zst
+*.pcap
+*.pcap.zst
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated runtime artifacts
+logs/
+artifacts/
+reports/generated/
+models/artifacts/
+
+# Operating-system and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
