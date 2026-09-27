@@ -1,5 +1,6 @@
 #include "chronos/databento/equities_mini_mbp1_file_reader.hpp"
 #include "chronos/databento/historical_recording_acquisition.hpp"
+#include "chronos/market_replay.hpp"
 #include "test_support.hpp"
 
 #include <databento/constants.hpp>
@@ -57,6 +58,8 @@ using adapter::RecordingManifestWriteErrorCode;
 using adapter::RecordingManifestWriteSuccess;
 using chronos::MarketDataQualityFlag;
 using chronos::MarketDataStreamId;
+using chronos::MarketReplay;
+using chronos::MarketReplayStep;
 using chronos::TopOfBookEvent;
 using chronos::TradeEvent;
 using chronos::ValidatedMarketEvent;
@@ -827,6 +830,68 @@ void test_ingest_sequence_exhaustion_stays_structured() {
     );
 }
 
+struct ReplayOutcome {
+    chronos::CurrentMarketView market_view;
+    std::optional<chronos::Timestamp> replay_time;
+    std::vector<MarketReplayStep> steps;
+
+    friend bool operator==(const ReplayOutcome&, const ReplayOutcome&) =
+        default;
+};
+
+ReplayOutcome replay_recording(const std::filesystem::path& path) {
+    const MarketDataStreamId stream("dbn-replay");
+    auto reader = require_reader(
+        EquitiesMiniMbp1FileReader::open(path, stream)
+    );
+    MarketReplay replay(stream);
+    std::vector<MarketReplayStep> steps;
+
+    while (true) {
+        auto read_result = reader->read_next();
+        if (std::holds_alternative<EndOfRecording>(read_result)) {
+            break;
+        }
+        REQUIRE(std::holds_alternative<ValidatedMarketEvent>(read_result));
+        auto replay_result = replay.accept(
+            std::get<ValidatedMarketEvent>(read_result)
+        );
+        REQUIRE(std::holds_alternative<MarketReplayStep>(replay_result));
+        steps.push_back(
+            std::get<MarketReplayStep>(std::move(replay_result))
+        );
+    }
+
+    return ReplayOutcome{
+        .market_view = replay.market_view(),
+        .replay_time = replay.clock().current_time(),
+        .steps = std::move(steps),
+    };
+}
+
+void test_dbn_recording_replays_identically_into_market_view() {
+    TemporaryDbnFile file;
+    file.write_compressed(valid_metadata(), valid_records());
+
+    const ReplayOutcome first = replay_recording(file.path());
+    const ReplayOutcome second = replay_recording(file.path());
+    REQUIRE(second == first);
+    REQUIRE(first.steps.size() == 3);
+
+    const auto* aapl = first.market_view.find(
+        chronos::InstrumentId("AAPL")
+    );
+    REQUIRE(aapl != nullptr);
+    REQUIRE(aapl->top_of_book.has_value());
+    REQUIRE(!aapl->last_trade.has_value());
+
+    const auto* spy = first.market_view.find(chronos::InstrumentId("SPY"));
+    REQUIRE(spy != nullptr);
+    REQUIRE(spy->last_trade.has_value());
+    REQUIRE(spy->top_of_book.has_value());
+    REQUIRE(first.replay_time == spy->top_of_book->header.receive_timestamp);
+}
+
 void test_historical_acquisition_is_cost_bounded_and_write_once() {
     TemporaryDbnFile source;
     source.write_compressed(valid_metadata(), valid_records());
@@ -1017,6 +1082,10 @@ int main() {
         {
             "sequence exhaustion",
             test_ingest_sequence_exhaustion_stays_structured,
+        },
+        {
+            "deterministic DBN replay",
+            test_dbn_recording_replays_identically_into_market_view,
         },
         {
             "historical acquisition",

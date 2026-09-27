@@ -75,6 +75,21 @@ target_link_libraries(chronos_market_data
     PRIVATE chronos_build_options
 )
 
+add_library(chronos_market_replay
+    core/src/current_market_view.cpp
+    core/src/market_replay.cpp
+    core/src/replay_clock.cpp
+)
+
+target_include_directories(chronos_market_replay
+    PUBLIC core/include
+)
+
+target_link_libraries(chronos_market_replay
+    PUBLIC chronos_market_data
+    PRIVATE chronos_build_options
+)
+
 if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
     include(FetchContent)
 
@@ -171,6 +186,21 @@ if(BUILD_TESTING)
         COMMAND chronos_market_data_stream_tests
     )
 
+    add_executable(chronos_market_replay_tests
+        tests/market_replay_tests.cpp
+    )
+
+    target_link_libraries(chronos_market_replay_tests
+        PRIVATE
+            chronos_market_replay
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_market_replay_tests
+        COMMAND chronos_market_replay_tests
+    )
+
     if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
         add_executable(chronos_databento_adapter_tests
             tests/databento_equities_mini_mbp1_tests.cpp
@@ -194,6 +224,7 @@ if(BUILD_TESTING)
         target_link_libraries(chronos_databento_file_reader_tests
             PRIVATE
                 chronos_databento_adapter
+                chronos_market_replay
                 chronos_build_options
         )
 
