@@ -20,6 +20,15 @@ enum class RoundingMode {
 
 namespace detail {
 
+#if !defined(__SIZEOF_INT128__)
+#error "Chronos fixed-point arithmetic requires a signed 128-bit integer type"
+#endif
+
+// Clang and GCC provide this extension for overflow-safe intermediate
+// arithmetic. Keeping it behind one alias documents and isolates the
+// non-standard type while preserving strict warnings everywhere else.
+__extension__ typedef __int128 WideInteger;
+
 consteval int decimal_places_for_scale(std::int64_t scale) {
     if (scale <= 0) {
         return -1;
@@ -36,7 +45,7 @@ consteval int decimal_places_for_scale(std::int64_t scale) {
     return decimal_places;
 }
 
-inline std::int64_t checked_int64(__int128 value) {
+inline std::int64_t checked_int64(WideInteger value) {
     if (value < std::numeric_limits<std::int64_t>::min() ||
         value > std::numeric_limits<std::int64_t>::max()) {
         throw std::overflow_error("fixed-point result exceeds the int64 range");
@@ -45,7 +54,7 @@ inline std::int64_t checked_int64(__int128 value) {
 }
 
 inline std::int64_t rounded_divide(
-    __int128 numerator,
+    WideInteger numerator,
     std::int64_t denominator,
     RoundingMode mode
 ) {
@@ -54,9 +63,9 @@ inline std::int64_t rounded_divide(
     }
 
     const bool negative = numerator < 0;
-    const __int128 magnitude = negative ? -numerator : numerator;
-    __int128 quotient = magnitude / denominator;
-    const __int128 remainder = magnitude % denominator;
+    const WideInteger magnitude = negative ? -numerator : numerator;
+    WideInteger quotient = magnitude / denominator;
+    const WideInteger remainder = magnitude % denominator;
 
     if (mode == RoundingMode::HalfAwayFromZero && remainder * 2 >= denominator) {
         ++quotient;
@@ -98,11 +107,13 @@ public:
             throw std::invalid_argument("fixed-point text has no digits");
         }
 
-        constexpr __int128 maximum_magnitude =
-            static_cast<__int128>(std::numeric_limits<std::int64_t>::max()) + 1;
-        constexpr __int128 maximum_whole = maximum_magnitude / Scale;
+        constexpr detail::WideInteger maximum_magnitude =
+            static_cast<detail::WideInteger>(
+                std::numeric_limits<std::int64_t>::max()
+            ) + 1;
+        constexpr detail::WideInteger maximum_whole = maximum_magnitude / Scale;
 
-        __int128 whole = 0;
+        detail::WideInteger whole = 0;
         bool saw_digit = false;
         while (index < text.size() && text[index] != '.') {
             const char character = text[index++];
@@ -118,7 +129,7 @@ public:
             whole = whole * 10 + digit;
         }
 
-        __int128 fractional = 0;
+        detail::WideInteger fractional = 0;
         std::size_t fractional_digits = 0;
         if (index < text.size()) {
             ++index;
@@ -147,8 +158,8 @@ public:
             ++fractional_digits;
         }
 
-        const __int128 magnitude = whole * Scale + fractional;
-        const __int128 allowed_magnitude = negative
+        const detail::WideInteger magnitude = whole * Scale + fractional;
+        const detail::WideInteger allowed_magnitude = negative
             ? maximum_magnitude
             : std::numeric_limits<std::int64_t>::max();
         if (magnitude > allowed_magnitude) {
@@ -163,7 +174,8 @@ public:
 
     [[nodiscard]] std::string to_string() const {
         const bool negative = raw_ < 0;
-        const __int128 magnitude = negative ? -static_cast<__int128>(raw_) : raw_;
+        const detail::WideInteger magnitude =
+            negative ? -static_cast<detail::WideInteger>(raw_) : raw_;
         const auto whole = static_cast<std::uint64_t>(magnitude / Scale);
         const auto fractional = static_cast<std::uint64_t>(magnitude % Scale);
 
@@ -188,13 +200,13 @@ public:
 
     friend FixedDecimal operator+(FixedDecimal left, FixedDecimal right) {
         return from_raw(detail::checked_int64(
-            static_cast<__int128>(left.raw_) + right.raw_
+            static_cast<detail::WideInteger>(left.raw_) + right.raw_
         ));
     }
 
     friend FixedDecimal operator-(FixedDecimal left, FixedDecimal right) {
         return from_raw(detail::checked_int64(
-            static_cast<__int128>(left.raw_) - right.raw_
+            static_cast<detail::WideInteger>(left.raw_) - right.raw_
         ));
     }
 
@@ -223,7 +235,7 @@ inline Money calculate_notional(
     RoundingMode mode = RoundingMode::HalfAwayFromZero
 ) {
     return Money::from_raw(detail::rounded_divide(
-        static_cast<__int128>(price.raw()) * quantity.raw(),
+        static_cast<detail::WideInteger>(price.raw()) * quantity.raw(),
         Price::scale(),
         mode
     ));
@@ -239,7 +251,7 @@ inline Money proportional_amount(
         throw std::invalid_argument("invalid fixed-point proportion");
     }
     return Money::from_raw(detail::rounded_divide(
-        static_cast<__int128>(total.raw()) * part.raw(),
+        static_cast<detail::WideInteger>(total.raw()) * part.raw(),
         whole.raw(),
         mode
     ));
@@ -254,7 +266,7 @@ inline Price average_price(
         throw std::invalid_argument("average price requires positive quantity and cost");
     }
     return Price::from_raw(detail::rounded_divide(
-        static_cast<__int128>(cost_basis.raw()) * Price::scale(),
+        static_cast<detail::WideInteger>(cost_basis.raw()) * Price::scale(),
         quantity.raw(),
         mode
     ));
