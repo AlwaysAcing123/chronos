@@ -76,7 +76,16 @@ The recording manifest does not exist until the reader reaches a clean end-of-fi
 
 ## Current boundary
 
-The adapter can now read an existing historical DBN recording and emit validated events. It does not download licensed data, persist normalized events, or replay them on a clock. The next increment will obtain a short real `AAPL` and `SPY` recording, inspect its manifest and events, and preserve a legal repository-safe fixture or reproducible acquisition instructions.
+The adapter can quote and safely acquire a historical DBN recording, read it,
+and emit validated events. Acquisition requires an explicit maximum quoted
+cost, refuses overwrites, and publishes a manifest only after full validation.
+The workflow is documented in `docs/historical-data-acquisition.md`.
+
+The repository still has no preserved real `AAPL`/`SPY` recording because raw
+licensed data cannot be committed and a local API key is required. It also
+does not persist normalized events or replay them on a clock. The next
+increment will run the documented short request locally, inspect its manifest
+and events, and then implement deterministic replay.
 
 ## References
 

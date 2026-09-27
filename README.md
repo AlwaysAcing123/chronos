@@ -17,14 +17,14 @@ Chronos simulates trading only. It does not place real-money orders.
 - Optional Databento `EQUS.MINI` MBP-1 record normalizer
 - Streaming DBN file ingestion with timestamp-aware symbol resolution
 - Checksum-backed, write-once recording manifests
+- Quote-first, cost-bounded historical DBN acquisition
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
 - Unit and edge-case tests for arithmetic, accounting, and market data
 
-The project does not yet ingest market data, replay markets, accept orders, or
-provide an API or web application. See [plan.md](plan.md) for the complete
-roadmap.
+The project does not yet replay markets, accept orders, or provide an API or
+web application. See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -80,6 +80,12 @@ Provider tests generate synthetic DBN recordings with the official SDK. They
 exercise metadata, decoding, symbol mapping, normalization, source-integrity,
 and manifest edge cases without an API key or licensed market-data download.
 
+The optional build also creates `chronos_databento_historical`, a JSON-output
+command-line tool that quotes and downloads small real recordings. It refuses
+to download without an explicit maximum quoted cost and never overwrites an
+existing recording. See
+[docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
+
 ## Repository map
 
 ```text
@@ -101,8 +107,8 @@ Pushes to `main` and manual runs also receive an AppleClang check on macOS 15.
 ## Data and credentials
 
 Raw or normalized licensed market data, credentials, model artifacts, build
-outputs, and generated reports must not be committed. Provider credentials
-will be read from local environment variables when data ingestion is added.
+outputs, and generated reports must not be committed. Provider credentials are
+read from local environment variables and never passed on the command line.
 
 The normalized event contract is documented in
 [docs/market-data-contract.md](docs/market-data-contract.md). The provider
@@ -112,5 +118,7 @@ The first provider mapping is documented in
 [docs/databento-adapter.md](docs/databento-adapter.md).
 Recording integrity and manifest semantics are documented in
 [docs/recording-manifest.md](docs/recording-manifest.md).
+Real-data quoting and guarded downloads are documented in
+[docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

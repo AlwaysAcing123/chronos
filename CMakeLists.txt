@@ -94,8 +94,10 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
     FetchContent_MakeAvailable(databento)
 
     add_library(chronos_databento_adapter
+        adapters/databento/src/databento_historical_recording_provider.cpp
         adapters/databento/src/equities_mini_mbp1_file_reader.cpp
         adapters/databento/src/equities_mini_mbp1_normalizer.cpp
+        adapters/databento/src/historical_recording_acquisition.cpp
         adapters/databento/src/recording_manifest.cpp
     )
 
@@ -108,6 +110,16 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
             chronos_market_data
             databento::databento
         PRIVATE chronos_build_options
+    )
+
+    add_executable(chronos_databento_historical
+        tools/databento_historical.cpp
+    )
+
+    target_link_libraries(chronos_databento_historical
+        PRIVATE
+            chronos_databento_adapter
+            chronos_build_options
     )
 endif()
 

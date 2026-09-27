@@ -1,4 +1,5 @@
 #include "chronos/databento/equities_mini_mbp1_file_reader.hpp"
+#include "chronos/databento/historical_recording_acquisition.hpp"
 #include "test_support.hpp"
 
 #include <databento/constants.hpp>
@@ -41,6 +42,16 @@ using adapter::EquitiesMiniMbp1FileErrorCode;
 using adapter::EquitiesMiniMbp1FileOpenResult;
 using adapter::EquitiesMiniMbp1FileReadResult;
 using adapter::EquitiesMiniMbp1FileReader;
+using adapter::HistoricalRecordingAcquisitionRequest;
+using adapter::HistoricalRecordingAcquisitionResult;
+using adapter::HistoricalRecordingAcquisitionSuccess;
+using adapter::HistoricalRecordingDownloadResult;
+using adapter::HistoricalRecordingError;
+using adapter::HistoricalRecordingErrorCode;
+using adapter::HistoricalRecordingProvider;
+using adapter::HistoricalRecordingQuery;
+using adapter::HistoricalRecordingQuote;
+using adapter::HistoricalRecordingQuoteResult;
 using adapter::RecordingManifestWriteError;
 using adapter::RecordingManifestWriteErrorCode;
 using adapter::RecordingManifestWriteSuccess;
@@ -226,6 +237,143 @@ public:
 private:
     std::filesystem::path path_;
 };
+
+class TemporaryRecordingDestination final {
+public:
+    TemporaryRecordingDestination() {
+        static std::uint64_t next_id = 0;
+        const auto timestamp = std::chrono::steady_clock::now()
+                                   .time_since_epoch()
+                                   .count();
+        path_ = std::filesystem::temp_directory_path() /
+            ("chronos-recording-" + std::to_string(timestamp) + "-" +
+             std::to_string(next_id++) + ".dbn.zst");
+    }
+
+    ~TemporaryRecordingDestination() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+        std::filesystem::remove(manifest_path(), ignored);
+    }
+
+    TemporaryRecordingDestination(
+        const TemporaryRecordingDestination&
+    ) = delete;
+    TemporaryRecordingDestination& operator=(
+        const TemporaryRecordingDestination&
+    ) = delete;
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+    [[nodiscard]] std::filesystem::path manifest_path() const {
+        return path_.string() + ".manifest.json";
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+HistoricalRecordingError historical_error(
+    HistoricalRecordingErrorCode code,
+    std::string message
+) {
+    return HistoricalRecordingError{
+        .code = code,
+        .field = "fake_provider",
+        .message = std::move(message),
+        .recording_error = std::nullopt,
+        .manifest_error = std::nullopt,
+    };
+}
+
+class FakeHistoricalRecordingProvider final
+    : public HistoricalRecordingProvider {
+public:
+    explicit FakeHistoricalRecordingProvider(
+        std::filesystem::path source_recording,
+        HistoricalRecordingQuote quote = HistoricalRecordingQuote{
+            .estimated_record_count = 2,
+            .estimated_billable_size_bytes = 1'024,
+            .estimated_cost_usd = 0.01,
+        }
+    ) : source_recording_(std::move(source_recording)), quote_(quote) {}
+
+    [[nodiscard]] HistoricalRecordingQuoteResult quote(
+        const HistoricalRecordingQuery&
+    ) override {
+        ++quote_calls;
+        if (quote_error) {
+            return *quote_error;
+        }
+        return quote_;
+    }
+
+    [[nodiscard]] HistoricalRecordingDownloadResult download_to_file(
+        const HistoricalRecordingQuery&,
+        const std::filesystem::path& destination
+    ) override {
+        ++download_calls;
+        if (download_error) {
+            return *download_error;
+        }
+        std::error_code copy_error;
+        std::filesystem::copy_file(
+            source_recording_,
+            destination,
+            std::filesystem::copy_options::overwrite_existing,
+            copy_error
+        );
+        if (copy_error) {
+            return historical_error(
+                HistoricalRecordingErrorCode::ProviderDownloadFailed,
+                copy_error.message()
+            );
+        }
+        return std::monostate{};
+    }
+
+    std::optional<HistoricalRecordingError> quote_error;
+    std::optional<HistoricalRecordingError> download_error;
+    std::uint64_t quote_calls{0};
+    std::uint64_t download_calls{0};
+
+private:
+    std::filesystem::path source_recording_;
+    HistoricalRecordingQuote quote_;
+};
+
+HistoricalRecordingQuery valid_historical_query() {
+    return HistoricalRecordingQuery{
+        .start = "2024-01-02T14:30:00Z",
+        .end = "2024-01-02T14:31:00Z",
+        .symbols = {"AAPL", "SPY"},
+    };
+}
+
+HistoricalRecordingAcquisitionSuccess require_acquisition_success(
+    HistoricalRecordingAcquisitionResult result
+) {
+    REQUIRE(std::holds_alternative<HistoricalRecordingAcquisitionSuccess>(
+        result
+    ));
+    return std::get<HistoricalRecordingAcquisitionSuccess>(
+        std::move(result)
+    );
+}
+
+HistoricalRecordingError require_acquisition_error(
+    HistoricalRecordingAcquisitionResult result,
+    HistoricalRecordingErrorCode code
+) {
+    REQUIRE(std::holds_alternative<HistoricalRecordingError>(result));
+    auto error = std::get<HistoricalRecordingError>(std::move(result));
+    REQUIRE(error.code == code);
+    REQUIRE(!error.field.empty());
+    REQUIRE(!error.message.empty());
+    return error;
+}
 
 std::unique_ptr<EquitiesMiniMbp1FileReader> require_reader(
     EquitiesMiniMbp1FileOpenResult result
@@ -679,6 +827,143 @@ void test_ingest_sequence_exhaustion_stays_structured() {
     );
 }
 
+void test_historical_acquisition_is_cost_bounded_and_write_once() {
+    TemporaryDbnFile source;
+    source.write_compressed(valid_metadata(), valid_records());
+    TemporaryRecordingDestination destination;
+    FakeHistoricalRecordingProvider provider(source.path());
+
+    const auto success = require_acquisition_success(
+        adapter::acquire_historical_recording(
+            provider,
+            HistoricalRecordingAcquisitionRequest{
+                .query = valid_historical_query(),
+                .destination = destination.path(),
+                .stream = MarketDataStreamId("historical-acquisition"),
+                .maximum_cost_usd = 0.02,
+            }
+        )
+    );
+
+    REQUIRE(provider.quote_calls == 1);
+    REQUIRE(provider.download_calls == 1);
+    REQUIRE(success.quote.estimated_cost_usd == 0.01);
+    REQUIRE(success.recording_path == destination.path());
+    REQUIRE(success.manifest_path == destination.manifest_path());
+    REQUIRE(std::filesystem::is_regular_file(destination.path()));
+    REQUIRE(std::filesystem::is_regular_file(destination.manifest_path()));
+    REQUIRE(success.manifest.source_file_name() ==
+        destination.path().filename().string());
+    REQUIRE(success.manifest.provider_record_count() == 2);
+    REQUIRE(success.manifest.normalized_event_count() == 3);
+
+    const auto permissions =
+        std::filesystem::status(destination.path()).permissions();
+    REQUIRE(
+        (permissions & std::filesystem::perms::owner_write) ==
+        std::filesystem::perms::none
+    );
+
+    require_acquisition_error(
+        adapter::acquire_historical_recording(
+            provider,
+            HistoricalRecordingAcquisitionRequest{
+                .query = valid_historical_query(),
+                .destination = destination.path(),
+                .stream = MarketDataStreamId("historical-acquisition"),
+                .maximum_cost_usd = 0.02,
+            }
+        ),
+        HistoricalRecordingErrorCode::DestinationAlreadyExists
+    );
+    REQUIRE(provider.quote_calls == 1);
+    REQUIRE(provider.download_calls == 1);
+}
+
+void test_historical_acquisition_refuses_cost_above_limit() {
+    TemporaryDbnFile source;
+    source.write(valid_metadata(), valid_records());
+    TemporaryRecordingDestination destination;
+    FakeHistoricalRecordingProvider provider(
+        source.path(),
+        HistoricalRecordingQuote{
+            .estimated_record_count = 2,
+            .estimated_billable_size_bytes = 1'024,
+            .estimated_cost_usd = 0.25,
+        }
+    );
+
+    require_acquisition_error(
+        adapter::acquire_historical_recording(
+            provider,
+            HistoricalRecordingAcquisitionRequest{
+                .query = valid_historical_query(),
+                .destination = destination.path(),
+                .stream = MarketDataStreamId("cost-limit"),
+                .maximum_cost_usd = 0.10,
+            }
+        ),
+        HistoricalRecordingErrorCode::CostLimitExceeded
+    );
+
+    REQUIRE(provider.quote_calls == 1);
+    REQUIRE(provider.download_calls == 0);
+    REQUIRE(!std::filesystem::exists(destination.path()));
+    REQUIRE(!std::filesystem::exists(destination.manifest_path()));
+}
+
+void test_historical_acquisition_cleans_failed_download() {
+    TemporaryDbnFile source;
+    source.write(valid_metadata(), valid_records());
+    TemporaryRecordingDestination destination;
+    FakeHistoricalRecordingProvider provider(source.path());
+    provider.download_error = historical_error(
+        HistoricalRecordingErrorCode::ProviderDownloadFailed,
+        "simulated download failure"
+    );
+
+    require_acquisition_error(
+        adapter::acquire_historical_recording(
+            provider,
+            HistoricalRecordingAcquisitionRequest{
+                .query = valid_historical_query(),
+                .destination = destination.path(),
+                .stream = MarketDataStreamId("download-failure"),
+                .maximum_cost_usd = 0.02,
+            }
+        ),
+        HistoricalRecordingErrorCode::ProviderDownloadFailed
+    );
+
+    REQUIRE(provider.download_calls == 1);
+    REQUIRE(!std::filesystem::exists(destination.path()));
+    REQUIRE(!std::filesystem::exists(destination.manifest_path()));
+}
+
+void test_historical_acquisition_removes_invalid_recording() {
+    TemporaryDbnFile invalid_source;
+    std::ofstream(invalid_source.path(), std::ios::binary) << "not dbn";
+    TemporaryRecordingDestination destination;
+    FakeHistoricalRecordingProvider provider(invalid_source.path());
+
+    const auto error = require_acquisition_error(
+        adapter::acquire_historical_recording(
+            provider,
+            HistoricalRecordingAcquisitionRequest{
+                .query = valid_historical_query(),
+                .destination = destination.path(),
+                .stream = MarketDataStreamId("invalid-download"),
+                .maximum_cost_usd = 0.02,
+            }
+        ),
+        HistoricalRecordingErrorCode::RecordingValidationFailed
+    );
+
+    REQUIRE(error.recording_error.has_value());
+    REQUIRE(!std::filesystem::exists(destination.path()));
+    REQUIRE(!std::filesystem::exists(destination.manifest_path()));
+}
+
 }  // namespace
 
 int main() {
@@ -732,6 +1017,22 @@ int main() {
         {
             "sequence exhaustion",
             test_ingest_sequence_exhaustion_stays_structured,
+        },
+        {
+            "historical acquisition",
+            test_historical_acquisition_is_cost_bounded_and_write_once,
+        },
+        {
+            "historical cost limit",
+            test_historical_acquisition_refuses_cost_above_limit,
+        },
+        {
+            "historical download cleanup",
+            test_historical_acquisition_cleans_failed_download,
+        },
+        {
+            "invalid historical recording cleanup",
+            test_historical_acquisition_removes_invalid_recording,
         },
     });
 }
