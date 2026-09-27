@@ -83,9 +83,10 @@ The workflow is documented in `docs/historical-data-acquisition.md`.
 
 The repository still has no preserved real `AAPL`/`SPY` recording because raw
 licensed data cannot be committed and a local API key is required. It also
-does not persist normalized events or replay them on a clock. The next
-increment will run the documented short request locally, inspect its manifest
-and events, and then implement deterministic replay.
+does not persist normalized events. The provider-independent replay engine can
+already consume the adapter's validated event stream; the next data increment
+will run the documented short request locally and inspect its manifest,
+events, and final market view.
 
 ## References
 

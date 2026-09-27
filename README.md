@@ -18,6 +18,7 @@ Chronos simulates trading only. It does not place real-money orders.
 - Streaming DBN file ingestion with timestamp-aware symbol resolution
 - Checksum-backed, write-once recording manifests
 - Quote-first, cost-bounded historical DBN acquisition
+- Deterministic receive-time replay clock and current market view
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
@@ -120,5 +121,7 @@ Recording integrity and manifest semantics are documented in
 [docs/recording-manifest.md](docs/recording-manifest.md).
 Real-data quoting and guarded downloads are documented in
 [docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
+Replay time, ordering, reset, and market-view semantics are documented in
+[docs/market-replay.md](docs/market-replay.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).
