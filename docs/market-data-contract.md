@@ -4,7 +4,7 @@
 
 This document defines the provider-independent market-data values that Chronos components exchange. Provider adapters translate external records into this contract. Replay, market views, features, execution, and accounting must not depend on provider record types.
 
-The contract is structural. Semantic acceptance rules and structured validation errors are implemented in the next market-data validation step.
+Newly normalized values are untrusted `MarketEvent` objects. They become `ValidatedMarketEvent` objects only after passing the single-event rules in this document. Components after this boundary accept validated events rather than relying on every caller to remember the same checks.
 
 ## Strong identifiers
 
@@ -72,10 +72,53 @@ An instrument-definition event contains the display symbol, currency, minimum pr
 
 An adapter may produce more than one Chronos event from one provider record. For example, a provider record can contain a trade and the resulting top of book. Each emitted Chronos event receives its own ingest sequence so ordering remains total and reproducible.
 
+## Validation boundary
+
+`validate_market_event` consumes an untrusted `MarketEvent` and returns one of two explicit outcomes:
+
+- `ValidatedMarketEvent`, which preserves the accepted event and can be constructed only by the validator
+- `MarketEventValidationFailure`, which contains every detected error in deterministic order
+
+Expected data-quality failures do not throw exceptions. Each error contains a stable code, a field path, and a human-readable message. This supports machine-readable metrics and useful diagnostics without making malformed external data an exceptional control-flow mechanism. Valid events do not allocate a collection of errors; error collection occurs only on the rejection path.
+
+### Header rules
+
+- Event and receive timestamps must not be negative.
+- Receive time may precede event time only when `QuestionableReceiveTimestamp` is present. Distributed clocks and replay sources can make such observations real, so the flag preserves them without silently presenting the timing as trustworthy.
+- Every quality bit must belong to the normalized Chronos quality vocabulary. Raw provider bits must be mapped rather than copied.
+- Ingest sequence zero is valid. Monotonicity, duplicates, and gaps require stream history and are not single-event rules.
+
+### Trade rules
+
+- Price and quantity must be positive.
+- Buy, sell, and unknown aggressor sides are valid. Any value outside the declared enum is rejected.
+
+### Top-of-book rules
+
+- Each present bid or ask level must have positive price and quantity.
+- One-sided books and fully cleared books are valid normalized states.
+- A locked book, where bid equals ask, is valid.
+- A crossed book, where bid exceeds ask, must carry `PotentiallyInvalidBook`. The observation remains recordable, but later execution code must not treat a suspect book as automatically tradeable.
+
+### Market-status rules
+
+The declared unknown, pre-open, open, halted, and closed states are valid. Values outside the declared enum are rejected. A status reason may be empty.
+
+### Instrument-definition rules
+
+- Display symbol must not be empty.
+- Minimum price and quantity increments must be positive.
+- Effective timestamps must not be negative.
+- When present, effective-until must be strictly later than effective-from.
+
+### Stateful validation remains separate
+
+The single-event validator deliberately does not detect duplicate records, sequence gaps, non-monotonic stream order, stale data, or tick-size compliance against the active definition. Those checks depend on prior events or runtime policy and belong to the later stream validator and market view. Keeping these responsibilities separate makes each contract deterministic and independently testable.
+
 ## Current limitations
 
 - Identifiers enforce non-emptiness but not yet character sets or length limits.
-- Event field relationships are not yet validated by constructors.
+- Validation proves the documented single-event rules; it does not prove stream integrity or that an event is suitable for execution.
 - The initial status vocabulary may not preserve every venue-specific state.
 - Instrument identity is symbol-based for the first slice; corporate-action and cross-listing identity require later reference-data work.
 - Stream-level uniqueness and monotonic ingest sequences are properties of a sequence of events, not one event in isolation.

@@ -1,10 +1,8 @@
 #include "chronos/market_data_types.hpp"
 #include "chronos/paper_account.hpp"
+#include "test_support.hpp"
 
 #include <cstdint>
-#include <exception>
-#include <functional>
-#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -42,42 +40,6 @@ using chronos::VenueId;
 
 static_assert(!std::is_same_v<InstrumentId, VenueId>);
 static_assert(!std::is_same_v<InstrumentId, MarketDataStreamId>);
-
-class TestFailure final : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
-void require(bool condition, std::string_view expression, int line) {
-    if (!condition) {
-        throw TestFailure(
-            "line " + std::to_string(line) + ": requirement failed: " +
-            std::string(expression)
-        );
-    }
-}
-
-#define REQUIRE(expression) require((expression), #expression, __LINE__)
-
-template <typename Exception, typename Function>
-void require_throws(Function&& function, int line) {
-    try {
-        std::invoke(std::forward<Function>(function));
-    } catch (const Exception&) {
-        return;
-    } catch (const std::exception& error) {
-        throw TestFailure(
-            "line " + std::to_string(line) + ": expected a different exception; got: " +
-            error.what()
-        );
-    }
-    throw TestFailure(
-        "line " + std::to_string(line) + ": expected an exception"
-    );
-}
-
-#define REQUIRE_THROWS_AS(expression, exception_type) \
-    require_throws<exception_type>([&] { static_cast<void>(expression); }, __LINE__)
 
 Money money(std::string_view value) {
     return Money::parse(value);
@@ -613,15 +575,10 @@ void test_provider_independent_market_events_preserve_semantics() {
     REQUIRE(definition.minimum_price_increment == price("0.01"));
 }
 
-struct TestCase {
-    std::string_view name;
-    void (*function)();
-};
-
 }  // namespace
 
 int main() {
-    const std::vector<TestCase> tests{
+    return chronos::test::run_tests({
         {"decimal parsing and formatting", test_decimal_parsing_and_formatting},
         {"decimal parser rejects invalid input", test_decimal_parser_rejects_invalid_input},
         {"decimal parser handles int64 boundaries", test_decimal_parser_handles_int64_boundaries},
@@ -643,23 +600,5 @@ int main() {
         {"market identifiers are strong and nonempty", test_market_identifiers_are_strong_and_nonempty},
         {"market quality flags are composable", test_market_data_quality_flags_are_composable},
         {"market events preserve semantics", test_provider_independent_market_events_preserve_semantics},
-    };
-
-    int failed = 0;
-    for (const auto& test : tests) {
-        try {
-            test.function();
-            std::cout << "[PASS] " << test.name << '\n';
-        } catch (const std::exception& failure) {
-            ++failed;
-            std::cerr << "[FAIL] " << test.name << ": " << failure.what() << '\n';
-        } catch (...) {
-            ++failed;
-            std::cerr << "[FAIL] " << test.name << ": unknown exception\n";
-        }
-    }
-
-    std::cout << tests.size() - static_cast<std::size_t>(failed) << "/"
-              << tests.size() << " tests passed\n";
-    return failed == 0 ? 0 : 1;
+    });
 }
