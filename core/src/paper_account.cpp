@@ -22,6 +22,11 @@ PaperAccount::PaperAccount(
       state_{
           .starting_cash = starting_cash,
           .cash = starting_cash,
+          .position = Quantity{},
+          .open_cost_basis = Money{},
+          .gross_realized_pnl = Money{},
+          .fees_paid = Money{},
+          .last_fill_timestamp = std::nullopt,
       } {
     if (account_id_.empty()) {
         throw std::invalid_argument("paper account ID must not be empty");
