@@ -56,6 +56,18 @@ target_link_libraries(chronos_accounting
     PRIVATE chronos_build_options
 )
 
+add_library(chronos_market_data
+    core/src/market_data_validation.cpp
+)
+
+target_include_directories(chronos_market_data
+    PUBLIC core/include
+)
+
+target_link_libraries(chronos_market_data
+    PRIVATE chronos_build_options
+)
+
 include(CTest)
 
 if(BUILD_TESTING)
@@ -72,5 +84,20 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_core_tests
         COMMAND chronos_core_tests
+    )
+
+    add_executable(chronos_market_data_tests
+        tests/market_data_validation_tests.cpp
+    )
+
+    target_link_libraries(chronos_market_data_tests
+        PRIVATE
+            chronos_market_data
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_market_data_tests
+        COMMAND chronos_market_data_tests
     )
 endif()

@@ -11,10 +11,12 @@ Chronos simulates trading only. It does not place real-money orders.
 
 - Fixed-point price, quantity, and money types
 - Provider-independent market-event types
+- Structured single-event market-data validation
+- A validated-event type that cannot be created without passing validation
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
-- Unit and edge-case tests for arithmetic and accounting
+- Unit and edge-case tests for arithmetic, accounting, and market data
 
 The project does not yet ingest market data, replay markets, accept orders, or
 provide an API or web application. See [plan.md](plan.md) for the complete
