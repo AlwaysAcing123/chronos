@@ -66,11 +66,11 @@ plan.md     Product requirements and delivery roadmap
 
 ## Continuous integration
 
-GitHub Actions builds and tests every push and pull request with GCC 14 and
-Clang 18 on Ubuntu 24.04. A separate job runs the test suite with
-AddressSanitizer and UndefinedBehaviorSanitizer enabled. The workflow fails if
-no tests are discovered and receives read-only repository access. Approved
-pushes to `main` and manual runs also receive an AppleClang check on macOS 15.
+GitHub Actions builds and tests every pull request and every push to `main`
+with GCC 14 and Clang 18 on Ubuntu 24.04. A separate job runs the test suite
+with AddressSanitizer and UndefinedBehaviorSanitizer enabled. The workflow
+fails if no tests are discovered and receives read-only repository access.
+Pushes to `main` and manual runs also receive an AppleClang check on macOS 15.
 
 ## Data and credentials
 
