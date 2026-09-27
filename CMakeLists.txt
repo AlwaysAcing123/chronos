@@ -94,7 +94,9 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
     FetchContent_MakeAvailable(databento)
 
     add_library(chronos_databento_adapter
+        adapters/databento/src/equities_mini_mbp1_file_reader.cpp
         adapters/databento/src/equities_mini_mbp1_normalizer.cpp
+        adapters/databento/src/recording_manifest.cpp
     )
 
     target_include_directories(chronos_databento_adapter
@@ -171,6 +173,21 @@ if(BUILD_TESTING)
         add_test(
             NAME chronos_databento_adapter_tests
             COMMAND chronos_databento_adapter_tests
+        )
+
+        add_executable(chronos_databento_file_reader_tests
+            tests/databento_equities_mini_file_reader_tests.cpp
+        )
+
+        target_link_libraries(chronos_databento_file_reader_tests
+            PRIVATE
+                chronos_databento_adapter
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_databento_file_reader_tests
+            COMMAND chronos_databento_file_reader_tests
         )
     endif()
 endif()

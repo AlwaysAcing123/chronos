@@ -15,6 +15,8 @@ Chronos simulates trading only. It does not place real-money orders.
 - A validated-event type that cannot be created without passing validation
 - Stateful stream, duplicate, regression, and sequence-gap detection
 - Optional Databento `EQUS.MINI` MBP-1 record normalizer
+- Streaming DBN file ingestion with timestamp-aware symbol resolution
+- Checksum-backed, write-once recording manifests
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
@@ -74,8 +76,9 @@ cmake --build build-databento --parallel
 ctest --test-dir build-databento --output-on-failure --no-tests=error
 ```
 
-Record-normalization tests use synthetic SDK records and do not require an API
-key or download licensed market data.
+Provider tests generate synthetic DBN recordings with the official SDK. They
+exercise metadata, decoding, symbol mapping, normalization, source-integrity,
+and manifest edge cases without an API key or licensed market-data download.
 
 ## Repository map
 
@@ -107,3 +110,7 @@ decision and licensing boundaries are documented in
 [docs/decisions/0001-market-data-provider.md](docs/decisions/0001-market-data-provider.md).
 The first provider mapping is documented in
 [docs/databento-adapter.md](docs/databento-adapter.md).
+Recording integrity and manifest semantics are documented in
+[docs/recording-manifest.md](docs/recording-manifest.md).
+The record/replay data-job direction is captured in
+[docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).
