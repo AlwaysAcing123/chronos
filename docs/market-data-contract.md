@@ -111,14 +111,28 @@ The declared unknown, pre-open, open, halted, and closed states are valid. Value
 - Effective timestamps must not be negative.
 - When present, effective-until must be strictly later than effective-from.
 
-### Stateful validation remains separate
+## Stream acceptance boundary
 
-The single-event validator deliberately does not detect duplicate records, sequence gaps, non-monotonic stream order, stale data, or tick-size compliance against the active definition. Those checks depend on prior events or runtime policy and belong to the later stream validator and market view. Keeping these responsibilities separate makes each contract deterministic and independently testable.
+`MarketDataStreamValidator` accepts only `ValidatedMarketEvent` objects and maintains sequence state for exactly one configured Chronos stream. Its initial expected ingest sequence is explicit and defaults to zero.
+
+For every accepted event, the validator requires:
+
+- The event's stream identifier matches the configured stream.
+- The ingest sequence equals the next expected value.
+- Advancing the sequence does not wrap the unsigned 64-bit range.
+
+It distinguishes an immediate duplicate from a sequence that moved further backward and from a forward gap. A rejected event never advances validator state, so a missing event can still be supplied after a gap is reported. `reset` establishes an explicit new expected boundary for recovery or a new recording segment.
+
+Market timestamps are deliberately not required to increase. Equal, late, and non-monotonic exchange timestamps occur in real feeds; Chronos ingest sequence is the deterministic stream order. A stream may also contain multiple instruments.
+
+### Remaining stateful validation
+
+The generic stream validator deliberately does not interpret provider venue sequences, detect content duplicates that received different Chronos ingest sequences, enforce freshness policy, or check tick-size compliance against the active instrument definition. Those rules require provider metadata or market-view state and belong to the provider adapter and later market view. Keeping these responsibilities separate makes each contract deterministic and independently testable.
 
 ## Current limitations
 
 - Identifiers enforce non-emptiness but not yet character sets or length limits.
-- Validation proves the documented single-event rules; it does not prove stream integrity or that an event is suitable for execution.
+- Validation proves the documented single-event and generic Chronos stream-order rules; it does not prove provider-specific sequence integrity or that an event is suitable for execution.
 - The initial status vocabulary may not preserve every venue-specific state.
 - Instrument identity is symbol-based for the first slice; corporate-action and cross-listing identity require later reference-data work.
-- Stream-level uniqueness and monotonic ingest sequences are properties of a sequence of events, not one event in isolation.
+- Provider venue-sequence semantics still require dataset-specific adapters and policies.

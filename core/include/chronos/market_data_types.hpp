@@ -140,4 +140,15 @@ using MarketEvent = std::variant<
     InstrumentDefinitionEvent
 >;
 
+[[nodiscard]] inline const MarketEventHeader& market_event_header(
+    const MarketEvent& event
+) {
+    return std::visit(
+        [](const auto& concrete_event) -> const MarketEventHeader& {
+            return concrete_event.header;
+        },
+        event
+    );
+}
+
 }  // namespace chronos

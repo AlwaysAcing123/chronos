@@ -57,6 +57,7 @@ target_link_libraries(chronos_accounting
 )
 
 add_library(chronos_market_data
+    core/src/market_data_stream_validator.cpp
     core/src/market_data_validation.cpp
 )
 
@@ -99,5 +100,20 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_market_data_tests
         COMMAND chronos_market_data_tests
+    )
+
+    add_executable(chronos_market_data_stream_tests
+        tests/market_data_stream_validator_tests.cpp
+    )
+
+    target_link_libraries(chronos_market_data_stream_tests
+        PRIVATE
+            chronos_market_data
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_market_data_stream_tests
+        COMMAND chronos_market_data_stream_tests
     )
 endif()
