@@ -44,6 +44,8 @@ static_assert(!std::is_invocable_v<
     MarketDataStreamValidator&,
     const MarketEvent&
 >);
+static_assert(!std::is_copy_constructible_v<MarketDataStreamValidator>);
+static_assert(std::is_move_constructible_v<MarketDataStreamValidator>);
 
 Price price(std::string_view value) {
     return Price::parse(value);

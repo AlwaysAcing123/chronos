@@ -89,6 +89,42 @@ jobs:
           --output-on-failure
           --no-tests=error
 
+  databento-adapter:
+    name: Databento adapter
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install provider dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev libzstd-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DCHRONOS_ENABLE_DATABENTO_ADAPTER=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: >
+          ctest --test-dir build
+          --output-on-failure
+          --no-tests=error
+
   appleclang:
     name: AppleClang
     if: >
