@@ -1,4 +1,5 @@
 #include "chronos/databento/historical_recording_acquisition.hpp"
+#include "chronos/databento/secret_redaction.hpp"
 
 #include <databento/enums.hpp>
 #include <databento/historical.hpp>
@@ -37,10 +38,11 @@ HistoricalRecordingError provider_error(
 
 class DatabentoHistoricalRecordingProvider::Impl final {
 public:
-    Impl()
-        : client_(
+    explicit Impl(std::string api_key)
+        : api_key_(std::move(api_key)),
+          client_(
               ::databento::Historical::Builder()
-                  .SetKeyFromEnv()
+                  .SetKey(api_key_)
                   .SetUpgradePolicy(
                       ::databento::VersionUpgradePolicy::UpgradeToV3
                   )
@@ -48,6 +50,16 @@ public:
                   .Build()
           ) {}
 
+    [[nodiscard]] const std::string& api_key() const noexcept {
+        return api_key_;
+    }
+
+    [[nodiscard]] ::databento::Historical& client() noexcept {
+        return client_;
+    }
+
+private:
+    std::string api_key_;
     ::databento::Historical client_;
 };
 
@@ -60,18 +72,19 @@ DatabentoHistoricalRecordingProvider::~DatabentoHistoricalRecordingProvider() =
 
 DatabentoHistoricalRecordingProvider::ConnectionResult
 DatabentoHistoricalRecordingProvider::connect_from_environment() {
-    const char* api_key = std::getenv("DATABENTO_API_KEY");
-    if (api_key == nullptr || *api_key == '\0') {
+    const char* environment_api_key = std::getenv("DATABENTO_API_KEY");
+    if (environment_api_key == nullptr || *environment_api_key == '\0') {
         return provider_error(
             HistoricalRecordingErrorCode::MissingApiKey,
             "DATABENTO_API_KEY",
             "DATABENTO_API_KEY is not set"
         );
     }
+    const std::string api_key(environment_api_key);
     try {
         return std::unique_ptr<DatabentoHistoricalRecordingProvider>(
             new DatabentoHistoricalRecordingProvider(
-                std::make_unique<Impl>()
+                std::make_unique<Impl>(api_key)
             )
         );
     } catch (const std::exception& exception) {
@@ -79,7 +92,7 @@ DatabentoHistoricalRecordingProvider::connect_from_environment() {
             HistoricalRecordingErrorCode::ProviderConnectionFailed,
             "DATABENTO_API_KEY",
             "could not create Databento historical client: " +
-                std::string(exception.what())
+                redact_secret(exception.what(), api_key)
         );
     }
 }
@@ -93,7 +106,7 @@ DatabentoHistoricalRecordingProvider::quote(
             query.start,
             query.end,
         };
-        const auto count = implementation_->client_.MetadataGetRecordCount(
+        const auto count = implementation_->client().MetadataGetRecordCount(
             std::string(kDataset),
             range,
             query.symbols,
@@ -102,7 +115,7 @@ DatabentoHistoricalRecordingProvider::quote(
             kNoRecordLimit
         );
         const auto billable_size =
-            implementation_->client_.MetadataGetBillableSize(
+            implementation_->client().MetadataGetBillableSize(
                 std::string(kDataset),
                 range,
                 query.symbols,
@@ -110,7 +123,7 @@ DatabentoHistoricalRecordingProvider::quote(
                 ::databento::SType::RawSymbol,
                 kNoRecordLimit
             );
-        const auto cost = implementation_->client_.MetadataGetCost(
+        const auto cost = implementation_->client().MetadataGetCost(
             std::string(kDataset),
             range,
             query.symbols,
@@ -135,7 +148,7 @@ DatabentoHistoricalRecordingProvider::quote(
             HistoricalRecordingErrorCode::ProviderQuoteFailed,
             "query",
             "Databento quote request failed: " +
-                std::string(exception.what())
+                redact_secret(exception.what(), implementation_->api_key())
         );
     }
 }
@@ -146,7 +159,7 @@ DatabentoHistoricalRecordingProvider::download_to_file(
     const std::filesystem::path& destination
 ) {
     try {
-        implementation_->client_.TimeseriesGetRangeToFile(
+        implementation_->client().TimeseriesGetRangeToFile(
             std::string(kDataset),
             {query.start, query.end},
             query.symbols,
@@ -162,7 +175,7 @@ DatabentoHistoricalRecordingProvider::download_to_file(
             HistoricalRecordingErrorCode::ProviderDownloadFailed,
             "query",
             "Databento download request failed: " +
-                std::string(exception.what())
+                redact_secret(exception.what(), implementation_->api_key())
         );
     }
 }

@@ -114,6 +114,7 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
         adapters/databento/src/equities_mini_mbp1_normalizer.cpp
         adapters/databento/src/historical_recording_acquisition.cpp
         adapters/databento/src/recording_manifest.cpp
+        adapters/databento/src/secret_redaction.cpp
     )
 
     target_include_directories(chronos_databento_adapter
@@ -231,6 +232,21 @@ if(BUILD_TESTING)
         add_test(
             NAME chronos_databento_file_reader_tests
             COMMAND chronos_databento_file_reader_tests
+        )
+
+        add_executable(chronos_databento_secret_redaction_tests
+            tests/databento_secret_redaction_tests.cpp
+        )
+
+        target_link_libraries(chronos_databento_secret_redaction_tests
+            PRIVATE
+                chronos_databento_adapter
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_databento_secret_redaction_tests
+            COMMAND chronos_databento_secret_redaction_tests
         )
     endif()
 endif()
