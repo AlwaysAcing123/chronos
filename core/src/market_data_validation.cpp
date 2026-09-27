@@ -266,15 +266,6 @@ void validate_instrument_definition(
     }
 }
 
-const MarketEventHeader& event_header(const MarketEvent& event) {
-    return std::visit(
-        [](const auto& concrete_event) -> const MarketEventHeader& {
-            return concrete_event.header;
-        },
-        event
-    );
-}
-
 void validate_event_fields(
     const MarketEvent& event,
     ValidationErrors& errors
@@ -316,7 +307,7 @@ ValidatedMarketEvent::ValidatedMarketEvent(MarketEvent event)
 
 MarketEventValidationResult validate_market_event(MarketEvent event) {
     ValidationErrors errors;
-    validate_header(event_header(event), errors);
+    validate_header(market_event_header(event), errors);
     validate_event_fields(event, errors);
 
     if (!errors.empty()) {

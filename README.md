@@ -13,6 +13,7 @@ Chronos simulates trading only. It does not place real-money orders.
 - Provider-independent market-event types
 - Structured single-event market-data validation
 - A validated-event type that cannot be created without passing validation
+- Stateful stream, duplicate, regression, and sequence-gap detection
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
