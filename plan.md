@@ -1150,7 +1150,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 10. Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
 
-The repository currently implements type-specific fixed-point price, money, and quantity values; provider-independent market-event types; structured single-event validation; generic stream identity and ingest-sequence validation; fill types; and an in-memory single-instrument long-only paper account with core tests. It does not yet contain a market-data adapter, provider-specific venue-sequence validation, replay, order intents, risk and execution components, persistence, a command-line adapter, an API, or a web application.
+The repository currently implements type-specific fixed-point price, money, and quantity values; provider-independent market-event types; structured single-event validation; generic stream identity and ingest-sequence validation; an optional, pinned Databento `EQUS.MINI` MBP-1 record normalizer; fill types; and an in-memory single-instrument long-only paper account with core tests. It does not yet contain a streaming DBN file source and recording manifest, provider-specific venue-sequence validation, replay, order intents, risk and execution components, persistence, a command-line adapter, an API, or a web application.
 
 ## 20. Post-submission OCaml learning and translation
 

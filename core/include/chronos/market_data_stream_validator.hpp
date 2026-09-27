@@ -50,6 +50,15 @@ public:
         std::uint64_t initial_ingest_sequence = 0
     );
 
+    MarketDataStreamValidator(const MarketDataStreamValidator&) = delete;
+    MarketDataStreamValidator& operator=(
+        const MarketDataStreamValidator&
+    ) = delete;
+    MarketDataStreamValidator(MarketDataStreamValidator&&) noexcept = default;
+    MarketDataStreamValidator& operator=(
+        MarketDataStreamValidator&&
+    ) noexcept = default;
+
     [[nodiscard]] const MarketDataStreamId& stream() const noexcept {
         return stream_;
     }

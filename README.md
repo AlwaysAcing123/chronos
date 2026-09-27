@@ -14,6 +14,7 @@ Chronos simulates trading only. It does not place real-money orders.
 - Structured single-event market-data validation
 - A validated-event type that cannot be created without passing validation
 - Stateful stream, duplicate, regression, and sequence-gap detection
+- Optional Databento `EQUS.MINI` MBP-1 record normalizer
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
@@ -58,9 +59,28 @@ Sanitizers require AppleClang, Clang, or GCC. On macOS, use AppleClang or
 Clang; the Homebrew GCC toolchain does not provide the required Darwin
 sanitizer runtime.
 
+## Build the Databento adapter
+
+The provider adapter is optional so the core can build without downloading a
+vendor SDK. Its first configuration downloads a checksum-pinned Databento C++
+release and requires OpenSSL 3 and Zstandard.
+
+```sh
+cmake -S . -B build-databento \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DCHRONOS_ENABLE_DATABENTO_ADAPTER=ON
+cmake --build build-databento --parallel
+ctest --test-dir build-databento --output-on-failure --no-tests=error
+```
+
+Record-normalization tests use synthetic SDK records and do not require an API
+key or download licensed market data.
+
 ## Repository map
 
 ```text
+adapters/   Provider-specific integrations isolated from the core
 core/       C++ domain types and paper-trading core
 docs/       Contracts, architecture decisions, and accounting rules
 tests/      C++ unit and edge-case tests
@@ -85,3 +105,5 @@ The normalized event contract is documented in
 [docs/market-data-contract.md](docs/market-data-contract.md). The provider
 decision and licensing boundaries are documented in
 [docs/decisions/0001-market-data-provider.md](docs/decisions/0001-market-data-provider.md).
+The first provider mapping is documented in
+[docs/databento-adapter.md](docs/databento-adapter.md).

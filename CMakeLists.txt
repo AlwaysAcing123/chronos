@@ -12,6 +12,12 @@ option(
     OFF
 )
 
+option(
+    CHRONOS_ENABLE_DATABENTO_ADAPTER
+    "Build the optional Databento provider adapter"
+    OFF
+)
+
 add_library(chronos_build_options INTERFACE)
 
 target_compile_options(chronos_build_options
@@ -69,6 +75,40 @@ target_link_libraries(chronos_market_data
     PRIVATE chronos_build_options
 )
 
+if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
+    include(FetchContent)
+
+    set(DATABENTO_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+    set(DATABENTO_ENABLE_UNIT_TESTING OFF CACHE BOOL "" FORCE)
+    set(DATABENTO_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(DATABENTO_ENABLE_CCACHE OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        databento
+        URL
+            https://github.com/databento/databento-cpp/archive/4e0cc2eded5ee3cff280ca5949f0ba251010afbf.tar.gz
+        URL_HASH
+            SHA256=9a10684c8925c850b22e5895fcdc2eccf791044e9ad364b8ab1a77029c18010c
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(databento)
+
+    add_library(chronos_databento_adapter
+        adapters/databento/src/equities_mini_mbp1_normalizer.cpp
+    )
+
+    target_include_directories(chronos_databento_adapter
+        PUBLIC adapters/databento/include
+    )
+
+    target_link_libraries(chronos_databento_adapter
+        PUBLIC
+            chronos_market_data
+            databento::databento
+        PRIVATE chronos_build_options
+    )
+endif()
+
 include(CTest)
 
 if(BUILD_TESTING)
@@ -116,4 +156,21 @@ if(BUILD_TESTING)
         NAME chronos_market_data_stream_tests
         COMMAND chronos_market_data_stream_tests
     )
+
+    if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
+        add_executable(chronos_databento_adapter_tests
+            tests/databento_equities_mini_mbp1_tests.cpp
+        )
+
+        target_link_libraries(chronos_databento_adapter_tests
+            PRIVATE
+                chronos_databento_adapter
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_databento_adapter_tests
+            COMMAND chronos_databento_adapter_tests
+        )
+    endif()
 endif()

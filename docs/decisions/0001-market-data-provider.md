@@ -65,6 +65,8 @@ This dataset supports:
 
 Databento types are confined to a dedicated adapter. The replay engine, market view, feature engine, execution simulator, and accounting system consume Chronos-owned domain types.
 
+The adapter build pins and checksum-verifies an official Databento C++ release. Exact record-to-domain mappings and dependency details are documented in `docs/databento-adapter.md`.
+
 The conceptual boundary is:
 
 ```text
