@@ -142,6 +142,15 @@ and accounting are never re-run to reconstruct a result.
   spelled as `unknown:<n>`, or a code outside the vocabulary. Malformed
   intents that the journal preserves on purpose round-trip exactly.
 
+## Portfolio valuation
+
+The portfolio endpoint adds no table, column, or migration. It loads the
+account through the same recovery path, in one repeatable-read, read-only
+snapshot, and values it against the current market in memory. The persisted
+active top-of-book observation is what binds the valuation to the account's
+market timeline, and the persisted latest fill timestamp bounds market time.
+Nothing about a valuation is written; it is recomputed on every read.
+
 ## Migrations
 
 Migrations are ordered files in `migrations/`. Each owns its transaction,

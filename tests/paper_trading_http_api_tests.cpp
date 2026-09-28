@@ -35,6 +35,7 @@ using chronos::PersistentPaperOrderSession;
 using chronos::Quantity;
 using chronos::Side;
 using chronos::TimeInForce;
+using chronos::TopOfBookEvent;
 using chronos::PostgresPaperOrderRepository;
 using chronos::paper_trading::HttpHeader;
 using chronos::paper_trading::HttpRequest;
@@ -1221,6 +1222,240 @@ void test_socket_server_serves_the_read_side() {
     REQUIRE(serving.stop().empty());
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio
+
+std::string portfolio_path(const std::string& account_id) {
+    return accounts_path(account_id) + "/portfolio";
+}
+
+// Buy 2 at the ask of 101 and sell 0.5 at the bid of 99 through a model
+// source, both through the real submission route.
+void submit_portfolio_orders(TestApi& api, const std::string& account_id) {
+    REQUIRE(submit(api, account_id, order("buy", "buy", "2")).status == 201);
+    REQUIRE(submit(
+        api,
+        account_id,
+        order("model-sell", "sell", "0.5", std::nullopt, "model")
+    ).status == 201);
+}
+
+// Written independently of the implementation: cost basis 202 - 50.5,
+// realized PnL 49.5 - 50.5, cash 1000 - 202.01 + 49.49, fees 2 × 0.01, and
+// at the bid of 99, market value 148.5, unrealized PnL -3, total PnL -4.02.
+void require_expected_portfolio(const Json& portfolio, const std::string& account_id) {
+    REQUIRE(portfolio.at("trading_mode") == "paper");
+    REQUIRE(portfolio.at("account_id") == account_id);
+    REQUIRE(portfolio.at("instrument") == "AAPL");
+    REQUIRE(portfolio.at("account_version") == "2");
+    REQUIRE(portfolio.at("status") == "active");
+    REQUIRE(portfolio.at("valued_at") == "2026-09-25T13:30:00.000000000Z");
+    REQUIRE(portfolio.at("mark_policy") == "best_bid");
+    REQUIRE(portfolio.at("mark_price") == "99");
+    REQUIRE(portfolio.at("market").at("ingest_sequence") == "0");
+    REQUIRE(portfolio.at("market").at("quality_flags") == Json::array({"replay"}));
+    REQUIRE(portfolio.at("starting_cash") == "1000");
+    REQUIRE(portfolio.at("cash") == "847.48");
+    REQUIRE(portfolio.at("position") == "1.5");
+    REQUIRE(portfolio.at("open_cost_basis") == "151.5");
+    REQUIRE(portfolio.at("average_entry_price") == "101");
+    REQUIRE(portfolio.at("position_market_value") == "148.5");
+    REQUIRE(portfolio.at("unrealized_pnl") == "-3");
+    REQUIRE(portfolio.at("gross_realized_pnl") == "-1");
+    REQUIRE(portfolio.at("fees_paid") == "0.02");
+    REQUIRE(portfolio.at("total_pnl") == "-4.02");
+    REQUIRE(portfolio.at("equity") == "995.98");
+    REQUIRE(portfolio.at("return_percent") == "-0.402");
+}
+
+void test_portfolio_reflects_orders_submitted_through_the_api() {
+    std::string account_id;
+    Json before_restart;
+    {
+        TestApi api;
+        apply(*api.market, quote(0, 0));
+        account_id = new_account(api, "http-portfolio");
+        const ApiResponse flat = call(api, "GET", portfolio_path(account_id));
+        REQUIRE(flat.status == 200);
+        REQUIRE(flat.body.at("portfolio").at("average_entry_price").is_null());
+        REQUIRE(flat.body.at("portfolio").at("equity") == "1000");
+
+        submit_portfolio_orders(api, account_id);
+        const ApiResponse valued = call(api, "GET", portfolio_path(account_id));
+        REQUIRE(valued.status == 200);
+        require_expected_portfolio(valued.body.at("portfolio"), account_id);
+        before_restart = valued.body;
+        REQUIRE(call(api, "GET", accounts_path(account_id)).body.at("account")
+                    .at("version") == "2");
+    }
+
+    TestApi restarted;
+    apply(*restarted.market, quote(0, 0));
+    const ApiResponse after_restart = call(
+        restarted,
+        "GET",
+        portfolio_path(account_id)
+    );
+    REQUIRE(after_restart.status == 200);
+    REQUIRE(after_restart.body == before_restart);
+}
+
+void test_portfolio_route_is_get_only_and_accepts_no_query() {
+    TestApi api;
+    apply(*api.market, quote(0, 0));
+    const std::string account_id = new_account(api, "http-portfolio-route");
+    for (const std::string_view method : {"POST", "PUT", "DELETE"}) {
+        const ApiResponse rejected = call(
+            api,
+            std::string(method),
+            portfolio_path(account_id),
+            "{}"
+        );
+        require_error(rejected, 405, "method_not_allowed");
+        REQUIRE(rejected.headers.front().value == "GET");
+    }
+    REQUIRE(require_error(
+        call(api, "GET", portfolio_path(account_id) + "?mark=ask"),
+        400,
+        "malformed_request"
+    ).at("reason") == "unexpected_field");
+    REQUIRE(require_error(
+        call(api, "GET", portfolio_path(account_id) + "?limit=1&limit=2"),
+        400,
+        "malformed_request"
+    ).at("reason") == "unexpected_field");
+    REQUIRE(require_error(
+        call(api, "GET", portfolio_path(account_id) + "?mark"),
+        400,
+        "malformed_request"
+    ).at("reason") == "invalid_query");
+    require_error(
+        call(api, "GET", portfolio_path(account_id) + "/history"),
+        404,
+        "route_not_found"
+    );
+}
+
+void test_portfolio_failures_have_stable_codes() {
+    TestApi api;
+    const std::string account_id = new_account(api, "http-portfolio-errors");
+    require_error(
+        call(api, "GET", portfolio_path(unique_test_id("absent"))),
+        404,
+        "account_not_found"
+    );
+    REQUIRE(require_error(
+        call(api, "GET", portfolio_path("bad id")),
+        400,
+        "malformed_request"
+    ).at("reason") == "invalid_identifier");
+    const auto unavailable_reason = [&](TestApi& target) {
+        const ApiResponse response = call(target, "GET", portfolio_path(account_id));
+        REQUIRE(!response.body.contains("portfolio"));
+        return require_error(response, 503, "market_data_unavailable").at("reason");
+    };
+    REQUIRE(unavailable_reason(api) == "no_top_of_book");
+
+    TestApi ask_only;
+    TopOfBookEvent no_bid = quote(0, 0);
+    no_bid.bid = std::nullopt;
+    apply(*ask_only.market, no_bid);
+    REQUIRE(unavailable_reason(ask_only) == "missing_best_bid");
+
+    TestApi interrupted;
+    apply(*interrupted.market, quote(0, 0));
+    auto gap = chronos::validate_market_event(quote(2, 10));
+    static_cast<void>(interrupted.market->apply(
+        std::get<chronos::ValidatedMarketEvent>(gap)
+    ));
+    REQUIRE(unavailable_reason(interrupted) == "stream_interrupted");
+
+    TestApi stale;
+    apply(*stale.market, quote(0, 0));
+    apply(*stale.market, quote(
+        1,
+        chronos::test::kMaximumQuoteAgeNanoseconds + 1,
+        "SPY"
+    ));
+    REQUIRE(unavailable_reason(stale) == "stale_market_state");
+}
+
+void test_portfolio_rejects_a_replay_behind_the_account() {
+    std::string account_id;
+    {
+        TestApi original;
+        for (std::uint64_t sequence = 0; sequence <= 3; ++sequence) {
+            apply(*original.market, quote(sequence, static_cast<std::int64_t>(sequence)));
+        }
+        account_id = new_account(original, "http-portfolio-timeline");
+        REQUIRE(submit(original, account_id, order("at-three", "buy", "1")).status ==
+                201);
+    }
+    TestApi earlier;
+    apply(*earlier.market, quote(0, 0));
+    apply(*earlier.market, quote(1, 1));
+    REQUIRE(require_error(
+        call(earlier, "GET", portfolio_path(account_id)),
+        503,
+        "market_data_unavailable"
+    ).at("reason") == "incompatible_market_timeline");
+}
+
+void test_portfolio_outage_returns_a_generic_error() {
+    const std::string application = unique_test_id("http-portfolio-outage");
+    TestApi api(with_application_name(connection_string, application));
+    apply(*api.market, quote(0, 0));
+    const std::string account_id = new_account(api, "http-portfolio-outage");
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    const Json error = require_error(
+        call(api, "GET", portfolio_path(account_id)),
+        503,
+        "persistence_unavailable"
+    );
+    REQUIRE(error.at("message").get<std::string>().find("PostgreSQL") ==
+            std::string::npos);
+    REQUIRE(api.diagnostics.size() == 1);
+    REQUIRE(api.diagnostics.front().starts_with(
+        "get portfolio: PostgreSQL connection is unavailable"
+    ));
+    REQUIRE(call(api, "GET", portfolio_path(account_id)).status == 200);
+}
+
+void test_socket_server_serves_the_portfolio() {
+    TestApi api;
+    apply(*api.market, quote(0, 0));
+    const std::string account_id = new_account(api, "socket-portfolio");
+    submit_portfolio_orders(api, account_id);
+    PaperTradingHttpServer server(
+        *api.api,
+        HttpServerOptions{.host = "127.0.0.1", .port = 0},
+        [](std::string_view) {}
+    );
+    const int port = server.bind();
+    ServingThread serving(server);
+
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(std::chrono::seconds(5));
+    const auto valued = client.Get(portfolio_path(account_id));
+    REQUIRE(static_cast<bool>(valued));
+    REQUIRE(valued->status == 200);
+    REQUIRE(valued->get_header_value("Content-Type") == "application/json");
+    REQUIRE(valued->get_header_value("X-Chronos-Trading-Mode") == "paper");
+    REQUIRE(valued->get_header_value("Cache-Control") == "no-store");
+    REQUIRE(valued->get_header_value("X-Content-Type-Options") == "nosniff");
+    const Json body = Json::parse(valued->body);
+    require_no_json_numbers(body);
+    require_expected_portfolio(body.at("portfolio"), account_id);
+
+    const auto with_query = client.Get(portfolio_path(account_id) + "?mark=mid");
+    REQUIRE(static_cast<bool>(with_query));
+    REQUIRE(with_query->status == 400);
+    REQUIRE(with_query->get_header_value("X-Chronos-Trading-Mode") == "paper");
+    REQUIRE(serving.stop().empty());
+}
+
 }  // namespace
 
 int main() {
@@ -1328,6 +1563,30 @@ int main() {
         {
             "socket server serves the read side",
             test_socket_server_serves_the_read_side,
+        },
+        {
+            "portfolio reflects orders submitted through the API",
+            test_portfolio_reflects_orders_submitted_through_the_api,
+        },
+        {
+            "portfolio route is GET only and accepts no query",
+            test_portfolio_route_is_get_only_and_accepts_no_query,
+        },
+        {
+            "portfolio failures have stable codes",
+            test_portfolio_failures_have_stable_codes,
+        },
+        {
+            "portfolio rejects a replay behind the account",
+            test_portfolio_rejects_a_replay_behind_the_account,
+        },
+        {
+            "portfolio outage returns a generic error",
+            test_portfolio_outage_returns_a_generic_error,
+        },
+        {
+            "socket server serves the portfolio",
+            test_socket_server_serves_the_portfolio,
         },
     });
 }

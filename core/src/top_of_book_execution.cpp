@@ -35,7 +35,53 @@ bool is_marketable(const ApprovedOrderIntent& approved) {
         : *intent.limit_price <= approved.execution_price();
 }
 
+SimulatedExecutionError lineage_error(SimulatedExecutionErrorCode code) {
+    switch (code) {
+        case SimulatedExecutionErrorCode::MarketStreamMismatch:
+            return execution_error(
+                code,
+                "market.header.stream",
+                "approved order belongs to a different market-data stream"
+            );
+        case SimulatedExecutionErrorCode::StaleMarketApproval:
+            return execution_error(
+                code,
+                "market.header.ingest_sequence",
+                "approved order uses an older market observation"
+            );
+        case SimulatedExecutionErrorCode::MarketSnapshotMismatch:
+            return execution_error(
+                code,
+                "market",
+                "one ingest sequence cannot identify different market states"
+            );
+        default:
+            throw std::logic_error("not a market-lineage violation");
+    }
+}
+
 }  // namespace
+
+std::optional<SimulatedExecutionErrorCode> market_lineage_violation(
+    const std::optional<TopOfBookEvent>& active_market,
+    const TopOfBookEvent& market
+) {
+    if (!active_market) {
+        return std::nullopt;
+    }
+    const MarketEventHeader& active = active_market->header;
+    if (market.header.stream != active.stream) {
+        return SimulatedExecutionErrorCode::MarketStreamMismatch;
+    }
+    if (market.header.ingest_sequence < active.ingest_sequence) {
+        return SimulatedExecutionErrorCode::StaleMarketApproval;
+    }
+    if (market.header.ingest_sequence == active.ingest_sequence &&
+        market != *active_market) {
+        return SimulatedExecutionErrorCode::MarketSnapshotMismatch;
+    }
+    return std::nullopt;
+}
 
 TopOfBookExecutionSimulator::TopOfBookExecutionSimulator(
     std::string account_id,
@@ -173,31 +219,11 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
         );
     }
 
-    if (active_market_) {
-        if (market.header.stream != active_market_->header.stream) {
-            return execution_error(
-                SimulatedExecutionErrorCode::MarketStreamMismatch,
-                "market.header.stream",
-                "approved order belongs to a different market-data stream"
-            );
-        }
-        if (market.header.ingest_sequence <
-            active_market_->header.ingest_sequence) {
-            return execution_error(
-                SimulatedExecutionErrorCode::StaleMarketApproval,
-                "market.header.ingest_sequence",
-                "approved order uses an older market observation"
-            );
-        }
-        if (market.header.ingest_sequence ==
-                active_market_->header.ingest_sequence &&
-            market != *active_market_) {
-            return execution_error(
-                SimulatedExecutionErrorCode::MarketSnapshotMismatch,
-                "market",
-                "one ingest sequence cannot identify different market states"
-            );
-        }
+    if (const auto violation = market_lineage_violation(
+            active_market_,
+            market
+        )) {
+        return lineage_error(*violation);
     }
 
     const bool is_new_market = !active_market_ ||

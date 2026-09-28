@@ -515,6 +515,30 @@ std::string_view reason_name(MalformedRequestReason reason) {
     throw std::logic_error("unknown malformed-request reason");
 }
 
+std::string_view valuation_reason(PortfolioValuationErrorCode code) {
+    switch (code) {
+        case PortfolioValuationErrorCode::InvalidMarketState:
+            return "invalid_market_state";
+        case PortfolioValuationErrorCode::MarketInstrumentMismatch:
+            return "market_instrument_mismatch";
+        case PortfolioValuationErrorCode::SuspectMarketState:
+            return "suspect_market_state";
+        case PortfolioValuationErrorCode::MissingBestBid:
+            return "missing_best_bid";
+        case PortfolioValuationErrorCode::StaleMarketState:
+            return "stale_market_state";
+        case PortfolioValuationErrorCode::MarketTimelineMismatch:
+            return "incompatible_market_timeline";
+        case PortfolioValuationErrorCode::NonpositiveStartingCash:
+            return "nonpositive_starting_cash";
+        case PortfolioValuationErrorCode::ArithmeticOverflow:
+            return "arithmetic_overflow";
+        case PortfolioValuationErrorCode::AccountingIdentityFailed:
+            return "accounting_identity_failed";
+    }
+    throw std::logic_error("unknown portfolio valuation error");
+}
+
 std::string_view market_state_reason(MarketStateUnavailableCode code) {
     switch (code) {
         case MarketStateUnavailableCode::StreamInterrupted:
@@ -612,6 +636,17 @@ ResponseJson risk_limits_json(const PreTradeRiskLimits& limits) {
     return json;
 }
 
+std::string_view account_status(const PaperAccountView& account) {
+    return account.is_healthy ? "active" : "halted";
+}
+
+// Average entry price is undefined without a position.
+ResponseJson average_entry_price_json(const AccountState& state) {
+    return state.position.raw() == 0
+        ? ResponseJson(nullptr)
+        : ResponseJson(state.average_entry_price().to_string());
+}
+
 ResponseJson account_json(const PaperAccountView& account) {
     const AccountState& state = account.state;
     ResponseJson json = ResponseJson::object();
@@ -619,14 +654,12 @@ ResponseJson account_json(const PaperAccountView& account) {
     json["account_id"] = account.account_id;
     json["instrument"] = account.instrument.value();
     json["version"] = std::to_string(account.version);
-    json["status"] = account.is_healthy ? "active" : "halted";
+    json["status"] = account_status(account);
     json["starting_cash"] = state.starting_cash.to_string();
     json["cash"] = state.cash.to_string();
     json["position"] = state.position.to_string();
     json["open_cost_basis"] = state.open_cost_basis.to_string();
-    json["average_entry_price"] = state.position.raw() == 0
-        ? ResponseJson(nullptr)
-        : ResponseJson(state.average_entry_price().to_string());
+    json["average_entry_price"] = average_entry_price_json(state);
     json["gross_realized_pnl"] = state.gross_realized_pnl.to_string();
     json["fees_paid"] = state.fees_paid.to_string();
     json["last_fill_at"] = optional_timestamp(state.last_fill_timestamp);
@@ -952,6 +985,51 @@ ResponseJson fill_record_json(const PaperFillRecord& record) {
     return json;
 }
 
+// MarketState could not quote the instrument, or valuation rejected the quote.
+std::optional<std::string> market_unavailable_reason(
+    const PaperTradingError& failure
+) {
+    if (failure.market_state) {
+        return std::string(market_state_reason(*failure.market_state));
+    }
+    if (failure.valuation) {
+        return std::string(valuation_reason(*failure.valuation));
+    }
+    return std::nullopt;
+}
+
+// Mark-to-market at the best bid; see docs/paper-trading-api.md.
+ResponseJson portfolio_json(const PaperPortfolioView& portfolio) {
+    const PaperAccountView& account = portfolio.account;
+    const PortfolioValuation& valuation = portfolio.valuation;
+    const AccountSnapshot& snapshot = valuation.snapshot;
+    const AccountState& state = snapshot.state;
+
+    ResponseJson json = ResponseJson::object();
+    json["trading_mode"] = "paper";
+    json["account_id"] = account.account_id;
+    json["instrument"] = account.instrument.value();
+    json["account_version"] = std::to_string(account.version);
+    json["status"] = account_status(account);
+    json["valued_at"] = format_timestamp(valuation.valued_at);
+    json["mark_policy"] = "best_bid";
+    json["mark_price"] = snapshot.mark_price.to_string();
+    json["market"] = market_json(valuation.market);
+    json["starting_cash"] = state.starting_cash.to_string();
+    json["cash"] = state.cash.to_string();
+    json["position"] = state.position.to_string();
+    json["open_cost_basis"] = state.open_cost_basis.to_string();
+    json["average_entry_price"] = average_entry_price_json(state);
+    json["position_market_value"] = snapshot.market_value.to_string();
+    json["unrealized_pnl"] = snapshot.gross_unrealized_pnl.to_string();
+    json["gross_realized_pnl"] = state.gross_realized_pnl.to_string();
+    json["fees_paid"] = state.fees_paid.to_string();
+    json["total_pnl"] = snapshot.net_total_pnl.to_string();
+    json["equity"] = snapshot.equity.to_string();
+    json["return_percent"] = valuation.return_percent.to_string();
+    return json;
+}
+
 HttpResponse render_service_error(const PaperTradingError& failure) {
     switch (failure.code) {
         case PaperTradingErrorCode::InvalidIdentifier:
@@ -1019,11 +1097,7 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 "market_data_unavailable",
                 failure.message,
                 std::nullopt,
-                failure.market_state
-                    ? std::optional<std::string>(
-                          market_state_reason(*failure.market_state)
-                      )
-                    : std::nullopt
+                market_unavailable_reason(failure)
             );
         case PaperTradingErrorCode::DuplicateClientOrderId:
             return error_response(
@@ -1038,6 +1112,18 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 "account_version_conflict",
                 "the account changed while the order was processed; nothing "
                 "was recorded, so the same client_order_id may be retried"
+            );
+        case PaperTradingErrorCode::ValuationFailed:
+            return error_response(
+                500,
+                "valuation_failed",
+                failure.message,
+                std::nullopt,
+                failure.valuation
+                    ? std::optional<std::string>(
+                          valuation_reason(*failure.valuation)
+                      )
+                    : std::nullopt
             );
         case PaperTradingErrorCode::PersistenceUnavailable:
             // The underlying libpq message stays in server logs.
@@ -1319,6 +1405,15 @@ HttpResponse render_fill_history(const PaperFillHistoryResult& result) {
     ResponseJson body = ResponseJson::object();
     body["fills"] = std::move(fills);
     body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
+}
+
+HttpResponse render_portfolio(const PaperPortfolioResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    ResponseJson body = ResponseJson::object();
+    body["portfolio"] = portfolio_json(std::get<PaperPortfolioView>(result));
     return json_response(200, body);
 }
 

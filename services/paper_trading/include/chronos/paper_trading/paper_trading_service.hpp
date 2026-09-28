@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chronos/market_state.hpp"
+#include "chronos/portfolio_valuation.hpp"
 #include "chronos/postgresql_paper_order_repository.hpp"
 
 #include <cstddef>
@@ -63,6 +64,7 @@ enum class PaperTradingErrorCode {
     MarketDataUnavailable,
     DuplicateClientOrderId,
     AccountVersionConflict,
+    ValuationFailed,
     PersistenceUnavailable,
 };
 
@@ -73,7 +75,12 @@ struct PaperTradingError {
     PaperTradingErrorCode code;
     std::string field;
     std::string message;
-    std::optional<MarketStateUnavailableCode> market_state;
+    // Why market data was unavailable: MarketState could not supply a
+    // quote, or the quote could not mark this account's portfolio.
+    std::optional<MarketStateUnavailableCode> market_state{};
+    // The valuation rule that failed, for MarketDataUnavailable raised by
+    // valuation and for ValuationFailed.
+    std::optional<PortfolioValuationErrorCode> valuation{};
 };
 
 struct PaperAccountView {
@@ -98,6 +105,19 @@ using PaperAccountResult = std::variant<PaperAccountView, PaperTradingError>;
 
 using PaperOrderSubmissionResult = std::variant<
     RecordedPaperOrder,
+    PaperTradingError
+>;
+
+// A read-only valuation of a durable account against the current server
+// quote. Financial fields come from `valuation`, whose snapshot holds the
+// same account state as `account`.
+struct PaperPortfolioView {
+    PaperAccountView account;
+    PortfolioValuation valuation;
+};
+
+using PaperPortfolioResult = std::variant<
+    PaperPortfolioView,
     PaperTradingError
 >;
 
@@ -189,6 +209,12 @@ public:
     [[nodiscard]] PaperFillHistoryResult list_fills(
         std::string_view account_id,
         const HistoryPageRequest& request
+    );
+
+    // Marks the durable account at the server's current best bid. Reads only:
+    // nothing is journaled, and no liquidity or client order ID is consumed.
+    [[nodiscard]] PaperPortfolioResult get_portfolio(
+        std::string_view account_id
     );
 
     [[nodiscard]] PaperTradingHealth health();

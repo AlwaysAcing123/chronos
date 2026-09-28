@@ -85,6 +85,8 @@ parse_history_query(std::string_view query);
     const PaperFillHistoryResult& result
 );
 
+[[nodiscard]] HttpResponse render_portfolio(const PaperPortfolioResult& result);
+
 [[nodiscard]] HttpResponse render_malformed_request(
     const MalformedRequest& malformed
 );

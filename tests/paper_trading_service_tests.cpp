@@ -37,7 +37,12 @@ using chronos::Side;
 using chronos::SimulatedCancellationReason;
 using chronos::SimulatedExecutionStatus;
 using chronos::Timestamp;
+using chronos::MarketDataQualityFlag;
 using chronos::PaperFillRecord;
+using chronos::Percentage;
+using chronos::PersistentPaperOrderSession;
+using chronos::PortfolioValuationErrorCode;
+using chronos::TopOfBookEvent;
 using chronos::PaperOrderRecord;
 using chronos::SimulatedExecutionReport;
 using chronos::paper_trading::CreatePaperAccountRequest;
@@ -49,6 +54,8 @@ using chronos::paper_trading::PaperFillHistoryResult;
 using chronos::paper_trading::PaperOrderHistoryPage;
 using chronos::paper_trading::PaperOrderHistoryResult;
 using chronos::paper_trading::PaperOrderRecordResult;
+using chronos::paper_trading::PaperPortfolioResult;
+using chronos::paper_trading::PaperPortfolioView;
 using chronos::paper_trading::PaperAccountResult;
 using chronos::paper_trading::PaperAccountView;
 using chronos::paper_trading::PaperOrderSubmissionResult;
@@ -1007,6 +1014,284 @@ void test_history_reads_report_outages_then_recover() {
     require_order_record(service->get_order(account_id, "before"));
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio valuation
+
+PaperPortfolioView require_portfolio(PaperPortfolioResult result) {
+    REQUIRE(std::holds_alternative<PaperPortfolioView>(result));
+    return std::get<PaperPortfolioView>(std::move(result));
+}
+
+PaperTradingError require_market_unavailable(
+    PaperPortfolioResult result,
+    PortfolioValuationErrorCode reason
+) {
+    PaperTradingError failure = require_error(
+        std::move(result),
+        PaperTradingErrorCode::MarketDataUnavailable
+    );
+    REQUIRE(failure.valuation == reason);
+    return failure;
+}
+
+// Buy 2 at the ask of 101, then sell 0.5 at the bid of 99 through a model
+// source. Independently: cost basis 202 - 50.5 = 151.5, realized PnL
+// 49.5 - 50.5 = -1, cash 1000 - 202.01 + 49.49 = 847.48, fees 0.02. Marked at
+// the bid of 99, 1.5 is worth 148.5, unrealized PnL is -3, total PnL is
+// -4.02 = 995.98 - 1000, and the return is -0.402%.
+void submit_valuation_history(PaperTradingService& service, const std::string& account_id) {
+    require_recorded(service.submit_order(
+        order_request(account_id, "buy", Side::Buy, "2")
+    ));
+    require_recorded(service.submit_order(order_request(
+        account_id,
+        "model-sell",
+        Side::Sell,
+        "0.5",
+        OrderType::Market,
+        std::nullopt,
+        OrderSourceKind::Model
+    )));
+}
+
+void require_expected_portfolio(const PaperPortfolioView& portfolio) {
+    const auto& snapshot = portfolio.valuation.snapshot;
+    REQUIRE(portfolio.account.version == 2);
+    REQUIRE(snapshot.state == portfolio.account.state);
+    REQUIRE(snapshot.mark_price == Price::parse("99"));
+    REQUIRE(snapshot.state.cash == Money::parse("847.48"));
+    REQUIRE(snapshot.state.position == Quantity::parse("1.5"));
+    REQUIRE(snapshot.state.open_cost_basis == Money::parse("151.5"));
+    REQUIRE(snapshot.state.gross_realized_pnl == Money::parse("-1"));
+    REQUIRE(snapshot.state.fees_paid == Money::parse("0.02"));
+    REQUIRE(snapshot.market_value == Money::parse("148.5"));
+    REQUIRE(snapshot.gross_unrealized_pnl == Money::parse("-3"));
+    REQUIRE(snapshot.net_total_pnl == Money::parse("-4.02"));
+    REQUIRE(snapshot.equity == Money::parse("995.98"));
+    REQUIRE(portfolio.valuation.return_percent == Percentage::parse("-0.402"));
+    REQUIRE(portfolio.valuation.market == quote(0, 0));
+    REQUIRE(
+        portfolio.valuation.valued_at ==
+        Timestamp::from_nanoseconds(kMarketOpenNanoseconds)
+    );
+}
+
+void test_portfolio_values_the_durable_account_at_the_best_bid() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "portfolio");
+    submit_valuation_history(*service, account_id);
+
+    require_expected_portfolio(require_portfolio(service->get_portfolio(account_id)));
+}
+
+void test_portfolio_requires_a_valid_existing_account() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    require_error(
+        service->get_portfolio(unique_test_id("no-portfolio")),
+        PaperTradingErrorCode::AccountNotFound
+    );
+    REQUIRE(require_error(
+        service->get_portfolio("bad id"),
+        PaperTradingErrorCode::InvalidIdentifier
+    ).field == "account_id");
+}
+
+void test_portfolio_requires_a_current_quote_for_the_instrument() {
+    const auto market = market_state();
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "portfolio-quote");
+
+    REQUIRE(require_error(
+        service->get_portfolio(account_id),
+        PaperTradingErrorCode::MarketDataUnavailable
+    ).market_state == MarketStateUnavailableCode::NoTopOfBook);
+    // Another instrument's book never marks the account.
+    apply(*market, quote(0, 0, "SPY"));
+    REQUIRE(require_error(
+        service->get_portfolio(account_id),
+        PaperTradingErrorCode::MarketDataUnavailable
+    ).market_state == MarketStateUnavailableCode::NoTopOfBook);
+
+    apply(*market, quote(1, 10));
+    apply(*market, quote(
+        2,
+        kMaximumQuoteAgeNanoseconds + 11,
+        "SPY"
+    ));
+    require_market_unavailable(
+        service->get_portfolio(account_id),
+        PortfolioValuationErrorCode::StaleMarketState
+    );
+
+    auto gap = chronos::validate_market_event(quote(
+        4,
+        kMaximumQuoteAgeNanoseconds + 20
+    ));
+    REQUIRE(std::holds_alternative<MarketStateUpdateError>(market->apply(
+        std::get<chronos::ValidatedMarketEvent>(gap)
+    )));
+    REQUIRE(require_error(
+        service->get_portfolio(account_id),
+        PaperTradingErrorCode::MarketDataUnavailable
+    ).market_state == MarketStateUnavailableCode::StreamInterrupted);
+}
+
+void test_portfolio_rejects_a_quote_without_a_usable_bid() {
+    const auto service_market = market_state();
+    TopOfBookEvent ask_only = quote(0, 0);
+    ask_only.bid = std::nullopt;
+    apply(*service_market, ask_only);
+    const auto service = make_service(*service_market);
+    const std::string account_id = create_account(*service, "portfolio-no-bid");
+    require_market_unavailable(
+        service->get_portfolio(account_id),
+        PortfolioValuationErrorCode::MissingBestBid
+    );
+
+    const auto suspect_market = market_state();
+    TopOfBookEvent suspect = quote(0, 0);
+    suspect.header.quality =
+        suspect.header.quality.with(MarketDataQualityFlag::PotentiallyInvalidBook);
+    apply(*suspect_market, suspect);
+    const auto suspect_service = make_service(*suspect_market);
+    require_market_unavailable(
+        suspect_service->get_portfolio(account_id),
+        PortfolioValuationErrorCode::SuspectMarketState
+    );
+}
+
+void test_portfolio_rejects_an_incompatible_market_timeline_after_restart() {
+    const auto original = market_state();
+    for (std::uint64_t sequence = 0; sequence <= 5; ++sequence) {
+        apply(*original, quote(sequence, static_cast<std::int64_t>(sequence)));
+    }
+    std::string account_id;
+    {
+        const auto service = make_service(*original);
+        account_id = create_account(*service, "portfolio-timeline");
+        require_recorded(service->submit_order(
+            order_request(account_id, "at-five", Side::Buy, "1")
+        ));
+        require_portfolio(service->get_portfolio(account_id));
+    }
+
+    const auto other_stream = std::make_unique<MarketState>(
+        MarketDataStreamId("another-recording")
+    );
+    TopOfBookEvent foreign = quote(0, 10);
+    foreign.header.stream = MarketDataStreamId("another-recording");
+    apply(*other_stream, foreign);
+    require_market_unavailable(
+        make_service(*other_stream)->get_portfolio(account_id),
+        PortfolioValuationErrorCode::MarketTimelineMismatch
+    );
+
+    const auto earlier_replay = market_state();
+    for (std::uint64_t sequence = 0; sequence <= 3; ++sequence) {
+        apply(*earlier_replay, quote(sequence, static_cast<std::int64_t>(sequence)));
+    }
+    require_market_unavailable(
+        make_service(*earlier_replay)->get_portfolio(account_id),
+        PortfolioValuationErrorCode::MarketTimelineMismatch
+    );
+}
+
+void test_portfolio_is_valued_identically_by_a_new_service() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    std::string account_id;
+    {
+        const auto service = make_service(*market);
+        account_id = create_account(*service, "portfolio-restart");
+        submit_valuation_history(*service, account_id);
+    }
+    require_expected_portfolio(
+        require_portfolio(make_service(*market)->get_portfolio(account_id))
+    );
+}
+
+void test_portfolio_valuation_is_read_only() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "portfolio-read-only");
+    require_recorded(service->submit_order(
+        order_request(account_id, "first", Side::Buy, "3")
+    ));
+
+    PostgresPaperOrderRepository inspector(connection_string);
+    const auto journal_before = inspector.journal_summary(account_id);
+    const auto consumed_ask = [&] {
+        return inspector.load_account(account_id)
+            ->processor.recovery_state().execution.consumed_ask_quantity;
+    };
+    REQUIRE(consumed_ask() == Quantity::parse("3"));
+    for (int valuation = 0; valuation < 3; ++valuation) {
+        require_portfolio(service->get_portfolio(account_id));
+    }
+    const auto journal_after = inspector.journal_summary(account_id);
+    REQUIRE(journal_after.order_count == journal_before.order_count);
+    REQUIRE(journal_after.event_count == journal_before.event_count);
+    REQUIRE(journal_after.applied_fill_count == journal_before.applied_fill_count);
+    REQUIRE(journal_after.account_version == journal_before.account_version);
+    REQUIRE(consumed_ask() == Quantity::parse("3"));
+
+    // The remaining displayed ask is still 2 of the original 5.
+    const auto next = require_receipt(require_recorded(service->submit_order(
+        order_request(account_id, "second", Side::Buy, "3")
+    )));
+    REQUIRE(next.execution.fill->quantity == Quantity::parse("2"));
+}
+
+void test_portfolio_reports_persistence_outages_then_recovers() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const std::string application = unique_test_id("portfolio-outage");
+    const auto service = make_service(
+        *market,
+        with_application_name(connection_string, application)
+    );
+    const std::string account_id = create_account(*service, "portfolio-outage");
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    require_error(
+        service->get_portfolio(account_id),
+        PaperTradingErrorCode::PersistenceUnavailable
+    );
+    const auto recovered = require_portfolio(service->get_portfolio(account_id));
+    REQUIRE(recovered.valuation.snapshot.equity == Money::parse("1000"));
+}
+
+// The API cannot create an account without positive starting cash, but an
+// in-process caller can; such an account has no defined return.
+void test_portfolio_without_starting_cash_is_a_valuation_failure() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const std::string account_id = unique_test_id("portfolio-unfunded");
+    {
+        PostgresPaperOrderRepository direct(connection_string);
+        REQUIRE(std::holds_alternative<PersistentPaperOrderSession>(
+            PersistentPaperOrderSession::create(
+                direct,
+                account_id,
+                InstrumentId("AAPL"),
+                Money{},
+                paper_risk_limits()
+            )
+        ));
+    }
+    const PaperTradingError failure = require_error(
+        make_service(*market)->get_portfolio(account_id),
+        PaperTradingErrorCode::ValuationFailed
+    );
+    REQUIRE(failure.valuation == PortfolioValuationErrorCode::NonpositiveStartingCash);
+}
+
 }  // namespace
 
 int main() {
@@ -1118,6 +1403,42 @@ int main() {
         {
             "history reads report outages then recover",
             test_history_reads_report_outages_then_recover,
+        },
+        {
+            "portfolio values the durable account at the bid",
+            test_portfolio_values_the_durable_account_at_the_best_bid,
+        },
+        {
+            "portfolio requires a valid existing account",
+            test_portfolio_requires_a_valid_existing_account,
+        },
+        {
+            "portfolio requires a current quote",
+            test_portfolio_requires_a_current_quote_for_the_instrument,
+        },
+        {
+            "portfolio rejects a quote without a usable bid",
+            test_portfolio_rejects_a_quote_without_a_usable_bid,
+        },
+        {
+            "portfolio rejects an incompatible timeline",
+            test_portfolio_rejects_an_incompatible_market_timeline_after_restart,
+        },
+        {
+            "portfolio is valued identically by a new service",
+            test_portfolio_is_valued_identically_by_a_new_service,
+        },
+        {
+            "portfolio valuation is read only",
+            test_portfolio_valuation_is_read_only,
+        },
+        {
+            "portfolio reports persistence outages",
+            test_portfolio_reports_persistence_outages_then_recovers,
+        },
+        {
+            "portfolio without starting cash fails valuation",
+            test_portfolio_without_starting_cash_is_a_valuation_failure,
         },
     });
 }

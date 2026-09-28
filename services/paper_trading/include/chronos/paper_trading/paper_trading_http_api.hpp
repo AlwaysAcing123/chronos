@@ -21,6 +21,7 @@ using DiagnosticLog = std::function<void(std::string_view line)>;
 //   GET  /api/v1/accounts/{account_id}/orders
 //   GET  /api/v1/accounts/{account_id}/orders/{client_order_id}
 //   GET  /api/v1/accounts/{account_id}/fills
+//   GET  /api/v1/accounts/{account_id}/portfolio
 //
 // The router holds no trading logic: it checks the method, query string, and
 // media type, parses the request through the JSON contract, calls the

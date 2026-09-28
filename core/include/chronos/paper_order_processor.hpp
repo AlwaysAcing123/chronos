@@ -64,6 +64,13 @@ public:
 
     [[nodiscard]] bool is_healthy() const noexcept { return is_healthy_; }
 
+    // The market observation of the latest execution, which fixes the
+    // account's market timeline; absent before the first execution.
+    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+        const noexcept {
+        return execution_simulator_.active_market();
+    }
+
     [[nodiscard]] PaperOrderProcessorRecoveryState recovery_state() const;
     [[nodiscard]] static PaperOrderProcessor restore(
         PaperOrderProcessorRecoveryState recovery_state

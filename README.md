@@ -40,12 +40,15 @@ Chronos simulates trading only. It does not place real-money orders.
   clients can never choose the quote or time they trade at
 - A transport-independent paper-trading application service shared by manual
   and model orders
-- An optional local HTTP API for health, account creation and retrieval, and
-  immediate-or-cancel order submission, with exact decimal strings and stable
-  machine-readable errors
+- An optional local HTTP API for health, account creation and retrieval,
+  immediate-or-cancel order submission, history, and portfolio valuation, with
+  exact decimal strings and stable machine-readable errors
 - Durable order and fill history read from the journal, with stable
   newest-first keyset pagination and order lookup for reconciling uncertain
   submissions
+- Read-only portfolio valuation at the server's current best bid, with exact
+  market value, unrealized and total PnL, equity, and a fixed-point return
+  percentage that reconcile before they are returned
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution, plus real-PostgreSQL service and API tests
 
@@ -173,8 +176,9 @@ CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos
 The server binds to `127.0.0.1:8080` by default. It has no authentication
 and is not production-secure. See
 [docs/paper-trading-api.md](docs/paper-trading-api.md) for the request and
-response contract, history pagination, decimal and timestamp rules, error
-codes, market-state ownership, and limitations.
+response contract, history pagination, the portfolio's best-bid mark policy,
+decimal and timestamp rules, error codes, market-state ownership, and
+limitations.
 
 A local database volume created before
 `migrations/002_paper_order_read_indexes.sql` existed needs that file applied
@@ -236,5 +240,7 @@ dependency decision in
 [docs/decisions/0004-paper-trading-http-api.md](docs/decisions/0004-paper-trading-http-api.md).
 The journal read model and pagination decision is recorded in
 [docs/decisions/0005-paper-journal-read-model.md](docs/decisions/0005-paper-journal-read-model.md).
+The best-bid mark policy and portfolio-valuation rules are recorded in
+[docs/decisions/0006-portfolio-valuation.md](docs/decisions/0006-portfolio-valuation.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

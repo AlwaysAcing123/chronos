@@ -256,6 +256,11 @@ public:
         return processor_.is_healthy();
     }
 
+    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+        const noexcept {
+        return processor_.active_market();
+    }
+
     [[nodiscard]] std::int64_t version() const noexcept { return version_; }
 
     [[nodiscard]] PersistentPaperOrderResult submit(

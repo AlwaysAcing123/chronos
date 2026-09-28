@@ -18,6 +18,21 @@ struct PreTradeRiskLimits {
     Money fee_per_fill;
 };
 
+enum class MarketObservationRecency {
+    Current,
+    FromFuture,
+    Stale,
+};
+
+// Classifies one observation against the market clock using the configured
+// quote-age limit. Execution and portfolio valuation share this policy so a
+// quote that is too old to trade against cannot still mark the account.
+[[nodiscard]] MarketObservationRecency classify_market_observation_recency(
+    Timestamp observation_received_at,
+    Timestamp market_time,
+    std::int64_t maximum_quote_age_nanoseconds
+);
+
 enum class PreTradeRiskErrorCode {
     MissingClientOrderId,
     MissingAccountId,

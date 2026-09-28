@@ -266,6 +266,25 @@ HttpResponse order(
     ));
 }
 
+HttpResponse portfolio(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    return render_portfolio(log_unavailable(
+        service.get_portfolio(account_id),
+        log,
+        "get portfolio"
+    ));
+}
+
 HttpResponse fills(
     PaperTradingService& service,
     const DiagnosticLog& log,
@@ -345,6 +364,9 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
     }
     if (parts.size() == 5 && parts[4] == "fills") {
         return fills(service_, log_, request, account_id);
+    }
+    if (parts.size() == 5 && parts[4] == "portfolio") {
+        return portfolio(service_, log_, request, account_id);
     }
     if (parts.size() == 6 && parts[4] == "orders") {
         return order(service_, log_, request, account_id, parts[5]);

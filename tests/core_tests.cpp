@@ -202,6 +202,49 @@ void test_proportions_and_average_price() {
     );
 }
 
+void test_percentage_of_is_exact_and_rounds_half_away_from_zero() {
+    using chronos::Percentage;
+    using chronos::percentage_of;
+    REQUIRE(percentage_of(money("27.6"), money("10000")) ==
+            Percentage::parse("0.276"));
+    REQUIRE(percentage_of(money("-1.5"), money("1000")) ==
+            Percentage::parse("-0.15"));
+    REQUIRE(percentage_of(Money{}, money("1000")) == Percentage{});
+    REQUIRE(percentage_of(money("1000"), money("1000")) ==
+            Percentage::parse("100"));
+    REQUIRE(percentage_of(money("1"), money("3")) ==
+            Percentage::parse("33.33333333"));
+    REQUIRE(percentage_of(money("2"), money("3")) ==
+            Percentage::parse("66.66666667"));
+
+    // 1 raw unit of change over 2e10 raw units of base is exactly half a
+    // percentage unit, which rounds away from zero in both directions.
+    const Money half_unit_base = Money::from_raw(20'000'000'000);
+    REQUIRE(percentage_of(Money::from_raw(1), half_unit_base).raw() == 1);
+    REQUIRE(percentage_of(Money::from_raw(-1), half_unit_base).raw() == -1);
+    REQUIRE(percentage_of(
+                Money::from_raw(1),
+                half_unit_base,
+                RoundingMode::TowardZero
+            ).raw() == 0);
+
+    REQUIRE_THROWS_AS(
+        percentage_of(money("1"), Money{}),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        percentage_of(money("1"), money("-1")),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        percentage_of(
+            Money::from_raw(std::numeric_limits<std::int64_t>::max()),
+            Money::from_raw(1)
+        ),
+        std::overflow_error
+    );
+}
+
 void test_price_notional_average_round_trip() {
     const std::vector<std::pair<Price, Quantity>> exactly_representable_cases{
         {price("0.000000001"), quantity("10")},
@@ -585,6 +628,7 @@ int main() {
         {"decimal arithmetic detects overflow", test_decimal_addition_and_subtraction_detect_overflow},
         {"fixed-point multiplication rounding", test_fixed_point_multiplication_rounding},
         {"proportions and average price", test_proportions_and_average_price},
+        {"percentage of is exact and rounds half away", test_percentage_of_is_exact_and_rounds_half_away_from_zero},
         {"price/notional/average round trip", test_price_notional_average_round_trip},
         {"account constructor validation", test_account_constructor_validation},
         {"primary buy/sell/snapshot example", test_primary_buy_sell_and_snapshot_example},
