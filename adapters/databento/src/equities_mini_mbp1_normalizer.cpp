@@ -17,15 +17,6 @@
 namespace chronos::databento_adapter {
 namespace {
 
-constexpr std::uint8_t kKnownDatabentoFlags =
-    ::databento::FlagSet::kLast |
-    ::databento::FlagSet::kTob |
-    ::databento::FlagSet::kSnapshot |
-    ::databento::FlagSet::kMbp |
-    ::databento::FlagSet::kBadTsRecv |
-    ::databento::FlagSet::kMaybeBadBook |
-    ::databento::FlagSet::kPublisherSpecific;
-
 EquitiesMiniMbp1Error adapter_error(
     EquitiesMiniMbp1ErrorCode code,
     std::string_view field,
@@ -124,13 +115,6 @@ std::optional<EquitiesMiniMbp1Error> validate_record(
             "EQUS.MINI records must have venue sequence zero"
         );
     }
-    if (record.depth != 0) {
-        return adapter_error(
-            EquitiesMiniMbp1ErrorCode::UnexpectedDepth,
-            "depth",
-            "MBP-1 record depth must be zero"
-        );
-    }
     if (record.levels[0].bid_ct != 0 || record.levels[0].ask_ct != 0) {
         return adapter_error(
             EquitiesMiniMbp1ErrorCode::UnexpectedOrderCount,
@@ -152,14 +136,6 @@ std::optional<EquitiesMiniMbp1Error> validate_record(
             "record contains an unknown Databento side"
         );
     }
-    if ((record.flags.Raw() & ~kKnownDatabentoFlags) != 0) {
-        return adapter_error(
-            EquitiesMiniMbp1ErrorCode::UnknownFlags,
-            "flags",
-            "record contains unknown Databento flag bits"
-        );
-    }
-
     const std::uint64_t event_timestamp =
         record.hd.ts_event.time_since_epoch().count();
     const std::uint64_t receive_timestamp =
@@ -252,6 +228,8 @@ MarketDataQuality market_data_quality(
     const ::databento::Mbp1Msg& record,
     FeedMode feed_mode
 ) {
+    // Structural flags and Databento's ignorable reserved bit deliberately do
+    // not become Chronos quality flags.
     MarketDataQuality quality;
     if (feed_mode == FeedMode::HistoricalReplay) {
         quality = quality.with(MarketDataQualityFlag::Replay);

@@ -317,19 +317,28 @@ void test_provider_identity_fields_are_rejected_atomically() {
         EquitiesMiniMbp1ErrorCode::UnexpectedVenueSequence
     );
 
-    db::Mbp1Msg wrong_depth = mbp1_record();
-    wrong_depth.depth = 1;
-    require_atomic_rejection(
-        wrong_depth,
-        EquitiesMiniMbp1ErrorCode::UnexpectedDepth
-    );
-
     db::Mbp1Msg unexpected_order_count = mbp1_record();
     unexpected_order_count.levels[0].bid_ct = 1;
     require_atomic_rejection(
         unexpected_order_count,
         EquitiesMiniMbp1ErrorCode::UnexpectedOrderCount
     );
+}
+
+void test_nonzero_update_depth_still_emits_top_of_book() {
+    db::Mbp1Msg record = mbp1_record();
+    record.depth = 1;
+    EquitiesMiniMbp1Normalizer normalizer(
+        MarketDataStreamId("nonzero-update-depth"),
+        FeedMode::HistoricalReplay
+    );
+
+    const auto events = require_events(normalizer.normalize(record, "AAPL"));
+    const auto& top_of_book = std::get<TopOfBookEvent>(
+        events.top_of_book.value()
+    );
+    REQUIRE(top_of_book.bid.has_value());
+    REQUIRE(top_of_book.ask.has_value());
 }
 
 void test_unknown_provider_values_are_rejected_atomically() {
@@ -347,11 +356,21 @@ void test_unknown_provider_values_are_rejected_atomically() {
         EquitiesMiniMbp1ErrorCode::UnknownSide
     );
 
-    db::Mbp1Msg unknown_flags = mbp1_record();
-    unknown_flags.flags = db::FlagSet{1U};
-    require_atomic_rejection(
-        unknown_flags,
-        EquitiesMiniMbp1ErrorCode::UnknownFlags
+    db::Mbp1Msg reserved_flag = mbp1_record();
+    reserved_flag.flags = db::FlagSet{1U};
+    EquitiesMiniMbp1Normalizer normalizer(
+        MarketDataStreamId("reserved-provider-flag"),
+        FeedMode::HistoricalReplay
+    );
+    const auto events = require_events(
+        normalizer.normalize(reserved_flag, "AAPL")
+    );
+    const auto& top_of_book = std::get<TopOfBookEvent>(
+        events.top_of_book.value()
+    );
+    REQUIRE(
+        top_of_book.header.quality.raw() ==
+        static_cast<std::uint32_t>(MarketDataQualityFlag::Replay)
     );
 }
 
@@ -480,6 +499,10 @@ int main() {
         {"empty book sides", test_empty_book_sides_become_absent_levels},
         {"invalid book levels", test_invalid_book_levels_are_rejected_atomically},
         {"provider identity", test_provider_identity_fields_are_rejected_atomically},
+        {
+            "nonzero update depth",
+            test_nonzero_update_depth_still_emits_top_of_book,
+        },
         {"unknown provider values", test_unknown_provider_values_are_rejected_atomically},
         {"invalid timestamps", test_invalid_timestamps_are_rejected_atomically},
         {

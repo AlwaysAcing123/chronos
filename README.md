@@ -18,14 +18,14 @@ Chronos simulates trading only. It does not place real-money orders.
 - Streaming DBN file ingestion with timestamp-aware symbol resolution
 - Checksum-backed, write-once recording manifests
 - Quote-first, cost-bounded historical DBN acquisition
-- Deterministic receive-time replay clock and current market view
+- Offline deterministic DBN replay with event counts and final market views
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
 - Unit and edge-case tests for arithmetic, accounting, and market data
 
-The project does not yet replay markets, accept orders, or provide an API or
-web application. See [plan.md](plan.md) for the complete roadmap.
+The project does not yet accept orders, simulate execution, or provide an API
+or web application. See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -86,6 +86,11 @@ command-line tool that quotes and downloads small real recordings. It refuses
 to download without an explicit maximum quoted cost and never overwrites an
 existing recording. See
 [docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
+
+`chronos_databento_replay` reads a local recording without network access,
+validates and replays every event, recomputes its checksum-backed manifest, and
+prints deterministic JSON containing event counts and each instrument's final
+trade and top of book. See [docs/market-replay.md](docs/market-replay.md).
 
 ## Repository map
 

@@ -1138,19 +1138,31 @@ Chronos succeeds when a technical reviewer can verify that:
 
 Build a real-data-to-paper-account vertical slice in small, verified increments:
 
-1. Record the market-data provider, dataset, licensing, and cost decisions.
-2. Separate the fixed-point scales and contracts for price, quantity, and money.
-3. Define provider-independent instrument, trade, quote, quality, and timestamp types.
-4. Add a historical Databento adapter and immutable recording manifest.
-5. Normalize and inspect a short real `EQUS.MINI` MBP-1 session for `AAPL` and `SPY`.
-6. Replay the recording deterministically and maintain a validated current market view.
+1. **Complete:** Record the market-data provider, dataset, licensing, and cost decisions.
+2. **Complete:** Separate the fixed-point scales and contracts for price, quantity, and money.
+3. **Complete:** Define provider-independent instrument, trade, quote, quality, and timestamp types.
+4. **Complete:** Add a historical Databento adapter and immutable recording manifest.
+5. **Complete:** Normalize and inspect a short real `EQUS.MINI` MBP-1 session for `AAPL` and `SPY`.
+6. **Complete:** Replay the recording deterministically and maintain a validated current market view.
 7. Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
 8. Feed simulated fills into the existing accounting core and verify end-to-end reconciliation.
 9. Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
 10. Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
 
-The repository currently implements type-specific fixed-point price, money, and quantity values; provider-independent market-event types; structured single-event validation; generic stream identity and ingest-sequence validation; an optional, pinned Databento `EQUS.MINI` MBP-1 normalizer and streaming DBN file reader; checksum-backed write-once recording manifests; a quote-first, cost-bounded historical acquisition command; deterministic receive-time replay and a current market view; fill types; and an in-memory single-instrument long-only paper account with core tests. It does not yet contain a preserved real `AAPL`/`SPY` recording, provider-specific venue-sequence validation, normalized-event persistence, order intents, risk and execution components, durable account persistence, an API, or a web application.
+The repository currently implements type-specific fixed-point price, money,
+and quantity values; provider-independent market-event types; structured
+single-event validation; generic stream identity and ingest-sequence
+validation; an optional, pinned Databento `EQUS.MINI` MBP-1 normalizer and
+streaming DBN file reader; checksum-backed write-once recording manifests; a
+quote-first, cost-bounded historical acquisition command; offline
+deterministic replay reports and a current market view; fill types; and an
+in-memory single-instrument long-only paper account with core tests. A local,
+Git-ignored real `AAPL`/`SPY` recording has been validated and replayed
+identically across repeated runs. Licensed recordings are intentionally not
+preserved in the repository. Chronos does not yet implement normalized-event
+persistence, order intents, risk and execution components, durable account
+persistence, an API, or a web application.
 
 ## 20. Post-submission OCaml learning and translation
 

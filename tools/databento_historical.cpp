@@ -1,4 +1,5 @@
 #include "chronos/databento/historical_recording_acquisition.hpp"
+#include "databento_cli_json.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -216,14 +217,18 @@ nlohmann::json quote_json(
 }
 
 int report_error(const adapter::HistoricalRecordingError& error) {
-    const nlohmann::json document = {
-        {"error",
-         {
-             {"code", adapter::to_string(error.code)},
-             {"field", error.field},
-             {"message", error.message},
-         }},
+    nlohmann::json error_document = {
+        {"code", adapter::to_string(error.code)},
+        {"field", error.field},
+        {"message", error.message},
     };
+    if (error.recording_error) {
+        error_document["recording_error"] =
+            chronos::databento_cli::recording_error_json(
+                *error.recording_error
+            );
+    }
+    const nlohmann::json document = {{"error", std::move(error_document)}};
     std::cerr << document.dump(2) << '\n';
     return 1;
 }

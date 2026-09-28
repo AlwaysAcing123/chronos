@@ -77,6 +77,22 @@ published recording. A successful output is never silently replaced, so a
 repeated request cannot accidentally incur a duplicate download or destroy
 the recording that produced an earlier result.
 
+## Replay the local recording
+
+Replay is offline and does not require an API key or make a Databento request:
+
+```sh
+./build-databento/chronos_databento_replay \
+  --input data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst \
+  --stream-id databento-equs-mini-mbp1-20260925-1330-1340
+```
+
+The JSON output includes the independently recomputed recording manifest,
+event totals, first and last receive timestamps, final ingest sequence, and
+the final trade and top-of-book state for each instrument. Nanosecond
+timestamps and fixed-point prices and quantities are emitted as decimal
+strings so JSON consumers do not lose integer precision.
+
 ## Repository boundary
 
 Never commit API keys, raw DBN files, normalized licensed events, or generated
