@@ -158,6 +158,11 @@ No latency model exists yet. The fill timestamp is the order submission
 timestamp. Explicit decision, acknowledgement, arrival, and execution times
 will be added before Chronos claims realistic trading evaluation.
 
+Orders submitted through the paper-trading API are timestamped with the
+server's market clock, the receive time of the latest accepted market event,
+and execute against the server's own quote. See
+[paper-trading-api.md](paper-trading-api.md).
+
 ## Important limitations
 
 - Top-of-book only; no Level-2 sweep, queue, or market impact
@@ -168,7 +173,8 @@ will be added before Chronos claims realistic trading evaluation.
 - No latency or slippage beyond crossing the visible spread
 - An unbounded processed-ID set inside each reconstructed processor
 - One processor instance is not safe for concurrent calls
-- No API, authentication, authorization, or user interface
+- No authentication, authorization, or user interface; the optional local
+  HTTP API is described in [paper-trading-api.md](paper-trading-api.md)
 
 The low-level risk and execution classes remain independently testable, but
 application code should use `PaperOrderProcessor` so approvals cannot outlive

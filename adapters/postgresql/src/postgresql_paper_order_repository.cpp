@@ -1,5 +1,7 @@
 #include "chronos/postgresql_paper_order_repository.hpp"
 
+#include "chronos/paper_order_codes.hpp"
+
 #include <libpq-fe.h>
 
 #include <charconv>
@@ -107,14 +109,12 @@ private:
 class PostgresParameters final {
 public:
     void add(std::string value) {
-        values_.push_back(std::move(value));
+        values_.push_back(checked_text(std::move(value)));
     }
 
-    void add(std::string_view value) {
-        values_.emplace_back(std::string(value));
-    }
+    void add(std::string_view value) { add(std::string(value)); }
 
-    void add(const char* value) { values_.emplace_back(std::string(value)); }
+    void add(const char* value) { add(std::string(value)); }
 
     void add(std::int64_t value) { add(std::to_string(value)); }
     void add(std::uint64_t value) { add(std::to_string(value)); }
@@ -122,7 +122,10 @@ public:
     void add(bool value) { add(value ? "true" : "false"); }
 
     void add(const std::optional<std::string>& value) {
-        values_.push_back(value);
+        values_.push_back(
+            value ? std::optional<std::string>(checked_text(*value))
+                  : std::nullopt
+        );
     }
 
     void add_optional(std::optional<std::int64_t> value) {
@@ -156,13 +159,38 @@ public:
     }
 
 private:
+    // libpq text parameters end at the first NUL byte. Persisting a silently
+    // truncated identifier would make the journal disagree with the
+    // in-memory state that was checked for idempotency.
+    [[nodiscard]] static std::string checked_text(std::string value) {
+        if (value.find('\0') != std::string::npos) {
+            throw std::invalid_argument(
+                "PostgreSQL text parameters must not contain NUL bytes"
+            );
+        }
+        return value;
+    }
+
     std::vector<std::optional<std::string>> values_;
     std::vector<const char*> pointers_;
 };
 
+// libpq returns no result, or marks the connection bad, when the server
+// cannot be reached. Both are availability failures rather than query errors.
+PostgresResult checked_result(PGconn* connection, PGresult* result) {
+    if (result == nullptr || PQstatus(connection) == CONNECTION_BAD) {
+        PQclear(result);
+        throw PaperPersistenceUnavailable(
+            "PostgreSQL connection is unavailable: " +
+            std::string(PQerrorMessage(connection))
+        );
+    }
+    return PostgresResult(result);
+}
+
 PostgresResult execute(PGconn* connection, std::string_view sql) {
     const std::string statement(sql);
-    return PostgresResult(PQexec(connection, statement.c_str()));
+    return checked_result(connection, PQexec(connection, statement.c_str()));
 }
 
 PostgresResult execute(
@@ -172,7 +200,7 @@ PostgresResult execute(
 ) {
     const std::string statement(sql);
     const auto& pointers = parameters.pointers();
-    return PostgresResult(PQexecParams(
+    return checked_result(connection, PQexecParams(
         connection,
         statement.c_str(),
         parameters.size(),
@@ -204,10 +232,12 @@ public:
         require_status(result, PGRES_COMMAND_OK, "begin transaction");
     }
 
+    // A destructor must not throw, and it may run while an availability
+    // exception is propagating. A lost connection has no transaction left to
+    // roll back; the next repository operation resets it.
     ~PostgresTransaction() {
-        if (!finished_) {
-            const auto result = execute(connection_, "ROLLBACK");
-            static_cast<void>(result);
+        if (!finished_ && PQstatus(connection_) == CONNECTION_OK) {
+            PQclear(PQexec(connection_, "ROLLBACK"));
         }
     }
 
@@ -276,160 +306,25 @@ std::optional<std::uint64_t> optional_uint64(
     ) : std::nullopt;
 }
 
-std::string source_kind_text(OrderSourceKind kind) {
-    switch (kind) {
-        case OrderSourceKind::Manual:
-            return "manual";
-        case OrderSourceKind::Model:
-            return "model";
+// Malformed intents are journaled faithfully, so an undeclared intent enum
+// value is preserved as its underlying integer instead of being renamed.
+template <typename Enum>
+std::string intent_text(Enum value) {
+    if (const auto name = canonical_name(value)) {
+        return std::string(*name);
     }
-    return "unknown:" + std::to_string(static_cast<int>(kind));
+    return "unknown:" + std::to_string(static_cast<int>(value));
 }
 
-std::string side_text(Side side) {
-    switch (side) {
-        case Side::Buy:
-            return "buy";
-        case Side::Sell:
-            return "sell";
-    }
-    return "unknown:" + std::to_string(static_cast<int>(side));
-}
-
-std::string order_type_text(OrderType type) {
-    switch (type) {
-        case OrderType::Market:
-            return "market";
-        case OrderType::Limit:
-            return "limit";
-    }
-    return "unknown:" + std::to_string(static_cast<int>(type));
-}
-
-std::string time_in_force_text(TimeInForce time_in_force) {
-    if (time_in_force == TimeInForce::ImmediateOrCancel) {
-        return "ioc";
-    }
-    return "unknown:" + std::to_string(static_cast<int>(time_in_force));
-}
-
-std::string execution_status_text(SimulatedExecutionStatus status) {
-    switch (status) {
-        case SimulatedExecutionStatus::Filled:
-            return "filled";
-        case SimulatedExecutionStatus::PartiallyFilledAndCancelled:
-            return "partially_filled_and_cancelled";
-        case SimulatedExecutionStatus::Cancelled:
-            return "cancelled";
-    }
-    throw std::invalid_argument("cannot persist unknown execution status");
-}
-
-std::string cancellation_reason_text(SimulatedCancellationReason reason) {
-    switch (reason) {
-        case SimulatedCancellationReason::LimitNotMarketable:
-            return "limit_not_marketable";
-        case SimulatedCancellationReason::DisplayedLiquidityExhausted:
-            return "displayed_liquidity_exhausted";
+// Outcomes are produced by Chronos itself; an undeclared value is a defect
+// that must not be written to the journal.
+template <typename Enum>
+std::string outcome_text(Enum value, std::string_view description) {
+    if (const auto name = canonical_name(value)) {
+        return std::string(*name);
     }
     throw std::invalid_argument(
-        "cannot persist unknown cancellation reason"
-    );
-}
-
-std::string risk_code_text(PreTradeRiskErrorCode code) {
-    switch (code) {
-        case PreTradeRiskErrorCode::MissingClientOrderId:
-            return "missing_client_order_id";
-        case PreTradeRiskErrorCode::MissingAccountId:
-            return "missing_account_id";
-        case PreTradeRiskErrorCode::MissingSourceId:
-            return "missing_source_id";
-        case PreTradeRiskErrorCode::UnknownOrderSource:
-            return "unknown_order_source";
-        case PreTradeRiskErrorCode::AccountMismatch:
-            return "account_mismatch";
-        case PreTradeRiskErrorCode::InstrumentMismatch:
-            return "instrument_mismatch";
-        case PreTradeRiskErrorCode::UnknownSide:
-            return "unknown_side";
-        case PreTradeRiskErrorCode::UnknownOrderType:
-            return "unknown_order_type";
-        case PreTradeRiskErrorCode::UnsupportedTimeInForce:
-            return "unsupported_time_in_force";
-        case PreTradeRiskErrorCode::NonpositiveQuantity:
-            return "nonpositive_quantity";
-        case PreTradeRiskErrorCode::UnexpectedLimitPrice:
-            return "unexpected_limit_price";
-        case PreTradeRiskErrorCode::MissingLimitPrice:
-            return "missing_limit_price";
-        case PreTradeRiskErrorCode::NonpositiveLimitPrice:
-            return "nonpositive_limit_price";
-        case PreTradeRiskErrorCode::NegativeSubmissionTimestamp:
-            return "negative_submission_timestamp";
-        case PreTradeRiskErrorCode::SubmissionTimestampMovedBackward:
-            return "submission_timestamp_moved_backward";
-        case PreTradeRiskErrorCode::InvalidMarketState:
-            return "invalid_market_state";
-        case PreTradeRiskErrorCode::MarketInstrumentMismatch:
-            return "market_instrument_mismatch";
-        case PreTradeRiskErrorCode::SuspectMarketState:
-            return "suspect_market_state";
-        case PreTradeRiskErrorCode::MarketObservationFromFuture:
-            return "market_observation_from_future";
-        case PreTradeRiskErrorCode::StaleMarketState:
-            return "stale_market_state";
-        case PreTradeRiskErrorCode::MissingOppositeBookSide:
-            return "missing_opposite_book_side";
-        case PreTradeRiskErrorCode::OrderQuantityLimitExceeded:
-            return "order_quantity_limit_exceeded";
-        case PreTradeRiskErrorCode::NotionalRoundedToZero:
-            return "notional_rounded_to_zero";
-        case PreTradeRiskErrorCode::OrderNotionalLimitExceeded:
-            return "order_notional_limit_exceeded";
-        case PreTradeRiskErrorCode::PositionLimitExceeded:
-            return "position_limit_exceeded";
-        case PreTradeRiskErrorCode::InsufficientCash:
-            return "insufficient_cash";
-        case PreTradeRiskErrorCode::InsufficientPosition:
-            return "insufficient_position";
-        case PreTradeRiskErrorCode::InsufficientCashForFee:
-            return "insufficient_cash_for_fee";
-        case PreTradeRiskErrorCode::ArithmeticOverflow:
-            return "arithmetic_overflow";
-    }
-    throw std::invalid_argument("cannot persist unknown risk error code");
-}
-
-std::string execution_error_code_text(SimulatedExecutionErrorCode code) {
-    switch (code) {
-        case SimulatedExecutionErrorCode::AccountMismatch:
-            return "account_mismatch";
-        case SimulatedExecutionErrorCode::InstrumentMismatch:
-            return "instrument_mismatch";
-        case SimulatedExecutionErrorCode::DuplicateClientOrderId:
-            return "duplicate_client_order_id";
-        case SimulatedExecutionErrorCode::MarketStreamMismatch:
-            return "market_stream_mismatch";
-        case SimulatedExecutionErrorCode::StaleMarketApproval:
-            return "stale_market_approval";
-        case SimulatedExecutionErrorCode::MarketSnapshotMismatch:
-            return "market_snapshot_mismatch";
-    }
-    throw std::invalid_argument(
-        "cannot persist unknown execution error code"
-    );
-}
-
-std::string processing_error_code_text(PaperOrderProcessingErrorCode code) {
-    switch (code) {
-        case PaperOrderProcessingErrorCode::ProcessorFaulted:
-            return "processor_faulted";
-        case PaperOrderProcessingErrorCode::AccountingInvariantViolation:
-            return "accounting_invariant_violation";
-    }
-    throw std::invalid_argument(
-        "cannot persist unknown processing error code"
+        "cannot persist unknown " + std::string(description)
     );
 }
 
@@ -533,7 +428,7 @@ PersistedOutcomeFields outcome_fields(const PaperOrderResult& result) {
             ) {
                 return PersistedOutcomeFields{
                     .kind = "risk_rejection",
-                    .code = risk_code_text(outcome.code),
+                    .code = outcome_text(outcome.code, "risk error code"),
                     .field = outcome.field,
                     .message = outcome.message,
                     .outcome_event = "risk_rejected",
@@ -543,7 +438,10 @@ PersistedOutcomeFields outcome_fields(const PaperOrderResult& result) {
             ) {
                 return PersistedOutcomeFields{
                     .kind = "execution_error",
-                    .code = execution_error_code_text(outcome.code),
+                    .code = outcome_text(
+                        outcome.code,
+                        "execution error code"
+                    ),
                     .field = outcome.field,
                     .message = outcome.message,
                     .outcome_event = "execution_rejected",
@@ -551,7 +449,10 @@ PersistedOutcomeFields outcome_fields(const PaperOrderResult& result) {
             } else {
                 return PersistedOutcomeFields{
                     .kind = "processing_error",
-                    .code = processing_error_code_text(outcome.code),
+                    .code = outcome_text(
+                        outcome.code,
+                        "processing error code"
+                    ),
                     .field = std::nullopt,
                     .message = outcome.message,
                     .execution = outcome.execution
@@ -581,17 +482,17 @@ void add_order_record_parameters(
     parameters.add(intent.client_order_id);
     parameters.add(intent.account_id);
     parameters.add(intent.instrument.value());
-    parameters.add(source_kind_text(intent.source.kind));
+    parameters.add(intent_text(intent.source.kind));
     parameters.add(intent.source.source_id);
-    parameters.add(side_text(intent.side));
-    parameters.add(order_type_text(intent.type));
+    parameters.add(intent_text(intent.side));
+    parameters.add(intent_text(intent.type));
     parameters.add(intent.quantity.raw());
     parameters.add_optional(
         intent.limit_price
             ? std::optional<std::int64_t>(intent.limit_price->raw())
             : std::nullopt
     );
-    parameters.add(time_in_force_text(intent.time_in_force));
+    parameters.add(intent_text(intent.time_in_force));
     parameters.add(intent.submitted_at.nanoseconds());
     parameters.add(market.header.instrument.value());
     parameters.add(market.header.stream.value());
@@ -633,15 +534,19 @@ void add_order_record_parameters(
     const SimulatedExecutionReport* execution = outcome.execution;
     parameters.add(execution
         ? std::optional<std::string>(
-              execution_status_text(execution->status)
+              outcome_text(
+                  execution->status,
+                  "execution status"
+              )
           )
         : std::nullopt);
     parameters.add_optional(execution
         ? std::optional<std::int64_t>(execution->unfilled_quantity.raw())
         : std::nullopt);
     parameters.add(execution && execution->cancellation_reason
-        ? std::optional<std::string>(cancellation_reason_text(
-              *execution->cancellation_reason
+        ? std::optional<std::string>(outcome_text(
+              *execution->cancellation_reason,
+              "cancellation reason"
           ))
         : std::nullopt);
     parameters.add_optional(execution
@@ -657,7 +562,7 @@ void add_order_record_parameters(
         ? std::optional<std::string>(fill->fill_id)
         : std::nullopt);
     parameters.add(fill
-        ? std::optional<std::string>(side_text(fill->side))
+        ? std::optional<std::string>(intent_text(fill->side))
         : std::nullopt);
     parameters.add_optional(fill
         ? std::optional<std::int64_t>(fill->price.raw())
@@ -725,13 +630,29 @@ struct PostgresPaperOrderRepository::Impl {
             const std::string message = PQerrorMessage(connection);
             PQfinish(connection);
             connection = nullptr;
-            throw std::runtime_error(
+            throw PaperPersistenceUnavailable(
                 "could not connect to PostgreSQL: " + message
             );
         }
     }
 
     ~Impl() { PQfinish(connection); }
+
+    // A connection lost by an earlier operation is reset once before the next
+    // operation starts. The repository holds no session state on the
+    // connection, so libpq can reconnect with the original parameters.
+    void ensure_connected() {
+        if (PQstatus(connection) == CONNECTION_OK) {
+            return;
+        }
+        PQreset(connection);
+        if (PQstatus(connection) != CONNECTION_OK) {
+            throw PaperPersistenceUnavailable(
+                "could not reconnect to PostgreSQL: " +
+                std::string(PQerrorMessage(connection))
+            );
+        }
+    }
 
     PGconn* connection;
 };
@@ -747,6 +668,7 @@ void PostgresPaperOrderRepository::apply_migration(std::string_view sql) {
     if (sql.empty()) {
         throw std::invalid_argument("migration SQL must not be empty");
     }
+    impl_->ensure_connected();
     const auto result = execute(impl_->connection, sql);
     if (result.status() != PGRES_COMMAND_OK) {
         const std::string message = result.error_message();
@@ -763,6 +685,7 @@ CreatePaperAccountResult PostgresPaperOrderRepository::create_account(
     PostgresParameters parameters;
     parameters.add(state.account.account_id);
     add_account_state_parameters(parameters, state);
+    impl_->ensure_connected();
     const auto result = execute(
         impl_->connection,
         R"SQL(
@@ -820,6 +743,7 @@ CreatePaperAccountResult PostgresPaperOrderRepository::create_account(
 
 std::optional<StoredPaperOrderProcessor>
 PostgresPaperOrderRepository::load_account(std::string_view account_id) {
+    impl_->ensure_connected();
     PostgresTransaction transaction(impl_->connection);
     const auto isolation = execute(
         impl_->connection,
@@ -1082,6 +1006,7 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
         }
     }
 
+    impl_->ensure_connected();
     PostgresTransaction transaction(impl_->connection);
     PostgresParameters update_parameters;
     update_parameters.add(account_id);
@@ -1246,6 +1171,7 @@ PaperAccountJournalSummary PostgresPaperOrderRepository::journal_summary(
 ) {
     PostgresParameters parameters;
     parameters.add(account_id);
+    impl_->ensure_connected();
     const auto result = execute(
         impl_->connection,
         R"SQL(
@@ -1286,6 +1212,21 @@ PaperAccountJournalSummary PostgresPaperOrderRepository::journal_summary(
             "account_version"
         ),
     };
+}
+
+bool PostgresPaperOrderRepository::check_availability() {
+    // One failed probe may be the first observation of a dropped
+    // connection; the second attempt starts with a reconnect.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            impl_->ensure_connected();
+            const auto result = execute(impl_->connection, "SELECT 1");
+            require_status(result, PGRES_TUPLES_OK, "probe PostgreSQL");
+            return true;
+        } catch (const PaperPersistenceUnavailable&) {
+        }
+    }
+    return false;
 }
 
 PersistentPaperOrderSession::PersistentPaperOrderSession(

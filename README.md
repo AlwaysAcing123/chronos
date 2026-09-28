@@ -34,12 +34,22 @@ Chronos simulates trading only. It does not place real-money orders.
 - Optional PostgreSQL persistence with atomic account snapshots and an
   append-only order, rejection, fill, and portfolio event journal
 - Validated restart recovery, database idempotency, and optimistic concurrency
+- Reconnection after a lost database connection, reported as a typed
+  unavailability error
+- A thread-safe, server-owned market state whose clock timestamps orders, so
+  clients can never choose the quote or time they trade at
+- A transport-independent paper-trading application service shared by manual
+  and model orders
+- An optional local HTTP API for health, account creation and retrieval, and
+  immediate-or-cancel order submission, with exact decimal strings and stable
+  machine-readable errors
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
-  risk, and execution
+  risk, and execution, plus real-PostgreSQL service and API tests
 
-The core now accepts, simulates, books, persists, and recovers paper orders
-through controlled paths. It does not yet provide an API or web application.
-See [plan.md](plan.md) for the complete roadmap.
+The core accepts, simulates, books, persists, and recovers paper orders
+through controlled paths, and the optional API exposes that path to local
+clients. It does not yet provide a web application. See [plan.md](plan.md)
+for the complete roadmap.
 
 ## Requirements
 
@@ -130,13 +140,47 @@ See
 transaction contract, recovery model, idempotency semantics, and reset
 instructions.
 
+## Build and run the paper-trading API
+
+The HTTP API is optional and requires the PostgreSQL adapter. Its first
+configuration downloads hash-pinned cpp-httplib and nlohmann/json releases.
+Adding the Databento adapter lets the server replay a local recording into its
+market state before it starts listening.
+
+```sh
+docker compose up -d --wait postgres
+cmake -S . -B build-api \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DCHRONOS_ENABLE_POSTGRESQL_ADAPTER=ON \
+  -DCHRONOS_ENABLE_PAPER_TRADING_API=ON \
+  -DCHRONOS_ENABLE_DATABENTO_ADAPTER=ON \
+  -DPostgreSQL_ROOT=/opt/homebrew/opt/libpq
+cmake --build build-api --parallel
+CHRONOS_TEST_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos' \
+  ctest --test-dir build-api --output-on-failure --no-tests=error
+
+CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos' \
+  ./build-api/chronos_paper_trading_server \
+    --stream-id databento-equs-mini-mbp1-20260925-1330-1340 \
+    --instrument AAPL --instrument SPY \
+    --replay-dbn data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst
+```
+
+The server binds to `127.0.0.1:8080` by default. It has no authentication
+and is not production-secure. See
+[docs/paper-trading-api.md](docs/paper-trading-api.md) for the request and
+response contract, decimal and timestamp rules, error codes, market-state
+ownership, and limitations.
+
 ## Repository map
 
 ```text
 adapters/   Provider-specific integrations isolated from the core
 core/       C++ domain types and paper-trading core
 docs/       Contracts, architecture decisions, and accounting rules
-tests/      C++ unit and edge-case tests
+services/   Application service and HTTP API over the core
+tests/      C++ unit, edge-case, and integration tests
 plan.md     Product requirements and delivery roadmap
 ```
 
@@ -145,10 +189,11 @@ plan.md     Product requirements and delivery roadmap
 GitHub Actions builds and tests every pull request and every push to `main`
 with GCC 14 and Clang 18 on Ubuntu 24.04. A separate job runs the test suite
 with AddressSanitizer and UndefinedBehaviorSanitizer enabled. The workflow
-also tests the optional Databento adapter and PostgreSQL persistence against a
-real PostgreSQL service. It fails if no tests are discovered and receives
-read-only repository access. Pushes to `main` and manual runs also receive an
-AppleClang check on macOS 15.
+also tests the optional Databento adapter, and tests PostgreSQL persistence
+and the paper-trading API against a real PostgreSQL service, including a
+sanitizer build that combines the API with the Databento adapter. It fails if
+no tests are discovered and receives read-only repository access. Pushes to
+`main` and manual runs also receive an AppleClang check on macOS 15.
 
 ## Data and credentials
 
@@ -173,5 +218,9 @@ Paper-order, risk, and simple top-of-book execution semantics are documented in
 PostgreSQL transaction, journal, idempotency, and recovery semantics are
 documented in
 [docs/postgresql-persistence.md](docs/postgresql-persistence.md).
+The paper-trading HTTP contract is documented in
+[docs/paper-trading-api.md](docs/paper-trading-api.md), and its transport and
+dependency decision in
+[docs/decisions/0004-paper-trading-http-api.md](docs/decisions/0004-paper-trading-http-api.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

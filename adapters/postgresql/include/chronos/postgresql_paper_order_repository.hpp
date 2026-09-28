@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -21,6 +22,16 @@ enum class PaperPersistenceConflictCode {
 struct PaperPersistenceConflict {
     PaperPersistenceConflictCode code;
     std::string message;
+};
+
+// PostgreSQL could not be reached, or the connection was lost during an
+// operation. When the loss interrupts a commit, whether the transaction
+// committed is unknown; resubmitting the same client order ID is safe because
+// the database accepts it at most once. Other database failures remain
+// std::runtime_error because they indicate defects or corrupt state.
+class PaperPersistenceUnavailable final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 using CreatePaperAccountResult = std::variant<
@@ -72,6 +83,10 @@ public:
     [[nodiscard]] PaperAccountJournalSummary journal_summary(
         std::string_view account_id
     );
+
+    // Probes the connection, reconnecting once if an earlier operation lost
+    // it. Returns false only when PostgreSQL is unavailable.
+    [[nodiscard]] bool check_availability();
 
 private:
     friend class PersistentPaperOrderSession;
@@ -133,6 +148,14 @@ public:
 
     [[nodiscard]] const PaperAccount& account() const noexcept {
         return processor_.account();
+    }
+
+    [[nodiscard]] const PreTradeRiskLimits& risk_limits() const noexcept {
+        return processor_.risk_limits();
+    }
+
+    [[nodiscard]] bool is_healthy() const noexcept {
+        return processor_.is_healthy();
     }
 
     [[nodiscard]] std::int64_t version() const noexcept { return version_; }

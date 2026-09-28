@@ -73,6 +73,15 @@ recomputed manifest, aggregate and per-instrument event counts, replay time
 bounds, the final ingest sequence, and final trade and top-of-book state. It
 does not contact Databento.
 
+## Server market state
+
+`MarketState` wraps one `MarketReplay` for the paper-trading server. It is
+safe to call from a feed thread and request threads at once, serves the latest
+top of book for an instrument together with the replay clock, and stops
+serving execution quotes permanently after any rejected event. The API uses
+the replay clock as each order's submission time, as described in
+[paper-trading-api.md](paper-trading-api.md).
+
 ## Current boundary
 
 This increment supports event-step replay of synthetic and local real DBN
