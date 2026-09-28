@@ -2,6 +2,8 @@
 #include "postgres_test_support.hpp"
 #include "test_support.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -13,6 +15,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -23,7 +26,14 @@ using chronos::OrderIntent;
 using chronos::OrderSource;
 using chronos::OrderSourceKind;
 using chronos::OrderType;
+using chronos::PaperFillRecord;
+using chronos::PaperJournalPage;
+using chronos::PaperJournalPageRequest;
+using chronos::PaperJournalReadMiss;
+using chronos::PaperOrderFaultRecord;
+using chronos::PaperOrderProcessingErrorCode;
 using chronos::PaperOrderReceipt;
+using chronos::PaperOrderRecord;
 using chronos::PaperPersistenceConflict;
 using chronos::PaperPersistenceConflictCode;
 using chronos::PaperPersistenceUnavailable;
@@ -39,11 +49,12 @@ using chronos::Quantity;
 using chronos::Side;
 using chronos::SimulatedExecutionError;
 using chronos::SimulatedExecutionErrorCode;
+using chronos::SimulatedExecutionReport;
 using chronos::SimulatedExecutionStatus;
 using chronos::TimeInForce;
 using chronos::Timestamp;
 using chronos::TopOfBookEvent;
-using chronos::test::migration_sql;
+using chronos::test::all_migrations_sql;
 using chronos::test::PostgresTestConnection;
 using chronos::test::terminate_backends;
 using chronos::test::unique_test_id;
@@ -174,7 +185,7 @@ PaperOrderReceipt require_order_receipt(PersistentPaperOrderReceipt receipt) {
 
 void test_fills_and_shadow_liquidity_survive_restart() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("restart");
     auto session = create_session(store, account_id);
     const OrderIntent first_order = order(
@@ -193,7 +204,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
     REQUIRE(first.account_after.position == quantity("3"));
 
     auto restarted_store = repository();
-    restarted_store.apply_migration(migration_sql());
+    restarted_store.apply_migration(all_migrations_sql());
     auto recovered = PersistentPaperOrderSession::load(
         restarted_store,
         account_id
@@ -235,7 +246,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
 
 void test_duplicate_submission_rolls_back_every_database_change() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("duplicate");
     auto session = create_session(store, account_id);
     const OrderIntent intent = order(
@@ -269,7 +280,7 @@ void test_duplicate_submission_rolls_back_every_database_change() {
 
 void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("rejection");
     auto session = create_session(store, account_id, risk_limits(5));
     const OrderIntent rejected_order = order(
@@ -320,7 +331,7 @@ void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
 
 void test_optimistic_version_conflict_preserves_committed_account() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("concurrency");
     auto first_session = create_session(store, account_id);
     auto second_session = PersistentPaperOrderSession::load(store, account_id);
@@ -351,7 +362,7 @@ void test_optimistic_version_conflict_preserves_committed_account() {
 
 void test_processed_client_ids_survive_restart() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("processed-id");
     auto session = create_session(store, account_id);
     const OrderIntent intent = order(
@@ -375,7 +386,7 @@ void test_processed_client_ids_survive_restart() {
 
 void test_malformed_order_is_preserved_as_a_risk_rejection() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("malformed");
     auto session = create_session(store, account_id);
     OrderIntent malformed = order(
@@ -411,7 +422,7 @@ void test_malformed_order_is_preserved_as_a_risk_rejection() {
 
 void test_missing_client_order_ids_remain_auditable() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("missing-client-id");
     auto session = create_session(store, account_id);
     OrderIntent first = order(account_id, "", Side::Buy, "1", 110);
@@ -454,7 +465,7 @@ void test_failed_migration_does_not_poison_connection() {
         std::runtime_error
     );
 
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("migration-recovery");
     auto session = create_session(store, account_id);
     REQUIRE(session.version() == 0);
@@ -463,7 +474,7 @@ void test_failed_migration_does_not_poison_connection() {
 
 void test_text_with_nul_bytes_is_never_persisted() {
     auto store = repository();
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("nul-text");
     const std::string account_id_with_nul = account_id + std::string("\0x", 2);
     REQUIRE_THROWS_AS(
@@ -504,7 +515,7 @@ void test_lost_connection_is_reported_and_then_reconnected() {
     PostgresPaperOrderRepository store(
         with_application_name(connection_string, application)
     );
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("reconnect");
     auto session = create_session(store, account_id);
     require_persisted_receipt(session.submit(
@@ -533,7 +544,7 @@ void test_connection_lost_during_commit_records_nothing() {
     PostgresPaperOrderRepository store(
         with_application_name(connection_string, application)
     );
-    store.apply_migration(migration_sql());
+    store.apply_migration(all_migrations_sql());
     const std::string account_id = unique_test_id("commit-loss");
     auto session = create_session(store, account_id);
     const OrderIntent intent = order(
@@ -579,6 +590,488 @@ void test_connection_lost_during_commit_records_nothing() {
         session.submit(intent, market(10, 100))
     );
     REQUIRE(retried.account_version == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Journal read model
+
+PaperJournalPage<PaperOrderRecord> require_order_page(
+    PostgresPaperOrderRepository& store,
+    const std::string& account_id,
+    std::size_t limit,
+    std::optional<std::int64_t> before = std::nullopt
+) {
+    auto page = store.list_orders(
+        account_id,
+        PaperJournalPageRequest{.limit = limit, .before_record_id = before}
+    );
+    REQUIRE(std::holds_alternative<PaperJournalPage<PaperOrderRecord>>(page));
+    return std::get<PaperJournalPage<PaperOrderRecord>>(std::move(page));
+}
+
+PaperJournalPage<PaperFillRecord> require_fill_page(
+    PostgresPaperOrderRepository& store,
+    const std::string& account_id,
+    std::size_t limit,
+    std::optional<std::int64_t> before = std::nullopt
+) {
+    auto page = store.list_fills(
+        account_id,
+        PaperJournalPageRequest{.limit = limit, .before_record_id = before}
+    );
+    REQUIRE(std::holds_alternative<PaperJournalPage<PaperFillRecord>>(page));
+    return std::get<PaperJournalPage<PaperFillRecord>>(std::move(page));
+}
+
+PaperOrderRecord require_order_record(
+    PostgresPaperOrderRepository& store,
+    const std::string& account_id,
+    const std::string& client_order_id
+) {
+    auto lookup = store.find_order(account_id, client_order_id);
+    REQUIRE(std::holds_alternative<PaperOrderRecord>(lookup));
+    return std::get<PaperOrderRecord>(std::move(lookup));
+}
+
+std::vector<std::string> client_order_ids(
+    const PaperJournalPage<PaperOrderRecord>& page
+) {
+    std::vector<std::string> ids;
+    for (const auto& record : page.records) {
+        ids.push_back(record.intent.client_order_id);
+    }
+    return ids;
+}
+
+void test_empty_history_is_distinct_from_a_missing_account() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("empty-history");
+    create_session(store, account_id);
+
+    const auto orders = require_order_page(store, account_id, 10);
+    REQUIRE(orders.records.empty());
+    REQUIRE(!orders.next_before_record_id.has_value());
+    const auto fills = require_fill_page(store, account_id, 10);
+    REQUIRE(fills.records.empty());
+    REQUIRE(!fills.next_before_record_id.has_value());
+    REQUIRE(std::get<PaperJournalReadMiss>(store.find_order(account_id, "none")) ==
+            PaperJournalReadMiss::OrderNotFound);
+
+    const std::string missing = unique_test_id("missing-history");
+    const PaperJournalPageRequest request{.limit = 10, .before_record_id = {}};
+    REQUIRE(std::get<PaperJournalReadMiss>(store.list_orders(missing, request)) ==
+            PaperJournalReadMiss::AccountNotFound);
+    REQUIRE(std::get<PaperJournalReadMiss>(store.list_fills(missing, request)) ==
+            PaperJournalReadMiss::AccountNotFound);
+    REQUIRE(std::get<PaperJournalReadMiss>(store.find_order(missing, "none")) ==
+            PaperJournalReadMiss::AccountNotFound);
+}
+
+void test_executed_orders_are_reconstructed_exactly() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("reconstruct-executed");
+    auto session = create_session(store, account_id);
+    const TopOfBookEvent quote = market(
+        7,
+        1'790'343'000'123'456'789,
+        "99.123456789",
+        "5",
+        "101.987654321",
+        "3.12345678"
+    );
+    const std::int64_t submitted_at = 1'790'343'000'123'456'790;
+
+    OrderIntent filled = order(account_id, "filled", Side::Buy, "1.5", submitted_at);
+    OrderIntent partial = order(account_id, "partial", Side::Buy, "4", submitted_at);
+    OrderIntent passive = order(account_id, "passive", Side::Buy, "1", submitted_at);
+    passive.type = OrderType::Limit;
+    passive.limit_price = price("100.000000001");
+    passive.source = OrderSource{
+        .kind = OrderSourceKind::Model,
+        .source_id = "momentum-v1",
+    };
+
+    std::vector<SimulatedExecutionReport> expected;
+    for (const OrderIntent& intent : {filled, partial, passive}) {
+        expected.push_back(require_order_receipt(require_persisted_receipt(
+            session.submit(intent, quote)
+        )).execution);
+    }
+    REQUIRE(expected[0].status == SimulatedExecutionStatus::Filled);
+    REQUIRE(
+        expected[1].status ==
+        SimulatedExecutionStatus::PartiallyFilledAndCancelled
+    );
+    REQUIRE(expected[2].status == SimulatedExecutionStatus::Cancelled);
+
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto record = require_order_record(
+            store,
+            account_id,
+            expected[index].intent.client_order_id
+        );
+        REQUIRE(record.intent == expected[index].intent);
+        REQUIRE(record.market == quote);
+        REQUIRE(std::holds_alternative<SimulatedExecutionReport>(record.outcome));
+        REQUIRE(std::get<SimulatedExecutionReport>(record.outcome) == expected[index]);
+    }
+
+    const auto page = require_order_page(store, account_id, 10);
+    REQUIRE((client_order_ids(page) ==
+             std::vector<std::string>{"passive", "partial", "filled"}));
+    REQUIRE(page.records[0].intent.source.kind == OrderSourceKind::Model);
+    REQUIRE(
+        page.records[0].intent.limit_price->raw() == 100'000'000'001
+    );
+    REQUIRE(
+        std::get<SimulatedExecutionReport>(page.records[1].outcome)
+            .fill->quantity == quantity("1.62345678")
+    );
+}
+
+void test_rejections_and_faults_are_reconstructed_exactly() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("reconstruct-rejected");
+    auto session = create_session(store, account_id, risk_limits(5));
+
+    const auto stale = require_persisted_receipt(session.submit(
+        order(account_id, "stale", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+    const auto risk_record = require_order_record(store, account_id, "stale");
+    REQUIRE(std::get<PreTradeRiskRejection>(risk_record.outcome) ==
+            std::get<PreTradeRiskRejection>(stale.result));
+
+    require_persisted_receipt(session.submit(
+        order(account_id, "seed", Side::Buy, "1", 110),
+        market(11, 108)
+    ));
+    TopOfBookEvent other_stream = market(12, 109);
+    other_stream.header.stream = chronos::MarketDataStreamId("other-stream");
+    const auto rejected = require_persisted_receipt(session.submit(
+        order(account_id, "other-stream", Side::Buy, "1", 110),
+        other_stream
+    ));
+    const auto execution_record = require_order_record(
+        store,
+        account_id,
+        "other-stream"
+    );
+    REQUIRE(std::get<SimulatedExecutionError>(execution_record.outcome) ==
+            std::get<SimulatedExecutionError>(rejected.result));
+    REQUIRE(
+        std::get<SimulatedExecutionError>(execution_record.outcome).code ==
+        SimulatedExecutionErrorCode::MarketStreamMismatch
+    );
+    REQUIRE(execution_record.market == other_stream);
+}
+
+// The whole order passes risk because its maximum notional is representable,
+// but the one displayed lot fills for a notional that rounds to zero, so
+// accounting rejects the risk-approved fill and the processor halts.
+void test_unbooked_fill_of_a_fault_is_never_reported_as_booked() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("unbooked-fault");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        order(account_id, "booked", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+    const TopOfBookEvent dust = market(
+        11,
+        105,
+        "0.000000001",
+        "1",
+        "0.000000001",
+        "1"
+    );
+    const auto faulted = require_persisted_receipt(session.submit(
+        order(account_id, "dust", Side::Buy, "10", 110),
+        dust
+    ));
+    REQUIRE(
+        std::get<chronos::PaperOrderProcessingError>(faulted.result).code ==
+        PaperOrderProcessingErrorCode::AccountingInvariantViolation
+    );
+    require_persisted_receipt(session.submit(
+        order(account_id, "halted", Side::Buy, "1", 110),
+        dust
+    ));
+
+    PostgresTestConnection inspector(connection_string);
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM paper_order_records "
+        "WHERE account_id = $1 AND fill_id IS NOT NULL",
+        {account_id}
+    ) == "2");
+
+    const auto fault = require_order_record(store, account_id, "dust");
+    const auto& fault_outcome = std::get<PaperOrderFaultRecord>(fault.outcome);
+    REQUIRE(
+        fault_outcome.code ==
+        PaperOrderProcessingErrorCode::AccountingInvariantViolation
+    );
+    REQUIRE(fault_outcome.unbooked_execution.has_value());
+    REQUIRE(fault_outcome.unbooked_execution->fill->quantity == quantity("1"));
+    const auto halted = require_order_record(store, account_id, "halted");
+    const auto& halted_outcome = std::get<PaperOrderFaultRecord>(halted.outcome);
+    REQUIRE(
+        halted_outcome.code == PaperOrderProcessingErrorCode::ProcessorFaulted
+    );
+    REQUIRE(!halted_outcome.unbooked_execution.has_value());
+
+    const auto fills = require_fill_page(store, account_id, 10);
+    REQUIRE(fills.records.size() == 1);
+    REQUIRE(fills.records.front().client_order_id == "booked");
+    REQUIRE(fills.records.front().fill.fill_id == "booked:fill:0");
+}
+
+void test_fill_history_links_booked_fills_newest_first() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("fill-history");
+    auto session = create_session(store, account_id);
+    const TopOfBookEvent quote = market(10, 100, "99", "5", "101", "5");
+    const auto first = require_order_receipt(require_persisted_receipt(
+        session.submit(order(account_id, "buy-a", Side::Buy, "2", 110), quote)
+    ));
+    OrderIntent passive = order(account_id, "passive", Side::Buy, "1", 110);
+    passive.type = OrderType::Limit;
+    passive.limit_price = price("100");
+    require_persisted_receipt(session.submit(passive, quote));
+    require_persisted_receipt(session.submit(
+        order(account_id, "too-big", Side::Buy, "90", 110),
+        quote
+    ));
+    OrderIntent model_sell = order(account_id, "sell-b", Side::Sell, "1.5", 111);
+    model_sell.source = OrderSource{
+        .kind = OrderSourceKind::Model,
+        .source_id = "mean-reversion-v2",
+    };
+    const auto second = require_order_receipt(require_persisted_receipt(
+        session.submit(model_sell, quote)
+    ));
+
+    const auto fills = require_fill_page(store, account_id, 10);
+    REQUIRE(fills.records.size() == 2);
+    REQUIRE(fills.records[0].account_id == account_id);
+    REQUIRE(fills.records[0].client_order_id == "sell-b");
+    REQUIRE(fills.records[0].source.kind == OrderSourceKind::Model);
+    REQUIRE(fills.records[0].source.source_id == "mean-reversion-v2");
+    REQUIRE(fills.records[0].fill == *second.execution.fill);
+    REQUIRE(fills.records[1].client_order_id == "buy-a");
+    REQUIRE(fills.records[1].fill == *first.execution.fill);
+    REQUIRE(fills.records[0].record_id > fills.records[1].record_id);
+}
+
+void test_pages_are_bounded_and_stable_while_orders_arrive() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("keyset-pages");
+    auto session = create_session(store, account_id);
+    std::vector<std::string> submitted;
+    for (int index = 0; index < 5; ++index) {
+        const std::string id = "order-" + std::to_string(index);
+        OrderIntent passive = order(account_id, id, Side::Buy, "1", 110);
+        passive.type = OrderType::Limit;
+        passive.limit_price = price("100");
+        require_persisted_receipt(session.submit(passive, market(10, 100)));
+        submitted.push_back(id);
+    }
+
+    const auto first = require_order_page(store, account_id, 2);
+    REQUIRE((client_order_ids(first) ==
+             std::vector<std::string>{"order-4", "order-3"}));
+    REQUIRE(first.next_before_record_id == first.records.back().record_id);
+
+    OrderIntent newer = order(account_id, "newer", Side::Buy, "1", 110);
+    newer.type = OrderType::Limit;
+    newer.limit_price = price("100");
+    require_persisted_receipt(session.submit(newer, market(10, 100)));
+
+    const auto second = require_order_page(
+        store,
+        account_id,
+        2,
+        first.next_before_record_id
+    );
+    REQUIRE((client_order_ids(second) ==
+             std::vector<std::string>{"order-2", "order-1"}));
+    const auto last = require_order_page(
+        store,
+        account_id,
+        2,
+        second.next_before_record_id
+    );
+    REQUIRE((client_order_ids(last) == std::vector<std::string>{"order-0"}));
+    REQUIRE(!last.next_before_record_id.has_value());
+
+    const auto exact = require_order_page(store, account_id, 6);
+    REQUIRE(exact.records.size() == 6);
+    REQUIRE(!exact.next_before_record_id.has_value());
+    REQUIRE(exact.records.front().intent.client_order_id == "newer");
+    const auto one_short = require_order_page(store, account_id, 5);
+    REQUIRE(one_short.next_before_record_id.has_value());
+    const auto past_oldest = require_order_page(
+        store,
+        account_id,
+        10,
+        exact.records.back().record_id
+    );
+    REQUIRE(past_oldest.records.empty());
+    REQUIRE(!past_oldest.next_before_record_id.has_value());
+}
+
+void test_invalid_read_requests_are_rejected_before_querying() {
+    auto store = repository();
+    const std::string account_id = unique_test_id("invalid-read");
+    REQUIRE_THROWS_AS(
+        store.list_orders(
+            account_id,
+            PaperJournalPageRequest{.limit = 0, .before_record_id = {}}
+        ),
+        std::invalid_argument
+    );
+    for (const std::int64_t before : {std::int64_t{0}, std::int64_t{-1}}) {
+        REQUIRE_THROWS_AS(
+            store.list_fills(
+                account_id,
+                PaperJournalPageRequest{.limit = 1, .before_record_id = before}
+            ),
+            std::invalid_argument
+        );
+    }
+    REQUIRE_THROWS_AS(store.find_order(account_id, ""), std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        store.find_order(account_id, std::string("order\0suffix", 12)),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        store.list_orders(
+            account_id + std::string("\0x", 2),
+            PaperJournalPageRequest{.limit = 1, .before_record_id = {}}
+        ),
+        std::invalid_argument
+    );
+}
+
+void test_malformed_intents_round_trip_through_the_journal() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("malformed-read");
+    auto session = create_session(store, account_id);
+    OrderIntent malformed = order(account_id, "malformed", Side::Buy, "1", 110);
+    malformed.side = static_cast<Side>(99);
+    malformed.quantity = Quantity{};
+    malformed.submitted_at = Timestamp::from_nanoseconds(-1);
+    require_persisted_receipt(session.submit(malformed, market(10, 100)));
+
+    const auto record = require_order_record(store, account_id, "malformed");
+    REQUIRE(record.intent == malformed);
+    REQUIRE(
+        std::get<PreTradeRiskRejection>(record.outcome).code ==
+        PreTradeRiskErrorCode::UnknownSide
+    );
+
+    // The writer spells an undeclared value exactly one way.
+    PostgresTestConnection editor(connection_string);
+    static_cast<void>(editor.query(
+        "UPDATE paper_order_records SET side = 'unknown:099' "
+        "WHERE account_id = $1",
+        {account_id}
+    ));
+    REQUIRE_THROWS_AS(
+        store.find_order(account_id, "malformed"),
+        std::runtime_error
+    );
+}
+
+void test_inconsistent_journal_rows_fail_closed() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    PostgresTestConnection editor(connection_string);
+    const auto corrupted_read = [&](const std::string& prefix,
+                                    std::string_view update) {
+        const std::string account_id = unique_test_id(prefix);
+        auto session = create_session(store, account_id);
+        require_persisted_receipt(session.submit(
+            order(account_id, "subject", Side::Buy, "1", 110),
+            market(10, 100)
+        ));
+        static_cast<void>(editor.query(update, {account_id}));
+        REQUIRE_THROWS_AS(
+            store.find_order(account_id, "subject"),
+            std::runtime_error
+        );
+        REQUIRE_THROWS_AS(
+            store.list_orders(
+                account_id,
+                PaperJournalPageRequest{.limit = 5, .before_record_id = {}}
+            ),
+            std::runtime_error
+        );
+    };
+    corrupted_read(
+        "corrupt-status",
+        "UPDATE paper_order_records SET execution_status = 'cancelled' "
+        "WHERE account_id = $1"
+    );
+    corrupted_read(
+        "corrupt-quantity",
+        "UPDATE paper_order_records SET unfilled_quantity_raw = 1 "
+        "WHERE account_id = $1"
+    );
+    corrupted_read(
+        "corrupt-side",
+        "UPDATE paper_order_records SET side = 'unknown:1' "
+        "WHERE account_id = $1"
+    );
+    corrupted_read(
+        "corrupt-code",
+        "UPDATE paper_order_records SET outcome_code = 'insufficient_cash' "
+        "WHERE account_id = $1"
+    );
+    corrupted_read(
+        "corrupt-market",
+        "UPDATE paper_order_records "
+        "SET execution_market_ingest_sequence = 11 WHERE account_id = $1"
+    );
+}
+
+void test_journal_reads_report_connection_loss_and_reconnect() {
+    const std::string application = unique_test_id("read-outage");
+    PostgresPaperOrderRepository store(
+        with_application_name(connection_string, application)
+    );
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("read-outage");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        order(account_id, "before-outage", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    REQUIRE_THROWS_AS(
+        store.list_orders(
+            account_id,
+            PaperJournalPageRequest{.limit = 5, .before_record_id = {}}
+        ),
+        PaperPersistenceUnavailable
+    );
+    REQUIRE(require_order_page(store, account_id, 5).records.size() == 1);
+
+    terminate_backends(observer, application);
+    REQUIRE_THROWS_AS(
+        store.find_order(account_id, "before-outage"),
+        PaperPersistenceUnavailable
+    );
+    REQUIRE(require_fill_page(store, account_id, 5).records.size() == 1);
 }
 
 }  // namespace
@@ -637,6 +1130,46 @@ int main() {
         {
             "connection lost during commit records nothing",
             test_connection_lost_during_commit_records_nothing,
+        },
+        {
+            "empty history is distinct from a missing account",
+            test_empty_history_is_distinct_from_a_missing_account,
+        },
+        {
+            "executed orders are reconstructed exactly",
+            test_executed_orders_are_reconstructed_exactly,
+        },
+        {
+            "rejections are reconstructed exactly",
+            test_rejections_and_faults_are_reconstructed_exactly,
+        },
+        {
+            "unbooked fault fill is never reported as booked",
+            test_unbooked_fill_of_a_fault_is_never_reported_as_booked,
+        },
+        {
+            "fill history links booked fills newest first",
+            test_fill_history_links_booked_fills_newest_first,
+        },
+        {
+            "pages are bounded and stable while orders arrive",
+            test_pages_are_bounded_and_stable_while_orders_arrive,
+        },
+        {
+            "invalid read requests are rejected",
+            test_invalid_read_requests_are_rejected_before_querying,
+        },
+        {
+            "malformed intents round trip through the journal",
+            test_malformed_intents_round_trip_through_the_journal,
+        },
+        {
+            "inconsistent journal rows fail closed",
+            test_inconsistent_journal_rows_fail_closed,
+        },
+        {
+            "journal reads survive connection loss",
+            test_journal_reads_report_connection_loss_and_reconnect,
         },
     });
 }

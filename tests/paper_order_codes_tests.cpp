@@ -6,6 +6,7 @@
 #include <set>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -22,16 +23,25 @@ using chronos::TimeInForce;
 // Every name is persisted in the journal and returned by the API. These
 // tables are deliberately literal: a failing assertion here means a stored
 // or public contract would change.
+// Every name must also decode back to its value, and the declared set must
+// be exactly the listed values; the persisted-journal reader and the API
+// parser depend on both.
 template <typename Enum>
 void require_names(
     std::initializer_list<std::pair<Enum, std::string_view>> expected
 ) {
     std::set<std::string_view> seen;
+    std::vector<Enum> listed;
     for (const auto& [value, name] : expected) {
         REQUIRE(chronos::canonical_name(value) == name);
+        REQUIRE(chronos::from_canonical_name<Enum>(name) == value);
         REQUIRE(seen.insert(name).second);
+        listed.push_back(value);
     }
+    REQUIRE(chronos::declared_values<Enum>() == listed);
     REQUIRE(!chronos::canonical_name(static_cast<Enum>(999)).has_value());
+    REQUIRE(!chronos::from_canonical_name<Enum>("").has_value());
+    REQUIRE(!chronos::from_canonical_name<Enum>("unknown:0").has_value());
 }
 
 void test_order_intent_names_are_stable() {

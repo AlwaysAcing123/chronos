@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -26,7 +28,12 @@ using chronos::OrderIntent;
 using chronos::OrderSource;
 using chronos::OrderSourceKind;
 using chronos::OrderType;
+using chronos::PaperFillRecord;
+using chronos::PaperOrderFaultRecord;
 using chronos::PaperOrderProcessingError;
+using chronos::PaperOrderRecord;
+using chronos::PaperOrderReceipt;
+using chronos::PreTradeRiskRejection;
 using chronos::PaperOrderProcessingErrorCode;
 using chronos::PaperOrderProcessor;
 using chronos::Price;
@@ -36,6 +43,9 @@ using chronos::TimeInForce;
 using chronos::Timestamp;
 using chronos::TopOfBookEvent;
 using chronos::paper_trading::CreatePaperAccountRequest;
+using chronos::paper_trading::HistoryPageRequest;
+using chronos::paper_trading::PaperFillHistoryPage;
+using chronos::paper_trading::PaperOrderHistoryPage;
 using chronos::paper_trading::HttpResponse;
 using chronos::paper_trading::MalformedRequest;
 using chronos::paper_trading::MalformedRequestReason;
@@ -810,6 +820,359 @@ void test_malformed_requests_render_reason_and_field() {
     REQUIRE(whole_body.at("error").at("field").is_null());
 }
 
+// ---------------------------------------------------------------------------
+// History queries and resources
+
+HistoryPageRequest require_history_query(std::string_view query) {
+    auto parsed = chronos::paper_trading::parse_history_query(query);
+    REQUIRE(std::holds_alternative<HistoryPageRequest>(parsed));
+    return std::get<HistoryPageRequest>(std::move(parsed));
+}
+
+MalformedRequest require_bad_history_query(
+    std::string_view query,
+    MalformedRequestReason reason,
+    std::string_view field
+) {
+    auto parsed = chronos::paper_trading::parse_history_query(query);
+    REQUIRE(std::holds_alternative<MalformedRequest>(parsed));
+    MalformedRequest malformed = std::get<MalformedRequest>(std::move(parsed));
+    REQUIRE(malformed.reason == reason);
+    REQUIRE(malformed.field == field);
+    REQUIRE(!malformed.message.empty());
+    return malformed;
+}
+
+void test_history_queries_parse_limit_and_cursor_strictly() {
+    const HistoryPageRequest empty = require_history_query("");
+    REQUIRE(!empty.limit.has_value());
+    REQUIRE(!empty.cursor.has_value());
+    const HistoryPageRequest both = require_history_query(
+        "limit=25&cursor=djF8b3JkZXJzfGFjY3QtMXw0Mg"
+    );
+    REQUIRE(both.limit == 25U);
+    REQUIRE(both.cursor == "djF8b3JkZXJzfGFjY3QtMXw0Mg");
+    REQUIRE(require_history_query("cursor=abc&limit=1").limit == 1U);
+    REQUIRE(require_history_query("%6Cimit=7").limit == 7U);
+    REQUIRE(require_history_query("cursor=a%2Db").cursor == "a-b");
+    // Range is the service's rule; syntax alone admits zero and large values.
+    REQUIRE(require_history_query("limit=0").limit == 0U);
+    REQUIRE(require_history_query("limit=100000").limit == 100'000U);
+    REQUIRE(require_history_query("cursor=").cursor == "");
+
+    for (const std::string_view limit : {
+             "limit=",
+             "limit=-1",
+             "limit=+5",
+             "limit=05",
+             "limit=1.5",
+             "limit=1e2",
+             "limit=%205",
+             "limit=five",
+             "limit=99999999999999999999999",
+         }) {
+        require_bad_history_query(
+            limit,
+            MalformedRequestReason::InvalidLimit,
+            "limit"
+        );
+    }
+    require_bad_history_query(
+        "limit=5&limit=6",
+        MalformedRequestReason::DuplicateField,
+        "limit"
+    );
+    require_bad_history_query(
+        "cursor=a&limit=5&cursor=b",
+        MalformedRequestReason::DuplicateField,
+        "cursor"
+    );
+    require_bad_history_query(
+        "limit=5&offset=10",
+        MalformedRequestReason::UnexpectedField,
+        "offset"
+    );
+    require_bad_history_query(
+        "Limit=5",
+        MalformedRequestReason::UnexpectedField,
+        "Limit"
+    );
+    const MalformedRequest unsafe = require_bad_history_query(
+        "%FF%00=1",
+        MalformedRequestReason::UnexpectedField,
+        ""
+    );
+    REQUIRE(unsafe.message == "query string contains an unrecognized parameter");
+    for (const std::string_view syntax : {
+             "&",
+             "limit=5&",
+             "&limit=5",
+             "limit",
+             "=5",
+             "limit=5&&cursor=a",
+             "limit=%",
+             "limit=%4",
+             "limit=%zz",
+         }) {
+        require_bad_history_query(syntax, MalformedRequestReason::InvalidQuery, "");
+    }
+}
+
+void test_parameterless_routes_reject_every_query_parameter() {
+    using chronos::paper_trading::reject_query_parameters;
+    REQUIRE(!reject_query_parameters("").has_value());
+    const auto unknown = reject_query_parameters("verbose=true");
+    REQUIRE(unknown.has_value());
+    REQUIRE(unknown->reason == MalformedRequestReason::UnexpectedField);
+    REQUIRE(unknown->field == "verbose");
+    const auto limit = reject_query_parameters("limit=5");
+    REQUIRE(limit->reason == MalformedRequestReason::UnexpectedField);
+    REQUIRE(reject_query_parameters("x")->reason ==
+            MalformedRequestReason::InvalidQuery);
+}
+
+PaperOrderRecord journal_record(
+    std::int64_t record_id,
+    const RecordedPaperOrder& recorded
+) {
+    PaperOrderRecord record{
+        .record_id = record_id,
+        .intent = recorded.intent,
+        .market = recorded.market,
+        .outcome = PreTradeRiskRejection{},
+    };
+    std::visit(
+        [&record](const auto& result) {
+            using Result = std::decay_t<decltype(result)>;
+            if constexpr (std::is_same_v<Result, PaperOrderReceipt>) {
+                record.outcome = result.execution;
+            } else if constexpr (std::is_same_v<Result, PaperOrderProcessingError>) {
+                record.outcome = PaperOrderFaultRecord{
+                    .code = result.code,
+                    .message = result.message,
+                    .unbooked_execution = result.execution,
+                };
+            } else {
+                record.outcome = result;
+            }
+        },
+        recorded.result
+    );
+    return record;
+}
+
+void test_journal_orders_render_the_same_resource_as_submissions() {
+    auto engine = processor();
+    const TopOfBookEvent market = quote(3, 0);
+    for (const auto& order : {
+             intent("filled", Side::Buy, "2.5"),
+             intent("partial", Side::Buy, "4"),
+             intent("passive", Side::Buy, "1", 0, "100.5"),
+             intent("too-large", Side::Buy, "50"),
+         }) {
+        const RecordedPaperOrder recorded = record(engine, order, market, 1);
+        const Json submitted = response_json(
+            chronos::paper_trading::render_order_submission(recorded)
+        );
+        const HttpResponse lookup = chronos::paper_trading::render_order_record(
+            journal_record(9, recorded)
+        );
+        REQUIRE(lookup.status == 200);
+        const Json looked_up = response_json(lookup);
+        REQUIRE(looked_up.at("order") == submitted.at("order"));
+        REQUIRE(!looked_up.contains("account"));
+        if (submitted.contains("error")) {
+            REQUIRE(submitted.at("order").at("rejection") == submitted.at("error"));
+        } else {
+            REQUIRE(submitted.at("order").at("rejection").is_null());
+        }
+    }
+}
+
+void test_rejection_and_fault_records_render_exactly() {
+    auto engine = processor();
+    const TopOfBookEvent market = quote(0, 0);
+    const RecordedPaperOrder stale = record(
+        engine,
+        intent(
+            "stale",
+            Side::Buy,
+            "1",
+            chronos::test::kMaximumQuoteAgeNanoseconds + 1
+        ),
+        market,
+        1
+    );
+    const Json stale_order = response_json(
+        chronos::paper_trading::render_order_record(journal_record(1, stale))
+    ).at("order");
+    REQUIRE(stale_order.at("status") == "rejected");
+    REQUIRE(stale_order.at("rejection") == Json({
+        {"code", "market_data_stale"},
+        {"message", "top-of-book state is older than the configured risk limit"},
+        {"field", nullptr},
+        {"reason", "stale_market_state"},
+    }));
+    REQUIRE(stale_order.at("fill").is_null());
+
+    // A fault keeps its unbooked simulated fill in the journal record, but
+    // the resource reports no fill and no filled quantity.
+    RecordedPaperOrder executed = record(
+        engine,
+        intent("faulted", Side::Buy, "2"),
+        market,
+        2
+    );
+    PaperOrderRecord fault = journal_record(2, executed);
+    fault.outcome = PaperOrderFaultRecord{
+        .code = PaperOrderProcessingErrorCode::AccountingInvariantViolation,
+        .message = "risk-approved simulated fill was rejected by accounting",
+        .unbooked_execution =
+            std::get<PaperOrderReceipt>(executed.result).execution,
+    };
+    const Json fault_order = response_json(
+        chronos::paper_trading::render_order_record(fault)
+    ).at("order");
+    REQUIRE(fault_order.at("status") == "faulted");
+    REQUIRE(fault_order.at("fill").is_null());
+    REQUIRE(fault_order.at("filled_quantity") == "0");
+    REQUIRE(fault_order.at("unfilled_quantity") == "2");
+    REQUIRE(fault_order.at("rejection").at("code") == "processing_fault");
+    REQUIRE(
+        fault_order.at("rejection").at("reason") ==
+        "accounting_invariant_violation"
+    );
+}
+
+void test_order_history_pages_render_cursor_or_null() {
+    auto engine = processor();
+    const TopOfBookEvent market = quote(0, 0);
+    const RecordedPaperOrder first = record(
+        engine,
+        intent("first", Side::Buy, "1"),
+        market,
+        1
+    );
+    const RecordedPaperOrder second = record(
+        engine,
+        intent("second", Side::Buy, "1"),
+        market,
+        2
+    );
+    const HttpResponse response = chronos::paper_trading::render_order_history(
+        PaperOrderHistoryPage{
+            .orders = {journal_record(8, second), journal_record(7, first)},
+            .next_cursor = "djF8b3JkZXJzfGFjY3QtMXw3",
+        }
+    );
+    REQUIRE(response.status == 200);
+    const Json body = response_json(response);
+    REQUIRE(body.at("orders").size() == 2);
+    REQUIRE(body.at("orders")[0].at("client_order_id") == "second");
+    REQUIRE(body.at("orders")[1].at("client_order_id") == "first");
+    REQUIRE(body.at("next_cursor") == "djF8b3JkZXJzfGFjY3QtMXw3");
+
+    const Json empty = response_json(chronos::paper_trading::render_order_history(
+        PaperOrderHistoryPage{.orders = {}, .next_cursor = std::nullopt}
+    ));
+    REQUIRE(empty.at("orders") == Json::array());
+    REQUIRE(empty.at("next_cursor").is_null());
+}
+
+void test_fill_history_renders_linkage_and_exact_notional() {
+    const PaperFillRecord rounded{
+        .record_id = 5,
+        .account_id = "acct-1",
+        .client_order_id = "order-5",
+        .source = OrderSource{
+            .kind = OrderSourceKind::Model,
+            .source_id = "momentum-v1",
+        },
+        .fill = chronos::Fill{
+            .fill_id = "order-5:fill:0",
+            .instrument = InstrumentId("AAPL"),
+            .side = Side::Sell,
+            .price = Price::parse("0.333333333"),
+            .quantity = Quantity::parse("3"),
+            .fee = Money::parse("0.00000001"),
+            .timestamp = Timestamp::from_nanoseconds(kMarketOpenNanoseconds + 7),
+        },
+    };
+    const HttpResponse response = chronos::paper_trading::render_fill_history(
+        PaperFillHistoryPage{.fills = {rounded}, .next_cursor = std::nullopt}
+    );
+    REQUIRE(response.status == 200);
+    const Json body = response_json(response);
+    REQUIRE(body.at("next_cursor").is_null());
+    REQUIRE(body.at("fills")[0] == Json({
+        {"trading_mode", "paper"},
+        {"account_id", "acct-1"},
+        {"client_order_id", "order-5"},
+        {"source", {{"kind", "model"}, {"id", "momentum-v1"}}},
+        {"instrument", "AAPL"},
+        {"fill_id", "order-5:fill:0"},
+        {"side", "sell"},
+        {"price", "0.333333333"},
+        {"quantity", "3"},
+        {"notional", "1"},
+        {"fee", "0.00000001"},
+        {"filled_at", "2026-09-25T13:30:00.000000007Z"},
+    }));
+}
+
+void test_read_side_errors_map_to_stable_codes() {
+    const auto render = [](PaperTradingErrorCode code, std::string field) {
+        return chronos::paper_trading::render_order_history(PaperTradingError{
+            .code = code,
+            .field = std::move(field),
+            .message = "detail",
+            .market_state = std::nullopt,
+        });
+    };
+    REQUIRE(require_error_body(
+        render(PaperTradingErrorCode::OrderNotFound, "client_order_id"),
+        404,
+        "order_not_found"
+    ).at("error").at("field") == "client_order_id");
+    const Json limit = require_error_body(
+        render(PaperTradingErrorCode::InvalidPageLimit, "limit"),
+        400,
+        "malformed_request"
+    );
+    REQUIRE(limit.at("error").at("reason") == "invalid_limit");
+    const Json cursor = require_error_body(
+        render(PaperTradingErrorCode::InvalidCursor, "cursor"),
+        400,
+        "malformed_request"
+    );
+    REQUIRE(cursor.at("error").at("reason") == "invalid_cursor");
+    REQUIRE(cursor.at("error").at("field") == "cursor");
+    require_error_body(
+        chronos::paper_trading::render_fill_history(PaperTradingError{
+            .code = PaperTradingErrorCode::AccountNotFound,
+            .field = "account_id",
+            .message = "paper account does not exist",
+            .market_state = std::nullopt,
+        }),
+        404,
+        "account_not_found"
+    );
+}
+
+// The journal can preserve a malformed intent from an in-process caller.
+// The v1 contract has no spelling for it, so rendering fails closed and the
+// router reports a generic internal error.
+void test_undeclared_journal_values_fail_closed_when_rendered() {
+    auto engine = processor();
+    OrderIntent malformed = intent("malformed", Side::Buy, "1");
+    malformed.side = static_cast<Side>(99);
+    const RecordedPaperOrder recorded = record(engine, malformed, quote(0, 0), 1);
+    REQUIRE_THROWS_AS(
+        chronos::paper_trading::render_order_record(journal_record(1, recorded)),
+        std::logic_error
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -856,6 +1219,38 @@ int main() {
         {
             "malformed requests render reason and field",
             test_malformed_requests_render_reason_and_field,
+        },
+        {
+            "history queries parse strictly",
+            test_history_queries_parse_limit_and_cursor_strictly,
+        },
+        {
+            "parameterless routes reject query parameters",
+            test_parameterless_routes_reject_every_query_parameter,
+        },
+        {
+            "journal orders render the submission resource",
+            test_journal_orders_render_the_same_resource_as_submissions,
+        },
+        {
+            "rejection and fault records render exactly",
+            test_rejection_and_fault_records_render_exactly,
+        },
+        {
+            "order history renders cursor or null",
+            test_order_history_pages_render_cursor_or_null,
+        },
+        {
+            "fill history renders linkage and exact notional",
+            test_fill_history_renders_linkage_and_exact_notional,
+        },
+        {
+            "read-side errors map to stable codes",
+            test_read_side_errors_map_to_stable_codes,
+        },
+        {
+            "undeclared journal values fail closed",
+            test_undeclared_journal_values_fail_closed_when_rendered,
         },
     });
 }

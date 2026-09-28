@@ -4,9 +4,11 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <sstream>
@@ -116,16 +118,30 @@ inline std::string unique_test_id(std::string_view prefix) {
         std::to_string(counter.fetch_add(1));
 }
 
-inline std::string migration_sql() {
-    const std::string path =
-        std::string(CHRONOS_SOURCE_DIR) +
-        "/migrations/001_paper_trading.sql";
-    std::ifstream input(path);
-    if (!input) {
-        throw TestFailure("could not open migration: " + path);
+// Every migration in lexical file order, as a fresh Compose volume applies
+// them. Each file is idempotent and owns its transaction.
+inline std::string all_migrations_sql() {
+    const std::filesystem::path directory =
+        std::filesystem::path(CHRONOS_SOURCE_DIR) / "migrations";
+    std::vector<std::filesystem::path> files;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() == ".sql") {
+            files.push_back(entry.path());
+        }
     }
+    std::sort(files.begin(), files.end());
+    if (files.empty()) {
+        throw TestFailure("no migrations found in " + directory.string());
+    }
+
     std::ostringstream contents;
-    contents << input.rdbuf();
+    for (const auto& file : files) {
+        std::ifstream input(file);
+        if (!input) {
+            throw TestFailure("could not open migration: " + file.string());
+        }
+        contents << input.rdbuf() << '\n';
+    }
     return contents.str();
 }
 

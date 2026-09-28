@@ -5,6 +5,7 @@
 #include <httplib.h>
 
 #include <atomic>
+#include <cstddef>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,16 @@
 
 namespace chronos::paper_trading {
 namespace {
+
+// The raw query component. The library's own parameter map merges
+// duplicates and form bodies leniently, so the JSON contract parses this
+// text itself.
+std::string raw_query(const httplib::Request& request) {
+    const std::size_t question = request.target.find('?');
+    return question == std::string::npos
+        ? std::string()
+        : request.target.substr(question + 1);
+}
 
 void write_response(const HttpResponse& source, httplib::Response& target) {
     target.status = source.status;
@@ -85,6 +96,7 @@ struct PaperTradingHttpServer::Impl {
                     api.handle(HttpRequest{
                         .method = request.method,
                         .path = request.path,
+                        .query = raw_query(request),
                         .content_type =
                             request.get_header_value("Content-Type"),
                         .body = request.body,
