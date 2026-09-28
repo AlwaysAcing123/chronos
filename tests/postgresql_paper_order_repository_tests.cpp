@@ -1,16 +1,15 @@
 #include "chronos/postgresql_paper_order_repository.hpp"
+#include "postgres_test_support.hpp"
 #include "test_support.hpp"
 
-#include <atomic>
-#include <chrono>
 #include <cstdlib>
-#include <fstream>
+#include <exception>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -27,6 +26,7 @@ using chronos::OrderType;
 using chronos::PaperOrderReceipt;
 using chronos::PaperPersistenceConflict;
 using chronos::PaperPersistenceConflictCode;
+using chronos::PaperPersistenceUnavailable;
 using chronos::PersistentPaperOrderReceipt;
 using chronos::PersistentPaperOrderResult;
 using chronos::PersistentPaperOrderSession;
@@ -43,6 +43,12 @@ using chronos::SimulatedExecutionStatus;
 using chronos::TimeInForce;
 using chronos::Timestamp;
 using chronos::TopOfBookEvent;
+using chronos::test::migration_sql;
+using chronos::test::PostgresTestConnection;
+using chronos::test::terminate_backends;
+using chronos::test::unique_test_id;
+using chronos::test::wait_until_blocked_on_lock;
+using chronos::test::with_application_name;
 
 std::string connection_string;
 
@@ -63,28 +69,6 @@ PreTradeRiskLimits risk_limits(
         .maximum_quote_age_nanoseconds = maximum_quote_age_nanoseconds,
         .fee_per_fill = money("0.01"),
     };
-}
-
-std::string unique_account_id(std::string_view prefix) {
-    static std::atomic<std::uint64_t> counter{0};
-    const auto now = std::chrono::system_clock::now()
-        .time_since_epoch()
-        .count();
-    return std::string(prefix) + "-" + std::to_string(now) + "-" +
-        std::to_string(counter.fetch_add(1));
-}
-
-std::string migration_sql() {
-    const std::string path =
-        std::string(CHRONOS_SOURCE_DIR) +
-        "/migrations/001_paper_trading.sql";
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("could not open migration: " + path);
-    }
-    std::ostringstream contents;
-    contents << input.rdbuf();
-    return contents.str();
 }
 
 PostgresPaperOrderRepository repository() {
@@ -191,7 +175,7 @@ PaperOrderReceipt require_order_receipt(PersistentPaperOrderReceipt receipt) {
 void test_fills_and_shadow_liquidity_survive_restart() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("restart");
+    const std::string account_id = unique_test_id("restart");
     auto session = create_session(store, account_id);
     const OrderIntent first_order = order(
         account_id,
@@ -252,7 +236,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
 void test_duplicate_submission_rolls_back_every_database_change() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("duplicate");
+    const std::string account_id = unique_test_id("duplicate");
     auto session = create_session(store, account_id);
     const OrderIntent intent = order(
         account_id,
@@ -286,7 +270,7 @@ void test_duplicate_submission_rolls_back_every_database_change() {
 void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("rejection");
+    const std::string account_id = unique_test_id("rejection");
     auto session = create_session(store, account_id, risk_limits(5));
     const OrderIntent rejected_order = order(
         account_id,
@@ -337,7 +321,7 @@ void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
 void test_optimistic_version_conflict_preserves_committed_account() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("concurrency");
+    const std::string account_id = unique_test_id("concurrency");
     auto first_session = create_session(store, account_id);
     auto second_session = PersistentPaperOrderSession::load(store, account_id);
     REQUIRE(second_session.has_value());
@@ -368,7 +352,7 @@ void test_optimistic_version_conflict_preserves_committed_account() {
 void test_processed_client_ids_survive_restart() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("processed-id");
+    const std::string account_id = unique_test_id("processed-id");
     auto session = create_session(store, account_id);
     const OrderIntent intent = order(
         account_id,
@@ -392,7 +376,7 @@ void test_processed_client_ids_survive_restart() {
 void test_malformed_order_is_preserved_as_a_risk_rejection() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("malformed");
+    const std::string account_id = unique_test_id("malformed");
     auto session = create_session(store, account_id);
     OrderIntent malformed = order(
         account_id,
@@ -428,7 +412,7 @@ void test_malformed_order_is_preserved_as_a_risk_rejection() {
 void test_missing_client_order_ids_remain_auditable() {
     auto store = repository();
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("missing-client-id");
+    const std::string account_id = unique_test_id("missing-client-id");
     auto session = create_session(store, account_id);
     OrderIntent first = order(account_id, "", Side::Buy, "1", 110);
     OrderIntent second = order(account_id, "", Side::Buy, "1", 111);
@@ -471,10 +455,130 @@ void test_failed_migration_does_not_poison_connection() {
     );
 
     store.apply_migration(migration_sql());
-    const std::string account_id = unique_account_id("migration-recovery");
+    const std::string account_id = unique_test_id("migration-recovery");
     auto session = create_session(store, account_id);
     REQUIRE(session.version() == 0);
     REQUIRE(session.account().state().cash == money("1000"));
+}
+
+void test_text_with_nul_bytes_is_never_persisted() {
+    auto store = repository();
+    store.apply_migration(migration_sql());
+    const std::string account_id = unique_test_id("nul-text");
+    const std::string account_id_with_nul = account_id + std::string("\0x", 2);
+    REQUIRE_THROWS_AS(
+        PersistentPaperOrderSession::create(
+            store,
+            account_id_with_nul,
+            InstrumentId("AAPL"),
+            money("1000"),
+            risk_limits()
+        ),
+        std::invalid_argument
+    );
+    REQUIRE(!store.load_account(account_id).has_value());
+
+    auto session = create_session(store, account_id);
+    const std::string client_order_id_with_nul("order\0suffix", 12);
+    REQUIRE_THROWS_AS(
+        session.submit(
+            order(account_id, client_order_id_with_nul, Side::Buy, "1", 110),
+            market(10, 100)
+        ),
+        std::invalid_argument
+    );
+    REQUIRE(session.version() == 0);
+    REQUIRE(session.account().state().position == Quantity{});
+    const auto summary = store.journal_summary(account_id);
+    REQUIRE(summary.order_count == 0);
+    REQUIRE(summary.account_version == 0);
+
+    require_persisted_receipt(session.submit(
+        order(account_id, "order", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+}
+
+void test_lost_connection_is_reported_and_then_reconnected() {
+    const std::string application = unique_test_id("lost-connection");
+    PostgresPaperOrderRepository store(
+        with_application_name(connection_string, application)
+    );
+    store.apply_migration(migration_sql());
+    const std::string account_id = unique_test_id("reconnect");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        order(account_id, "before-loss", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    REQUIRE_THROWS_AS(
+        store.load_account(account_id),
+        PaperPersistenceUnavailable
+    );
+
+    auto recovered = PersistentPaperOrderSession::load(store, account_id);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->version() == 1);
+    REQUIRE(recovered->account().state().position == quantity("1"));
+
+    terminate_backends(observer, application);
+    REQUIRE(store.check_availability());
+}
+
+void test_connection_lost_during_commit_records_nothing() {
+    const std::string application = unique_test_id("commit-loss");
+    PostgresPaperOrderRepository store(
+        with_application_name(connection_string, application)
+    );
+    store.apply_migration(migration_sql());
+    const std::string account_id = unique_test_id("commit-loss");
+    auto session = create_session(store, account_id);
+    const OrderIntent intent = order(
+        account_id,
+        "interrupted",
+        Side::Buy,
+        "1",
+        110
+    );
+
+    PostgresTestConnection lock_holder(connection_string);
+    PostgresTestConnection observer(connection_string);
+    static_cast<void>(lock_holder.query("BEGIN"));
+    static_cast<void>(lock_holder.query(
+        "SELECT 1 FROM paper_accounts WHERE account_id = $1 FOR UPDATE",
+        {account_id}
+    ));
+
+    std::string submitter_outcome = "returned without an exception";
+    std::thread submitter([&] {
+        try {
+            static_cast<void>(session.submit(intent, market(10, 100)));
+        } catch (const PaperPersistenceUnavailable&) {
+            submitter_outcome = "unavailable";
+        } catch (const std::exception& error) {
+            submitter_outcome = error.what();
+        }
+    });
+    wait_until_blocked_on_lock(observer, application);
+    terminate_backends(observer, application);
+    submitter.join();
+    static_cast<void>(lock_holder.query("ROLLBACK"));
+
+    REQUIRE(submitter_outcome == "unavailable");
+    REQUIRE(session.version() == 0);
+    REQUIRE(session.account().state().position == Quantity{});
+    const auto summary = store.journal_summary(account_id);
+    REQUIRE(summary.order_count == 0);
+    REQUIRE(summary.event_count == 0);
+    REQUIRE(summary.account_version == 0);
+
+    const auto retried = require_persisted_receipt(
+        session.submit(intent, market(10, 100))
+    );
+    REQUIRE(retried.account_version == 1);
 }
 
 }  // namespace
@@ -521,6 +625,18 @@ int main() {
         {
             "failed migration leaves connection usable",
             test_failed_migration_does_not_poison_connection,
+        },
+        {
+            "text with NUL bytes is never persisted",
+            test_text_with_nul_bytes_is_never_persisted,
+        },
+        {
+            "lost connection is reported then reconnected",
+            test_lost_connection_is_reported_and_then_reconnected,
+        },
+        {
+            "connection lost during commit records nothing",
+            test_connection_lost_during_commit_records_nothing,
         },
     });
 }

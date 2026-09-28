@@ -63,6 +63,26 @@ cost basis, invalid market observations, duplicate IDs, mismatched account or
 instrument identity, and consumed liquidity beyond the visible book fail
 closed instead of creating a partially valid processor.
 
+## Connection loss and text parameters
+
+`PaperPersistenceUnavailable` reports that PostgreSQL could not be reached or
+that the connection was lost during an operation. It derives from
+`std::runtime_error`; every other database failure remains a plain
+`std::runtime_error` because it indicates a defect or corrupt state rather
+than an outage. When a lost connection interrupts a commit, whether the
+transaction committed is unknown. Resubmitting the same client order ID is
+safe because the database accepts it at most once.
+
+The next repository operation after a loss resets the connection once. The
+repository keeps no session state on the connection, so reconnection is
+transparent. Rolling back an abandoned transaction never throws; a lost
+connection has no transaction left to roll back.
+
+libpq text parameters end at the first NUL byte. The repository rejects any
+text parameter containing one with `std::invalid_argument` before sending the
+statement. A silently truncated identifier would otherwise make the journal
+disagree with the in-memory idempotency state.
+
 ## Audit journal
 
 `paper_order_records` preserves the routed account, requested account,
@@ -145,6 +165,10 @@ tests prove:
 - Stale concurrent sessions cannot overwrite committed state.
 - Processed IDs remain effective after recovery.
 - Malformed rejected inputs remain persistable and auditable.
+- Text containing NUL bytes is rejected without persisting anything.
+- A terminated connection is reported as unavailable and then reconnected.
+- A connection lost while a commit waits on a row lock records nothing and
+  leaves the client order ID reusable.
 
 The integration executable returns the standard CTest skip code when
 `CHRONOS_TEST_POSTGRES_URL` is absent, so ordinary core builds do not require a
@@ -153,13 +177,15 @@ database.
 ## Current limitations
 
 - One PostgreSQL connection per repository; no connection pool yet
+- No statement or lock timeout; a blocked row lock blocks the caller
 - No authentication or user-to-account authorization layer
 - No TLS policy or production secret manager configuration
 - No migration runner CLI or rollback migrations
 - Snapshot recovery is validated against database constraints and domain
   invariants but is not yet independently recomputed from the complete journal
 - No retention, archival, backup, replication, or disaster-recovery policy
-- No API endpoint exposes this component yet
+- The paper-trading API uses this component through request-scoped
+  sessions; see [paper-trading-api.md](paper-trading-api.md)
 
 These belong to the backend and production-hardening milestones. They do not
 weaken the current guarantees for local, atomic, restart-safe paper trading.
