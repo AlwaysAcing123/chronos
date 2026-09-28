@@ -131,6 +131,7 @@ target_link_libraries(chronos_market_state
 add_library(chronos_paper_execution
     core/src/paper_order_codes.cpp
     core/src/paper_order_processor.cpp
+    core/src/portfolio_valuation.cpp
     core/src/pre_trade_risk.cpp
     core/src/top_of_book_execution.cpp
 )
@@ -435,6 +436,21 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_paper_order_codes_tests
         COMMAND chronos_paper_order_codes_tests
+    )
+
+    add_executable(chronos_portfolio_valuation_tests
+        tests/portfolio_valuation_tests.cpp
+    )
+
+    target_link_libraries(chronos_portfolio_valuation_tests
+        PRIVATE
+            chronos_paper_execution
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_portfolio_valuation_tests
+        COMMAND chronos_portfolio_valuation_tests
     )
 
     add_executable(chronos_paper_order_processor_tests

@@ -128,6 +128,26 @@ std::optional<PreTradeRiskRejection> validate_intent(
 
 }  // namespace
 
+MarketObservationRecency classify_market_observation_recency(
+    Timestamp observation_received_at,
+    Timestamp market_time,
+    std::int64_t maximum_quote_age_nanoseconds
+) {
+    if (maximum_quote_age_nanoseconds < 0) {
+        throw std::invalid_argument(
+            "maximum quote age must not be negative"
+        );
+    }
+    if (observation_received_at > market_time) {
+        return MarketObservationRecency::FromFuture;
+    }
+    if (market_time.nanoseconds() - observation_received_at.nanoseconds() >
+        maximum_quote_age_nanoseconds) {
+        return MarketObservationRecency::Stale;
+    }
+    return MarketObservationRecency::Current;
+}
+
 ApprovedOrderIntent::ApprovedOrderIntent(
     OrderIntent intent,
     TopOfBookEvent market,
@@ -216,12 +236,7 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             "top-of-book instrument does not match the order"
         );
     }
-    if (market.header.quality.contains(
-            MarketDataQualityFlag::PotentiallyInvalidBook
-        ) ||
-        market.header.quality.contains(
-            MarketDataQualityFlag::QuestionableReceiveTimestamp
-        )) {
+    if (market.header.quality.is_suspect()) {
         return rejection(
             PreTradeRiskErrorCode::SuspectMarketState,
             "market.header.quality",
@@ -229,23 +244,25 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
         );
     }
 
-    const std::int64_t submitted_at = intent.submitted_at.nanoseconds();
-    const std::int64_t market_received_at =
-        market.header.receive_timestamp.nanoseconds();
-    if (market_received_at > submitted_at) {
-        return rejection(
-            PreTradeRiskErrorCode::MarketObservationFromFuture,
-            "market.header.receive_timestamp",
-            "order cannot use a market observation received in the future"
-        );
-    }
-    if (submitted_at - market_received_at >
-        limits_.maximum_quote_age_nanoseconds) {
-        return rejection(
-            PreTradeRiskErrorCode::StaleMarketState,
-            "market.header.receive_timestamp",
-            "top-of-book state is older than the configured risk limit"
-        );
+    switch (classify_market_observation_recency(
+        market.header.receive_timestamp,
+        intent.submitted_at,
+        limits_.maximum_quote_age_nanoseconds
+    )) {
+        case MarketObservationRecency::Current:
+            break;
+        case MarketObservationRecency::FromFuture:
+            return rejection(
+                PreTradeRiskErrorCode::MarketObservationFromFuture,
+                "market.header.receive_timestamp",
+                "order cannot use a market observation received in the future"
+            );
+        case MarketObservationRecency::Stale:
+            return rejection(
+                PreTradeRiskErrorCode::StaleMarketState,
+                "market.header.receive_timestamp",
+                "top-of-book state is older than the configured risk limit"
+            );
     }
 
     const std::optional<BookLevel>& opposite_side =

@@ -142,6 +142,14 @@ explicit mark-to-market snapshot and verify the accounting identity:
 equity - starting cash = net total PnL
 ```
 
+The portfolio API marks the account at the current best bid through
+`value_portfolio`. It shares two rules with this pipeline so that valuation
+and execution cannot drift apart: `MarketDataQuality::is_suspect`, which the
+risk engine uses to reject suspect books, and `market_lineage_violation`,
+which the simulator uses to bind an account to one market timeline. The
+processor's `active_market()` exposes the observation of its latest
+execution for that check.
+
 If accounting ever rejects a risk-approved simulated fill, the processor
 returns an invariant-violation error and permanently enters a faulted state.
 It will reject subsequent submissions instead of continuing with execution

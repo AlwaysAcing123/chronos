@@ -58,6 +58,49 @@ PaperTradingError account_not_found() {
     );
 }
 
+PaperTradingError market_data_unavailable(
+    const MarketStateUnavailable& unavailable
+) {
+    PaperTradingError failure = error(
+        PaperTradingErrorCode::MarketDataUnavailable,
+        "",
+        unavailable.message
+    );
+    failure.market_state = unavailable.code;
+    return failure;
+}
+
+// A market that cannot mark the account is unavailable market data; an
+// account that cannot be valued exactly is a valuation failure.
+PaperTradingErrorCode service_code(PortfolioValuationErrorCode code) {
+    switch (code) {
+        case PortfolioValuationErrorCode::InvalidMarketState:
+        case PortfolioValuationErrorCode::MarketInstrumentMismatch:
+        case PortfolioValuationErrorCode::SuspectMarketState:
+        case PortfolioValuationErrorCode::MissingBestBid:
+        case PortfolioValuationErrorCode::StaleMarketState:
+        case PortfolioValuationErrorCode::MarketTimelineMismatch:
+            return PaperTradingErrorCode::MarketDataUnavailable;
+        case PortfolioValuationErrorCode::NonpositiveStartingCash:
+        case PortfolioValuationErrorCode::ArithmeticOverflow:
+        case PortfolioValuationErrorCode::AccountingIdentityFailed:
+            return PaperTradingErrorCode::ValuationFailed;
+    }
+    throw std::logic_error("unknown portfolio valuation error");
+}
+
+PaperTradingError portfolio_valuation_failure(
+    PortfolioValuationError failure
+) {
+    PaperTradingError mapped = error(
+        service_code(failure.code),
+        "",
+        std::move(failure.message)
+    );
+    mapped.valuation = failure.code;
+    return mapped;
+}
+
 PaperTradingError persistence_unavailable(
     const PaperPersistenceUnavailable& failure
 ) {
@@ -318,13 +361,7 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
             market_state_.execution_quote(session->account().instrument());
         if (const auto* unavailable =
                 std::get_if<MarketStateUnavailable>(&quote_result)) {
-            PaperTradingError unavailable_error = error(
-                PaperTradingErrorCode::MarketDataUnavailable,
-                "",
-                unavailable->message
-            );
-            unavailable_error.market_state = unavailable->code;
-            return unavailable_error;
+            return market_data_unavailable(*unavailable);
         }
         ExecutionQuote quote =
             std::get<ExecutionQuote>(std::move(quote_result));
@@ -459,6 +496,48 @@ PaperFillHistoryResult PaperTradingService::list_fills(
                 account_id,
                 journal.next_before_record_id
             ),
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+PaperPortfolioResult PaperTradingService::get_portfolio(
+    std::string_view account_id
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        const auto session = PersistentPaperOrderSession::load(
+            *repository_,
+            account_id
+        );
+        if (!session) {
+            return account_not_found();
+        }
+        const ExecutionQuoteResult quote_result =
+            market_state_.execution_quote(session->account().instrument());
+        if (const auto* unavailable =
+                std::get_if<MarketStateUnavailable>(&quote_result)) {
+            return market_data_unavailable(*unavailable);
+        }
+        const auto& quote = std::get<ExecutionQuote>(quote_result);
+        PortfolioValuationResult valuation = value_portfolio(
+            session->account(),
+            session->active_market(),
+            quote.top_of_book,
+            quote.market_time,
+            session->risk_limits().maximum_quote_age_nanoseconds
+        );
+        if (auto* failure = std::get_if<PortfolioValuationError>(&valuation)) {
+            return portfolio_valuation_failure(std::move(*failure));
+        }
+        return PaperPortfolioView{
+            .account = account_view(*session),
+            .valuation = std::get<PortfolioValuation>(std::move(valuation)),
         };
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);

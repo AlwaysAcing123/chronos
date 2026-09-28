@@ -70,6 +70,17 @@ struct TopOfBookExecutionRecoveryState {
     std::vector<std::string> processed_client_order_ids;
 };
 
+// An account's executions follow one market-data stream forward: the same
+// stream, a non-decreasing ingest sequence, and one state per sequence.
+// Returns the rule `market` breaks relative to the account's last execution
+// market, if any. Anything that uses a market observation on the account's
+// behalf, not only execution, must continue the same timeline.
+[[nodiscard]] std::optional<SimulatedExecutionErrorCode>
+market_lineage_violation(
+    const std::optional<TopOfBookEvent>& active_market,
+    const TopOfBookEvent& market
+);
+
 class TopOfBookExecutionSimulator final {
 public:
     TopOfBookExecutionSimulator(
@@ -94,6 +105,12 @@ public:
 
     [[nodiscard]] const InstrumentId& instrument() const noexcept {
         return instrument_;
+    }
+
+    // The observation of the latest execution; absent before the first.
+    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+        const noexcept {
+        return active_market_;
     }
 
     [[nodiscard]] TopOfBookExecutionRecoveryState recovery_state() const;

@@ -33,6 +33,8 @@ using chronos::PaperOrderFaultRecord;
 using chronos::PaperOrderProcessingError;
 using chronos::PaperOrderRecord;
 using chronos::PaperOrderReceipt;
+using chronos::PortfolioValuation;
+using chronos::PortfolioValuationErrorCode;
 using chronos::PreTradeRiskRejection;
 using chronos::PaperOrderProcessingErrorCode;
 using chronos::PaperOrderProcessor;
@@ -51,6 +53,7 @@ using chronos::paper_trading::MalformedRequest;
 using chronos::paper_trading::MalformedRequestReason;
 using chronos::paper_trading::PaperAccountView;
 using chronos::paper_trading::PaperOrderRequest;
+using chronos::paper_trading::PaperPortfolioView;
 using chronos::paper_trading::PaperTradingError;
 using chronos::paper_trading::PaperTradingErrorCode;
 using chronos::paper_trading::PaperTradingHealth;
@@ -1173,6 +1176,166 @@ void test_undeclared_journal_values_fail_closed_when_rendered() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio
+
+PaperPortfolioView portfolio_of(const PaperOrderProcessor& source, std::int64_t version) {
+    auto valuation = chronos::value_portfolio(
+        source.account(),
+        source.active_market(),
+        quote(0, 0),
+        Timestamp::from_nanoseconds(kMarketOpenNanoseconds),
+        chronos::test::kMaximumQuoteAgeNanoseconds
+    );
+    REQUIRE(std::holds_alternative<PortfolioValuation>(valuation));
+    return PaperPortfolioView{
+        .account = view_of(source, version),
+        .valuation = std::get<PortfolioValuation>(std::move(valuation)),
+    };
+}
+
+// Buying 2 at the ask of 101 and marking at the bid of 99: cost basis 202,
+// market value 198, unrealized PnL -4, fees 0.01, total PnL -4.01, cash
+// 797.99, equity 995.99, and a return of -0.401%.
+void test_portfolio_renders_every_field_as_an_exact_string() {
+    auto engine = processor();
+    static_cast<void>(record(engine, intent("buy", Side::Buy, "2"), quote(0, 0), 1));
+    const HttpResponse response =
+        chronos::paper_trading::render_portfolio(portfolio_of(engine, 1));
+    REQUIRE(response.status == 200);
+    REQUIRE(response_json(response) == Json({
+        {"portfolio", {
+            {"trading_mode", "paper"},
+            {"account_id", "account-1"},
+            {"instrument", "AAPL"},
+            {"account_version", "1"},
+            {"status", "active"},
+            {"valued_at", "2026-09-25T13:30:00.000000000Z"},
+            {"mark_policy", "best_bid"},
+            {"mark_price", "99"},
+            {"market", {
+                {"stream_id", chronos::test::kTestStream},
+                {"ingest_sequence", "0"},
+                {"venue", nullptr},
+                {"event_timestamp", "2026-09-25T13:29:59.999999750Z"},
+                {"receive_timestamp", "2026-09-25T13:30:00.000000000Z"},
+                {"quality_flags", {"replay"}},
+                {"bid", {{"price", "99"}, {"quantity", "5"}}},
+                {"ask", {{"price", "101"}, {"quantity", "5"}}},
+            }},
+            {"starting_cash", "1000"},
+            {"cash", "797.99"},
+            {"position", "2"},
+            {"open_cost_basis", "202"},
+            {"average_entry_price", "101"},
+            {"position_market_value", "198"},
+            {"unrealized_pnl", "-4"},
+            {"gross_realized_pnl", "0"},
+            {"fees_paid", "0.01"},
+            {"total_pnl", "-4.01"},
+            {"equity", "995.99"},
+            {"return_percent", "-0.401"},
+        }},
+    }));
+}
+
+void test_flat_portfolio_has_no_average_entry_price() {
+    const Json portfolio = response_json(
+        chronos::paper_trading::render_portfolio(portfolio_of(processor(), 0))
+    ).at("portfolio");
+    REQUIRE(portfolio.at("average_entry_price").is_null());
+    REQUIRE(portfolio.at("position") == "0");
+    REQUIRE(portfolio.at("position_market_value") == "0");
+    REQUIRE(portfolio.at("total_pnl") == "0");
+    REQUIRE(portfolio.at("equity") == "1000");
+    REQUIRE(portfolio.at("return_percent") == "0");
+    REQUIRE(portfolio.at("mark_price") == "99");
+}
+
+// A faulted processor keeps its last reconciled account, which is still
+// valued; only the status reports the fault.
+void test_halted_portfolio_is_valued_and_reports_its_status() {
+    auto engine = processor();
+    static_cast<void>(record(engine, intent("buy", Side::Buy, "2"), quote(0, 0), 1));
+    PaperPortfolioView halted = portfolio_of(engine, 1);
+    halted.account.is_healthy = false;
+    const Json portfolio = response_json(
+        chronos::paper_trading::render_portfolio(halted)
+    ).at("portfolio");
+    REQUIRE(portfolio.at("status") == "halted");
+    REQUIRE(portfolio.at("equity") == "995.99");
+    REQUIRE(portfolio.at("total_pnl") == "-4.01");
+}
+
+void test_portfolio_errors_map_to_stable_codes_and_reasons() {
+    const auto render = [](PaperTradingErrorCode code,
+                           std::optional<PortfolioValuationErrorCode> valuation) {
+        return chronos::paper_trading::render_portfolio(PaperTradingError{
+            .code = code,
+            .field = "",
+            .message = "internal detail from host=db password=secret",
+            .market_state = std::nullopt,
+            .valuation = valuation,
+        });
+    };
+    for (const auto& [valuation, reason] : {
+             std::pair{PortfolioValuationErrorCode::InvalidMarketState, "invalid_market_state"},
+             std::pair{
+                 PortfolioValuationErrorCode::MarketInstrumentMismatch,
+                 "market_instrument_mismatch",
+             },
+             std::pair{PortfolioValuationErrorCode::SuspectMarketState, "suspect_market_state"},
+             std::pair{PortfolioValuationErrorCode::MissingBestBid, "missing_best_bid"},
+             std::pair{PortfolioValuationErrorCode::StaleMarketState, "stale_market_state"},
+             std::pair{
+                 PortfolioValuationErrorCode::MarketTimelineMismatch,
+                 "incompatible_market_timeline",
+             },
+         }) {
+        REQUIRE(require_error_body(
+            render(PaperTradingErrorCode::MarketDataUnavailable, valuation),
+            503,
+            "market_data_unavailable"
+        ).at("error").at("reason") == reason);
+    }
+    for (const auto& [valuation, reason] : {
+             std::pair{
+                 PortfolioValuationErrorCode::NonpositiveStartingCash,
+                 "nonpositive_starting_cash",
+             },
+             std::pair{PortfolioValuationErrorCode::ArithmeticOverflow, "arithmetic_overflow"},
+             std::pair{
+                 PortfolioValuationErrorCode::AccountingIdentityFailed,
+                 "accounting_identity_failed",
+             },
+         }) {
+        const Json failed = require_error_body(
+            render(PaperTradingErrorCode::ValuationFailed, valuation),
+            500,
+            "valuation_failed"
+        );
+        REQUIRE(failed.at("error").at("reason") == reason);
+        REQUIRE(!failed.contains("portfolio"));
+    }
+    const Json outage = require_error_body(
+        render(PaperTradingErrorCode::PersistenceUnavailable, std::nullopt),
+        503,
+        "persistence_unavailable"
+    );
+    REQUIRE(outage.at("error").at("message").get<std::string>().find("secret") ==
+            std::string::npos);
+    require_error_body(
+        render(PaperTradingErrorCode::AccountNotFound, std::nullopt),
+        404,
+        "account_not_found"
+    );
+    require_error_body(
+        render(PaperTradingErrorCode::InvalidIdentifier, std::nullopt),
+        400,
+        "malformed_request"
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -1251,6 +1414,22 @@ int main() {
         {
             "undeclared journal values fail closed",
             test_undeclared_journal_values_fail_closed_when_rendered,
+        },
+        {
+            "portfolio renders every field as an exact string",
+            test_portfolio_renders_every_field_as_an_exact_string,
+        },
+        {
+            "flat portfolio has no average entry price",
+            test_flat_portfolio_has_no_average_entry_price,
+        },
+        {
+            "halted portfolio is valued and reports its status",
+            test_halted_portfolio_is_valued_and_reports_its_status,
+        },
+        {
+            "portfolio errors map to stable codes",
+            test_portfolio_errors_map_to_stable_codes_and_reasons,
         },
     });
 }

@@ -93,6 +93,8 @@ equity − starting cash = net total PnL
 
 The caller must identify the mark-price policy, such as best bid, midpoint, or last trade. This accounting layer only evaluates the supplied mark.
 
+The portfolio API's policy is the current best bid, chosen and validated by `value_portfolio` in `chronos/portfolio_valuation.hpp`. It adds a return percentage, `round(net total PnL / starting cash × 100)` to eight decimal places, half away from zero, with starting cash required to be positive. The rules are recorded in `decisions/0006-portfolio-valuation.md`.
+
 ## Primary example
 
 Starting account:

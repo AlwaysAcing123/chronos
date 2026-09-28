@@ -12,8 +12,10 @@ default and must not be exposed to other hosts. Every account and order
 resource carries `"trading_mode": "paper"`, and every response carries the
 `X-Chronos-Trading-Mode: paper` header.
 
-The decision record is
-[decisions/0004-paper-trading-http-api.md](decisions/0004-paper-trading-http-api.md).
+The decision records are
+[decisions/0004-paper-trading-http-api.md](decisions/0004-paper-trading-http-api.md)
+and, for portfolio valuation,
+[decisions/0006-portfolio-valuation.md](decisions/0006-portfolio-valuation.md).
 
 ## Architecture
 
@@ -31,6 +33,9 @@ replay driver or future live feed -> MarketState -> PaperTradingService
 
 HTTP GET history -> PaperTradingService -> journal read model
                                            (persisted rows only)
+
+HTTP GET portfolio -> PaperTradingService -> durable account + MarketState
+                                          -> value_portfolio (core)
 ```
 
 Business rules live only in the core and the service. The HTTP layer never
@@ -106,6 +111,7 @@ curl -s localhost:8080/api/v1/accounts/demo-1
 curl -s 'localhost:8080/api/v1/accounts/demo-1/orders?limit=20'
 curl -s localhost:8080/api/v1/accounts/demo-1/orders/buy-1
 curl -s localhost:8080/api/v1/accounts/demo-1/fills
+curl -s localhost:8080/api/v1/accounts/demo-1/portfolio
 ```
 
 The history endpoints read indexes added by
@@ -174,7 +180,9 @@ as `nonpositive_quantity`.
 
 Responses render decimals canonically, as produced by the fixed-point types:
 no exponent, no plus sign, no trailing fractional zeros, and no decimal point
-for whole values (`"101"`, `"0.01"`, `"-2.5"`).
+for whole values (`"101"`, `"0.01"`, `"-2.5"`). Response money and quantities
+have at most 8 fractional digits and prices at most 9. The portfolio's
+`return_percent` is a percentage with at most 8 fractional digits.
 
 ### Integers, timestamps, and absent values
 
@@ -263,8 +271,100 @@ accounting invariant violation. `average_entry_price` is `null` while flat.
 ### `GET /api/v1/accounts/{account_id}`
 
 Returns `200` with the same account resource, read from a consistent database
-snapshot. Mark-to-market valuation and unrealized PnL are not part of this
-slice because they require an explicit mark-price policy.
+snapshot. It holds no market-dependent values; mark-to-market valuation is the
+portfolio resource below.
+
+### `GET /api/v1/accounts/{account_id}/portfolio`
+
+Values the durable account against the server's current market. It is
+read-only: it records nothing, changes no account version, and consumes no
+shadow liquidity or client order ID. It accepts no query parameters and no
+other method. The client cannot supply or influence the mark.
+
+This is the response for the recording's final AAPL quote after a 10-share
+market buy that filled 4 at 337 and a model sell of 1.5 at 335.82, with a
+0.35 fee per fill:
+
+```json
+{
+  "portfolio": {
+    "trading_mode": "paper",
+    "account_id": "demo-1",
+    "instrument": "AAPL",
+    "account_version": "2",
+    "status": "active",
+    "valued_at": "2026-09-25T13:39:59.969574414Z",
+    "mark_policy": "best_bid",
+    "mark_price": "335.82",
+    "market": {
+      "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
+      "ingest_sequence": "121297",
+      "venue": null,
+      "event_timestamp": "2026-09-25T13:39:59.960824207Z",
+      "receive_timestamp": "2026-09-25T13:39:59.960922473Z",
+      "quality_flags": ["replay"],
+      "bid": {"price": "335.82", "quantity": "80"},
+      "ask": {"price": "337", "quantity": "4"}
+    },
+    "starting_cash": "100000",
+    "cash": "99155.03",
+    "position": "2.5",
+    "open_cost_basis": "842.5",
+    "average_entry_price": "337",
+    "position_market_value": "839.55",
+    "unrealized_pnl": "-2.95",
+    "gross_realized_pnl": "-1.77",
+    "fees_paid": "0.7",
+    "total_pnl": "-5.42",
+    "equity": "99994.58",
+    "return_percent": "-0.00542"
+  }
+}
+```
+
+**Mark policy.** Accounts are long-only, so the position is marked at the
+current displayed best bid (`mark_policy: "best_bid"`), the price at which it
+could begin to be sold. **This is mark-to-market valuation, not guaranteed
+liquidation proceeds**: it ignores the bid's displayed size, queue position,
+market impact, latency, and the fee a closing sale would pay. A position
+larger than `market.bid.quantity` could not be sold at the mark in this
+simulator either.
+
+A best bid is required even when the account is flat. The server never falls
+back to the ask, midpoint, last trade, cost basis, or zero; without a usable
+bid it returns `503` instead of a value.
+
+**Fields.** `market` is the exact observation whose best bid is the mark, in
+the same shape as an order's `market`. `valued_at` is the market clock when it
+was read: the receive timestamp of the latest event accepted on the stream,
+which may be later than `market.receive_timestamp` when other instruments
+updated since. `account_version` is the durable version valued. The account
+fields have the account resource's meaning; `status` is `halted` for a
+faulted account, which can still be valued.
+
+**Formulas.** All values are exact fixed-point decimals computed with checked
+arithmetic:
+
+```text
+position_market_value = round(mark_price × position)          to 0.00000001
+unrealized_pnl        = position_market_value − open_cost_basis
+equity                = cash + position_market_value
+total_pnl             = equity − starting_cash
+                      = gross_realized_pnl + unrealized_pnl − fees_paid
+return_percent        = round(total_pnl / starting_cash × 100) to 0.00000001
+```
+
+`round` is half away from zero, the same rule as every fill's notional. The
+server verifies both definitions of `total_pnl` before responding; they agree
+exactly for every valid account. `return_percent` is in percentage points:
+`"-0.00542"` means −0.00542%, not −0.542%. A value outside the fixed-point
+range fails with `500 valuation_failed` rather than being approximated.
+
+**Eligibility.** The observation must be a valid top of book for the
+account's instrument without a suspect quality flag, it must be no older than
+the account's `maximum_quote_age_ns` relative to `valued_at`, and it must
+continue the account's market timeline (see
+[Accounts are bound to one market timeline](#accounts-are-bound-to-one-market-timeline)).
 
 ### `POST /api/v1/accounts/{account_id}/orders`
 
@@ -488,9 +588,29 @@ with the same ID.
 | 422 | `market_data_stale` | yes | The quote is older than the account's maximum quote age |
 | 422 | `execution_rejected` | yes | The simulator rejected the approved order; `reason` is the execution code |
 | 500 | `processing_fault` | yes | Accounting rejected a risk-approved fill; the account is halted |
+| 500 | `valuation_failed` | no | The portfolio could not be valued exactly; `reason` is `nonpositive_starting_cash`, `arithmetic_overflow`, or `accounting_identity_failed` |
 | 500 | `internal_error` | unknown | Unexpected server failure; retry the identical request with the same identifiers |
-| 503 | `market_data_unavailable` | no | No quote for the instrument (`no_top_of_book`) or the stream is interrupted (`stream_interrupted`) |
+| 503 | `market_data_unavailable` | no | No usable market for the account; `reason` is below |
 | 503 | `persistence_unavailable` | unknown | PostgreSQL was unreachable; retry the identical request with the same identifiers |
+
+`market_data_unavailable` reasons:
+
+| `reason` | Returned by | Meaning |
+|---|---|---|
+| `no_top_of_book` | orders, portfolio | No observation of the account's instrument has been accepted |
+| `stream_interrupted` | orders, portfolio | The stream rejected an event; see `/health` |
+| `missing_best_bid` | portfolio | The current book has no bid to mark the position |
+| `suspect_market_state` | portfolio | The observation is flagged as a potentially invalid book or questionable receive timestamp |
+| `stale_market_state` | portfolio | The observation is older than the account's maximum quote age relative to market time |
+| `incompatible_market_timeline` | portfolio | The market does not continue the account's timeline |
+| `invalid_market_state` | portfolio | The observation fails the market-data contract, such as a crossed book without a quality flag |
+| `market_instrument_mismatch` | portfolio | The observation is for another instrument |
+
+The last two cannot occur while `MarketState` enforces its own contract; they
+are checked so the core never values against an unverified observation.
+Orders are journaled, so they report a suspect book or a missing side as
+the recorded `risk_rejected` reasons `suspect_market_state` and
+`missing_opposite_book_side` instead.
 
 Risk reasons are the persisted risk codes, such as `insufficient_cash`,
 `insufficient_position`, `order_quantity_limit_exceeded`,
@@ -530,7 +650,9 @@ Clients cannot supply the quote they trade against.
   ages only as later events arrive, so in a replayed market, a quiet
   instrument becomes stale while another instrument keeps updating. A live
   feed must also advance time with heartbeats, or a silent feed would never
-  become stale.
+  become stale. Portfolio valuation uses the same recency classifier and
+  returns `503 market_data_unavailable` / `stale_market_state` for the same
+  observation.
 - **Missing data.** Without a top of book for the instrument, the order is not
   recorded and returns `503 market_data_unavailable` / `no_top_of_book`. The
   journal requires the observation an order used, so nothing can be recorded
@@ -543,7 +665,9 @@ Clients cannot supply the quote they trade against.
   an interruption is a server restart in this slice.
 - **Quality flags.** Flags are preserved unchanged and shown in
   `order.market.quality_flags`. The risk engine rejects a potentially invalid
-  book or questionable receive timestamp as `suspect_market_state`.
+  book or questionable receive timestamp as `suspect_market_state`, and the
+  portfolio refuses to mark against one with the same rule
+  (`MarketDataQuality::is_suspect`).
 
 ### Accounts are bound to one market timeline
 
@@ -556,6 +680,15 @@ server on a different stream returns `execution_rejected` /
 `market_stream_mismatch` for those accounts, and an earlier point on the same
 stream returns `risk_rejected` / `submission_timestamp_moved_backward`. Use new
 accounts for a new market timeline.
+
+The portfolio applies the same rule, through the same function as execution
+(`market_lineage_violation`), so an account is valued only against a market it
+could also trade against. Its observation must be on the stream of the
+account's latest execution, at the same or a later ingest sequence, and must
+be identical at the same sequence; market time must not precede the latest
+fill. Otherwise the portfolio returns `503 market_data_unavailable` /
+`incompatible_market_timeline`. An account that has never executed has no
+timeline yet and can be valued against any stream.
 
 ## Persistence and concurrency
 
@@ -571,6 +704,9 @@ accounts for a new market timeline.
   `account_version_conflict`.
 - A lost connection surfaces as `persistence_unavailable` for the request that
   observes it. The next operation reconnects automatically.
+- A portfolio read loads the account the same way, in a repeatable-read,
+  read-only transaction, then reads `MarketState` while holding the service
+  lock. No order can commit between the two within one server process.
 - Each history read runs in one repeatable-read, read-only transaction that
   checks the account and fetches at most `limit + 1` rows through an index on
   `(account_id, order_record_id)`, so an empty history is reliably
@@ -605,8 +741,10 @@ These are intentionally not implemented in this slice:
 - **Live updates.** A WebSocket endpoint can publish `MarketState` updates and
   journal events. The journal already assigns `paper_events` a database
   sequence for ordered consumers.
-- **Valuation and cancel/replace** need a mark-price policy and a
-  resting-order state machine.
+- **Cancel/replace** needs a resting-order state machine.
+- **Other valuations.** Size-aware liquidation value needs Level-2 depth; an
+  equity curve needs a valuation history, which could be derived from the
+  journal and market recording without changing this endpoint.
 - **Model runtimes** will build `PaperOrderRequest` values with
   `source.kind = model` and call the same service in process.
 
@@ -620,7 +758,11 @@ These are intentionally not implemented in this slice:
 - Startup replay is unpaced, so the served market does not move while the
   server runs.
 - An interrupted market stream recovers only by restarting the server.
-- No valuation, unrealized PnL, or cancel/replace endpoints yet.
+- No cancel/replace endpoints yet.
+- The portfolio is a point-in-time value at the current best bid; there is no
+  valuation history, equity curve, or alternative mark policy. The mark
+  ignores displayed size, so it overstates what a position larger than the
+  displayed bid could be sold for.
 - History lists page backward from the newest item only; there is no time
   range filter or ascending order.
 - The top-of-book simulator's assumptions above make simulated PnL optimistic

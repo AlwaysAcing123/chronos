@@ -12,6 +12,7 @@ namespace chronos {
 inline constexpr std::int64_t kMoneyScale = 100'000'000;
 inline constexpr std::int64_t kPriceScale = 1'000'000'000;
 inline constexpr std::int64_t kQuantityScale = 100'000'000;
+inline constexpr std::int64_t kPercentageScale = 100'000'000;
 
 enum class RoundingMode {
     TowardZero,
@@ -219,10 +220,13 @@ private:
 struct MoneyTag;
 struct PriceTag;
 struct QuantityTag;
+struct PercentageTag;
 
 using Money = FixedDecimal<MoneyTag, kMoneyScale>;
 using Price = FixedDecimal<PriceTag, kPriceScale>;
 using Quantity = FixedDecimal<QuantityTag, kQuantityScale>;
+// Percentage points: 1.5 means 1.5%, not 150%.
+using Percentage = FixedDecimal<PercentageTag, kPercentageScale>;
 
 static_assert(
     Money::scale() == Quantity::scale(),
@@ -252,6 +256,25 @@ inline Money proportional_amount(
     }
     return Money::from_raw(detail::rounded_divide(
         static_cast<detail::WideInteger>(total.raw()) * part.raw(),
+        whole.raw(),
+        mode
+    ));
+}
+
+// `part` as a percentage of `whole`, rounded to the percentage scale:
+// raw = round(part raw * 100 * percentage scale / whole raw). The ratio of
+// two Money values is scale-free, so no money-scale factor appears.
+inline Percentage percentage_of(
+    Money part,
+    Money whole,
+    RoundingMode mode = RoundingMode::HalfAwayFromZero
+) {
+    if (whole.raw() <= 0) {
+        throw std::invalid_argument("percentage base must be positive");
+    }
+    return Percentage::from_raw(detail::rounded_divide(
+        static_cast<detail::WideInteger>(part.raw()) * 100 *
+            Percentage::scale(),
         whole.raw(),
         mode
     ));

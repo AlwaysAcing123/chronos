@@ -48,6 +48,13 @@ public:
 
     [[nodiscard]] constexpr std::uint32_t raw() const { return bits_; }
 
+    // A possibly invalid book, or one whose receive time cannot be trusted,
+    // must not be executed against or used as a valuation mark.
+    [[nodiscard]] constexpr bool is_suspect() const {
+        return contains(MarketDataQualityFlag::PotentiallyInvalidBook) ||
+            contains(MarketDataQualityFlag::QuestionableReceiveTimestamp);
+    }
+
     friend constexpr auto operator<=>(
         const MarketDataQuality&,
         const MarketDataQuality&
