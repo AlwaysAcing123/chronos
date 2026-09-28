@@ -123,6 +123,10 @@ paper account never changes another user's market or simulated liquidity.
 - Rejected execution attempts do not consume liquidity or reserve their client
   order ID, so a caller may correct the routing error and retry.
 
+The durable PostgreSQL path applies a stricter API boundary: every recorded
+submission consumes its client order ID, including a risk rejection. A
+corrected durable submission therefore requires a new ID.
+
 ## Accounting and reconciliation
 
 Every non-empty simulated fill is applied exactly once to the processor's
@@ -162,15 +166,12 @@ will be added before Chronos claims realistic trading evaluation.
 - Long-only paper accounting
 - Flat fee per fill
 - No latency or slippage beyond crossing the visible spread
-- In-memory state and an unbounded processed-ID set
-- No durable audit log or restart recovery
-- No durable transaction spanning risk, execution, and accounting
+- An unbounded processed-ID set inside each reconstructed processor
 - One processor instance is not safe for concurrent calls
-- No recovery constructor for an existing account and execution state
 - No API, authentication, authorization, or user interface
 
 The low-level risk and execution classes remain independently testable, but
 application code should use `PaperOrderProcessor` so approvals cannot outlive
-the account state against which they were checked. The next persistence
-milestone will record order, risk, execution, and accounting events in one
-recoverable transaction.
+the account state against which they were checked. Durable application code
+should use `PersistentPaperOrderSession`, which adds atomic journaling,
+validated restart recovery, database idempotency, and optimistic concurrency.

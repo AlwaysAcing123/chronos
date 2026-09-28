@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
 namespace chronos {
 
@@ -60,6 +61,15 @@ using SimulatedExecutionResult = std::variant<
     SimulatedExecutionError
 >;
 
+struct TopOfBookExecutionRecoveryState {
+    std::string account_id;
+    InstrumentId instrument;
+    std::optional<TopOfBookEvent> active_market;
+    Quantity consumed_bid_quantity;
+    Quantity consumed_ask_quantity;
+    std::vector<std::string> processed_client_order_ids;
+};
+
 class TopOfBookExecutionSimulator final {
 public:
     TopOfBookExecutionSimulator(
@@ -85,6 +95,11 @@ public:
     [[nodiscard]] const InstrumentId& instrument() const noexcept {
         return instrument_;
     }
+
+    [[nodiscard]] TopOfBookExecutionRecoveryState recovery_state() const;
+    [[nodiscard]] static TopOfBookExecutionSimulator restore(
+        TopOfBookExecutionRecoveryState recovery_state
+    );
 
     [[nodiscard]] SimulatedExecutionResult execute(
         const ApprovedOrderIntent& approved

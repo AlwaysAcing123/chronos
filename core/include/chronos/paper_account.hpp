@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 
 namespace chronos {
 
@@ -19,6 +20,8 @@ struct AccountState {
     std::optional<Timestamp> last_fill_timestamp;
 
     [[nodiscard]] Price average_entry_price() const;
+
+    friend bool operator==(const AccountState&, const AccountState&) = default;
 };
 
 struct AccountSnapshot {
@@ -62,6 +65,13 @@ struct ApplyFillReceipt {
 
 using ApplyFillResult = std::variant<ApplyFillReceipt, ApplyFillError>;
 
+struct PaperAccountRecoveryState {
+    std::string account_id;
+    InstrumentId instrument;
+    AccountState state;
+    std::vector<std::string> applied_fill_ids;
+};
+
 class PaperAccount final {
 public:
     PaperAccount(
@@ -73,6 +83,11 @@ public:
     [[nodiscard]] const std::string& account_id() const { return account_id_; }
     [[nodiscard]] const InstrumentId& instrument() const { return instrument_; }
     [[nodiscard]] const AccountState& state() const { return state_; }
+
+    [[nodiscard]] PaperAccountRecoveryState recovery_state() const;
+    [[nodiscard]] static PaperAccount restore(
+        PaperAccountRecoveryState recovery_state
+    );
 
     [[nodiscard]] ApplyFillResult apply_fill(const Fill& fill);
     [[nodiscard]] AccountSnapshot snapshot(Price mark_price) const;

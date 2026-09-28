@@ -416,6 +416,98 @@ void test_accounting_invariant_failure_halts_the_processor() {
     REQUIRE(!halted.accounting_error.has_value());
 }
 
+void test_recovery_preserves_account_and_execution_state() {
+    PaperOrderProcessor engine = processor();
+    const OrderIntent original = order("original", Side::Buy, "3", 110);
+    require_receipt(engine.submit(original, market(10, 100)));
+
+    const auto saved_state = engine.recovery_state();
+    REQUIRE(saved_state.account.applied_fill_ids.size() == 1);
+    REQUIRE(saved_state.execution.processed_client_order_ids.size() == 1);
+    REQUIRE(saved_state.execution.consumed_ask_quantity == quantity("3"));
+    PaperOrderProcessor recovered = PaperOrderProcessor::restore(saved_state);
+
+    require_execution_error(
+        recovered.submit(original, market(10, 100)),
+        SimulatedExecutionErrorCode::DuplicateClientOrderId
+    );
+    const auto remainder = require_receipt(recovered.submit(
+        order("after-restart", Side::Buy, "3", 110),
+        market(10, 100)
+    ));
+    REQUIRE(
+        remainder.execution.status ==
+        SimulatedExecutionStatus::PartiallyFilledAndCancelled
+    );
+    REQUIRE(remainder.execution.fill->quantity == quantity("2"));
+    REQUIRE(remainder.execution.unfilled_quantity == quantity("1"));
+    REQUIRE(remainder.account_after.position == quantity("5"));
+    REQUIRE(remainder.account_after.cash == money("494.98"));
+    REQUIRE(remainder.account_after.open_cost_basis == money("505"));
+    REQUIRE(remainder.account_after.fees_paid == money("0.02"));
+}
+
+void test_corrupt_recovery_state_is_rejected() {
+    PaperOrderProcessor engine = processor();
+    require_receipt(engine.submit(
+        order("saved", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+
+    auto state = engine.recovery_state();
+    state.account.state.cash = money("-0.01");
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.account.state.open_cost_basis = money("100");
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.account.applied_fill_ids.clear();
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.execution.consumed_ask_quantity = quantity("6");
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.execution.account_id = "other-account";
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.account.applied_fill_ids.push_back(
+        state.account.applied_fill_ids.front()
+    );
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+
+    state = engine.recovery_state();
+    state.execution.processed_client_order_ids.push_back(
+        state.execution.processed_client_order_ids.front()
+    );
+    REQUIRE_THROWS_AS(
+        PaperOrderProcessor::restore(std::move(state)),
+        std::invalid_argument
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -451,6 +543,14 @@ int main() {
         {
             "accounting invariant failure halts processor",
             test_accounting_invariant_failure_halts_the_processor,
+        },
+        {
+            "recovery preserves account and execution state",
+            test_recovery_preserves_account_and_execution_state,
+        },
+        {
+            "corrupt recovery state is rejected",
+            test_corrupt_recovery_state_is_rejected,
         },
     });
 }

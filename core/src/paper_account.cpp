@@ -1,5 +1,6 @@
 #include "chronos/paper_account.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -34,6 +35,106 @@ PaperAccount::PaperAccount(
     if (starting_cash.raw() < 0) {
         throw std::invalid_argument("paper account starting cash must not be negative");
     }
+}
+
+PaperAccountRecoveryState PaperAccount::recovery_state() const {
+    std::vector<std::string> applied_fill_ids(
+        applied_fill_ids_.begin(),
+        applied_fill_ids_.end()
+    );
+    std::sort(applied_fill_ids.begin(), applied_fill_ids.end());
+    return PaperAccountRecoveryState{
+        .account_id = account_id_,
+        .instrument = instrument_,
+        .state = state_,
+        .applied_fill_ids = std::move(applied_fill_ids),
+    };
+}
+
+PaperAccount PaperAccount::restore(
+    PaperAccountRecoveryState recovery_state
+) {
+    const AccountState& state = recovery_state.state;
+    if (state.starting_cash.raw() < 0) {
+        throw std::invalid_argument(
+            "recovered starting cash must not be negative"
+        );
+    }
+    if (state.cash.raw() < 0) {
+        throw std::invalid_argument("recovered cash must not be negative");
+    }
+    if (state.position.raw() < 0) {
+        throw std::invalid_argument(
+            "recovered position must not be negative"
+        );
+    }
+    if (state.open_cost_basis.raw() < 0) {
+        throw std::invalid_argument(
+            "recovered open cost basis must not be negative"
+        );
+    }
+    if (state.position.raw() == 0 && state.open_cost_basis.raw() != 0) {
+        throw std::invalid_argument(
+            "a recovered flat position must have zero open cost basis"
+        );
+    }
+    if (state.position.raw() != 0 && state.open_cost_basis.raw() == 0) {
+        throw std::invalid_argument(
+            "a recovered open position must have positive cost basis"
+        );
+    }
+    if (state.fees_paid.raw() < 0) {
+        throw std::invalid_argument(
+            "recovered fees paid must not be negative"
+        );
+    }
+    if (state.last_fill_timestamp &&
+        state.last_fill_timestamp->nanoseconds() < 0) {
+        throw std::invalid_argument(
+            "recovered fill timestamp must not be negative"
+        );
+    }
+    if (state.last_fill_timestamp.has_value() !=
+        !recovery_state.applied_fill_ids.empty()) {
+        throw std::invalid_argument(
+            "recovered fill history and latest fill timestamp do not match"
+        );
+    }
+
+    const detail::WideInteger cash_and_open_cost =
+        static_cast<detail::WideInteger>(state.cash.raw()) +
+        state.open_cost_basis.raw();
+    const detail::WideInteger expected_cash_and_open_cost =
+        static_cast<detail::WideInteger>(state.starting_cash.raw()) +
+        state.gross_realized_pnl.raw() - state.fees_paid.raw();
+    if (cash_and_open_cost != expected_cash_and_open_cost) {
+        throw std::invalid_argument(
+            "recovered account violates the accounting identity"
+        );
+    }
+
+    PaperAccount account(
+        std::move(recovery_state.account_id),
+        std::move(recovery_state.instrument),
+        state.starting_cash
+    );
+    account.state_ = state;
+    for (std::string& fill_id : recovery_state.applied_fill_ids) {
+        if (fill_id.empty()) {
+            throw std::invalid_argument(
+                "recovered fill ID must not be empty"
+            );
+        }
+        const bool inserted = account.applied_fill_ids_
+            .insert(std::move(fill_id))
+            .second;
+        if (!inserted) {
+            throw std::invalid_argument(
+                "recovered fill IDs must be unique"
+            );
+        }
+    }
+    return account;
 }
 
 std::optional<ApplyFillError> PaperAccount::validate_fill(const Fill& fill) const {

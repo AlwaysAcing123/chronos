@@ -31,12 +31,15 @@ Chronos simulates trading only. It does not place real-money orders.
   owned paper account
 - Exact reconciliation from order and fill through cash, position, fees, and
   PnL
+- Optional PostgreSQL persistence with atomic account snapshots and an
+  append-only order, rejection, fill, and portfolio event journal
+- Validated restart recovery, database idempotency, and optimistic concurrency
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution
 
-The core now accepts, simulates, and books paper orders in memory through one
-controlled path. It does not yet persist order and account state or provide an
-API or web application. See [plan.md](plan.md) for the complete roadmap.
+The core now accepts, simulates, books, persists, and recovers paper orders
+through controlled paths. It does not yet provide an API or web application.
+See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -103,6 +106,30 @@ validates and replays every event, recomputes its checksum-backed manifest, and
 prints deterministic JSON containing event counts and each instrument's final
 trade and top of book. See [docs/market-replay.md](docs/market-replay.md).
 
+## Build the PostgreSQL persistence adapter
+
+The persistence adapter is optional. It requires PostgreSQL's C client library
+and a reachable PostgreSQL server. The supplied Docker Compose service uses
+localhost port `55432` and retains data in a named volume.
+
+```sh
+brew install libpq
+docker compose up -d --wait postgres
+cmake -S . -B build-postgres \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON \
+  -DCHRONOS_ENABLE_POSTGRESQL_ADAPTER=ON \
+  -DPostgreSQL_ROOT=/opt/homebrew/opt/libpq
+cmake --build build-postgres --parallel
+CHRONOS_TEST_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos' \
+  ctest --test-dir build-postgres --output-on-failure --no-tests=error
+```
+
+See
+[docs/postgresql-persistence.md](docs/postgresql-persistence.md) for the
+transaction contract, recovery model, idempotency semantics, and reset
+instructions.
+
 ## Repository map
 
 ```text
@@ -118,8 +145,10 @@ plan.md     Product requirements and delivery roadmap
 GitHub Actions builds and tests every pull request and every push to `main`
 with GCC 14 and Clang 18 on Ubuntu 24.04. A separate job runs the test suite
 with AddressSanitizer and UndefinedBehaviorSanitizer enabled. The workflow
-fails if no tests are discovered and receives read-only repository access.
-Pushes to `main` and manual runs also receive an AppleClang check on macOS 15.
+also tests the optional Databento adapter and PostgreSQL persistence against a
+real PostgreSQL service. It fails if no tests are discovered and receives
+read-only repository access. Pushes to `main` and manual runs also receive an
+AppleClang check on macOS 15.
 
 ## Data and credentials
 
@@ -141,5 +170,8 @@ Replay time, ordering, reset, and market-view semantics are documented in
 [docs/market-replay.md](docs/market-replay.md).
 Paper-order, risk, and simple top-of-book execution semantics are documented in
 [docs/paper-execution.md](docs/paper-execution.md).
+PostgreSQL transaction, journal, idempotency, and recovery semantics are
+documented in
+[docs/postgresql-persistence.md](docs/postgresql-persistence.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).
