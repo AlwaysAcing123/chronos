@@ -22,10 +22,18 @@ Chronos simulates trading only. It does not place real-money orders.
 - Fill and trading-domain types
 - Single-instrument, long-only paper-account accounting
 - Exact cash, position, cost-basis, fee, and PnL calculations
-- Unit and edge-case tests for arithmetic, accounting, and market data
+- Shared manual/model paper-order intents with explicit source attribution
+- Structured pre-trade validation, quote-freshness checks, and risk limits
+- Deterministic top-of-book IOC market and limit execution
+- Partial fills, cancellation reasons, idempotency, and per-account shadow
+  liquidity
+- Unit and edge-case tests for arithmetic, accounting, market data, replay,
+  risk, and execution
 
-The project does not yet accept orders, simulate execution, or provide an API
-or web application. See [plan.md](plan.md) for the complete roadmap.
+The core now accepts and simulates orders in memory. It does not yet connect
+execution reports to account updates atomically, persist order state, or
+provide an API or web application. See [plan.md](plan.md) for the complete
+roadmap.
 
 ## Requirements
 
@@ -128,5 +136,7 @@ Real-data quoting and guarded downloads are documented in
 [docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
 Replay time, ordering, reset, and market-view semantics are documented in
 [docs/market-replay.md](docs/market-replay.md).
+Paper-order, risk, and simple top-of-book execution semantics are documented in
+[docs/paper-execution.md](docs/paper-execution.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

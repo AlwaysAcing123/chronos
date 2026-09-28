@@ -64,6 +64,8 @@ struct Fill {
     Quantity quantity;
     Money fee;
     Timestamp timestamp;
+
+    friend bool operator==(const Fill&, const Fill&) = default;
 };
 
 }  // namespace chronos

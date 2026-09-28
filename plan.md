@@ -1144,7 +1144,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 4. **Complete:** Add a historical Databento adapter and immutable recording manifest.
 5. **Complete:** Normalize and inspect a short real `EQUS.MINI` MBP-1 session for `AAPL` and `SPY`.
 6. **Complete:** Replay the recording deterministically and maintain a validated current market view.
-7. Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
+7. **Complete:** Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
 8. Feed simulated fills into the existing accounting core and verify end-to-end reconciliation.
 9. Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
 10. Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view.
@@ -1157,12 +1157,15 @@ validation; an optional, pinned Databento `EQUS.MINI` MBP-1 normalizer and
 streaming DBN file reader; checksum-backed write-once recording manifests; a
 quote-first, cost-bounded historical acquisition command; offline
 deterministic replay reports and a current market view; fill types; and an
-in-memory single-instrument long-only paper account with core tests. A local,
+in-memory single-instrument long-only paper account with core tests. It now
+also implements a shared manual/model order-intent contract, structured
+pre-trade risk decisions, and deterministic immediate-or-cancel top-of-book
+execution with partial fills and shadow displayed liquidity. A local,
 Git-ignored real `AAPL`/`SPY` recording has been validated and replayed
 identically across repeated runs. Licensed recordings are intentionally not
 preserved in the repository. Chronos does not yet implement normalized-event
-persistence, order intents, risk and execution components, durable account
-persistence, an API, or a web application.
+persistence, an atomic execution-to-account coordinator, durable account and
+order persistence, an API, or a web application.
 
 ## 20. Post-submission OCaml learning and translation
 
