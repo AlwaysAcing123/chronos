@@ -1147,7 +1147,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 7. **Complete:** Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
 8. **Complete:** Feed simulated fills into the existing accounting core and verify end-to-end reconciliation.
 9. **Complete:** Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
-10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. Order and fill history, valuation, live updates, and the web views remain.
+10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Valuation, live updates, and the web views remain.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
 
 The repository currently implements type-specific fixed-point price, money,
@@ -1173,9 +1173,11 @@ supplies execution quotes and the market clock that timestamps orders. A
 transport-independent paper-trading service and an optional, localhost-only
 HTTP API expose account creation, account retrieval, and durable order
 submission with exact decimal strings, stable error codes, reconnection after
-database loss, and real-PostgreSQL tests. Chronos does not yet implement
-normalized market-event persistence, authentication, order-history or
-valuation endpoints, live updates, or a web application.
+database loss, and real-PostgreSQL tests. Durable order and fill history is
+read from the journal with stable keyset pagination, and a single order can
+be looked up to reconcile an uncertain submission. Chronos does not yet
+implement normalized market-event persistence, authentication, valuation
+endpoints, live updates, or a web application.
 
 ## 20. Post-submission OCaml learning and translation
 

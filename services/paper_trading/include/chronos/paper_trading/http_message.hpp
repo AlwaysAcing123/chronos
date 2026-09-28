@@ -12,6 +12,9 @@ struct HttpRequest {
     std::string method;
     // The decoded path without its query string.
     std::string path;
+    // The raw query component after '?', still percent-encoded; empty when
+    // the target has none. The JSON contract parses it strictly.
+    std::string query;
     // Empty when the request has no Content-Type header.
     std::string content_type;
     std::string body;

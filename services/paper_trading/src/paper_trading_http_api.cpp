@@ -78,15 +78,15 @@ bool is_json_media_type(std::string_view content_type) {
     return trim_spaces(value.substr(separator + 1)) == "charset=utf-8";
 }
 
-HttpResponse method_not_allowed(std::string_view allowed_method) {
+HttpResponse method_not_allowed(std::string_view allowed_methods) {
     HttpResponse response = render_error(
         405,
         "method_not_allowed",
-        "this path supports " + std::string(allowed_method) + " only"
+        "this route allows " + std::string(allowed_methods)
     );
     response.headers.push_back(HttpHeader{
         .name = "Allow",
-        .value = std::string(allowed_method),
+        .value = std::string(allowed_methods),
     });
     return response;
 }
@@ -108,6 +108,182 @@ const Result& log_unavailable(
         log(std::string(operation) + ": " + failure->message);
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Request preconditions, checked in this order: method, query, media type.
+
+std::optional<HttpResponse> require_method(
+    const HttpRequest& request,
+    std::string_view method
+) {
+    if (request.method == method) {
+        return std::nullopt;
+    }
+    return method_not_allowed(method);
+}
+
+std::optional<HttpResponse> require_no_query(const HttpRequest& request) {
+    if (auto invalid = reject_query_parameters(request.query)) {
+        return render_malformed_request(*invalid);
+    }
+    return std::nullopt;
+}
+
+std::optional<HttpResponse> require_json_body(const HttpRequest& request) {
+    if (is_json_media_type(request.content_type)) {
+        return std::nullopt;
+    }
+    return render_error(
+        415,
+        "unsupported_media_type",
+        "request Content-Type must be application/json"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+
+HttpResponse health(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    HttpResponse response = render_health(service.health());
+    if (response.status != 200) {
+        log("health check: PostgreSQL is unavailable");
+    }
+    return response;
+}
+
+HttpResponse create_account(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request
+) {
+    if (auto rejected = require_method(request, "POST")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    if (auto rejected = require_json_body(request)) {
+        return *rejected;
+    }
+    auto parsed = parse_create_account_request(request.body);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&parsed)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_account(
+        log_unavailable(
+            service.create_account(std::get<CreatePaperAccountRequest>(parsed)),
+            log,
+            "create account"
+        ),
+        201
+    );
+}
+
+HttpResponse get_account(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    return render_account(
+        log_unavailable(service.get_account(account_id), log, "get account"),
+        200
+    );
+}
+
+// GET lists the durable order history; POST submits a new order.
+HttpResponse orders(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id
+) {
+    if (request.method == "GET") {
+        auto page = parse_history_query(request.query);
+        if (const auto* malformed = std::get_if<MalformedRequest>(&page)) {
+            return render_malformed_request(*malformed);
+        }
+        return render_order_history(log_unavailable(
+            service.list_orders(account_id, std::get<HistoryPageRequest>(page)),
+            log,
+            "list orders"
+        ));
+    }
+    if (request.method != "POST") {
+        return method_not_allowed("GET, POST");
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    if (auto rejected = require_json_body(request)) {
+        return *rejected;
+    }
+    auto parsed = parse_order_request(std::string(account_id), request.body);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&parsed)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_order_submission(log_unavailable(
+        service.submit_order(std::get<PaperOrderRequest>(parsed)),
+        log,
+        "submit order"
+    ));
+}
+
+HttpResponse order(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    return render_order_record(log_unavailable(
+        service.get_order(account_id, client_order_id),
+        log,
+        "get order"
+    ));
+}
+
+HttpResponse fills(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    auto page = parse_history_query(request.query);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&page)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_fill_history(log_unavailable(
+        service.list_fills(account_id, std::get<HistoryPageRequest>(page)),
+        log,
+        "list fills"
+    ));
 }
 
 }  // namespace
@@ -148,77 +324,32 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
         return route_not_found();
     }
     const auto& parts = *segments;
+    if (parts.size() == 1 && parts[0] == "health") {
+        return health(service_, log_, request);
+    }
+
     const bool is_accounts_path = parts.size() >= 3 && parts[0] == "api" &&
         parts[1] == "v1" && parts[2] == "accounts";
-
-    if (parts.size() == 1 && parts[0] == "health") {
-        if (request.method != "GET") {
-            return method_not_allowed("GET");
-        }
-        const HttpResponse response = render_health(service_.health());
-        if (response.status != 200) {
-            log_("health check: PostgreSQL is unavailable");
-        }
-        return response;
-    }
-
-    if (is_accounts_path && parts.size() == 4) {
-        if (request.method != "GET") {
-            return method_not_allowed("GET");
-        }
-        return render_account(
-            log_unavailable(
-                service_.get_account(parts[3]),
-                log_,
-                "get account"
-            ),
-            200
-        );
-    }
-
-    const bool is_create_account = is_accounts_path && parts.size() == 3;
-    const bool is_submit_order = is_accounts_path && parts.size() == 5 &&
-        parts[4] == "orders";
-    if (!is_create_account && !is_submit_order) {
+    if (!is_accounts_path) {
         return route_not_found();
     }
-    if (request.method != "POST") {
-        return method_not_allowed("POST");
+    if (parts.size() == 3) {
+        return create_account(service_, log_, request);
     }
-    if (!is_json_media_type(request.content_type)) {
-        return render_error(
-            415,
-            "unsupported_media_type",
-            "request Content-Type must be application/json"
-        );
+    const std::string_view account_id = parts[3];
+    if (parts.size() == 4) {
+        return get_account(service_, log_, request, account_id);
     }
-
-    if (is_create_account) {
-        auto parsed = parse_create_account_request(request.body);
-        if (const auto* malformed = std::get_if<MalformedRequest>(&parsed)) {
-            return render_malformed_request(*malformed);
-        }
-        return render_account(
-            log_unavailable(
-                service_.create_account(
-                    std::get<CreatePaperAccountRequest>(parsed)
-                ),
-                log_,
-                "create account"
-            ),
-            201
-        );
+    if (parts.size() == 5 && parts[4] == "orders") {
+        return orders(service_, log_, request, account_id);
     }
-
-    auto parsed = parse_order_request(std::string(parts[3]), request.body);
-    if (const auto* malformed = std::get_if<MalformedRequest>(&parsed)) {
-        return render_malformed_request(*malformed);
+    if (parts.size() == 5 && parts[4] == "fills") {
+        return fills(service_, log_, request, account_id);
     }
-    return render_order_submission(log_unavailable(
-        service_.submit_order(std::get<PaperOrderRequest>(parsed)),
-        log_,
-        "submit order"
-    ));
+    if (parts.size() == 6 && parts[4] == "orders") {
+        return order(service_, log_, request, account_id, parts[5]);
+    }
+    return route_not_found();
 }
 
 }  // namespace chronos::paper_trading

@@ -4,7 +4,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include <array>
+#include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -26,14 +28,6 @@ using RequestJson = nlohmann::json;
 // Responses preserve field insertion order so documents read in a deliberate
 // order; the order is part of neither the contract nor any comparison.
 using ResponseJson = nlohmann::ordered_json;
-
-constexpr std::array kOrderSourceKinds{
-    OrderSourceKind::Manual,
-    OrderSourceKind::Model,
-};
-constexpr std::array kSides{Side::Buy, Side::Sell};
-constexpr std::array kOrderTypes{OrderType::Market, OrderType::Limit};
-constexpr std::array kTimesInForce{TimeInForce::ImmediateOrCancel};
 
 // ---------------------------------------------------------------------------
 // Request parsing
@@ -173,10 +167,10 @@ std::variant<Decimal, DecimalTextError> parse_decimal_text(
     }
 }
 
-template <typename Enum, std::size_t Count>
-std::string allowed_names(const std::array<Enum, Count>& values) {
+template <typename Enum>
+std::string allowed_names() {
     std::string names;
-    for (const Enum value : values) {
+    for (const Enum value : declared_values<Enum>()) {
         if (!names.empty()) {
             names += ", ";
         }
@@ -282,24 +276,19 @@ public:
         return std::nullopt;
     }
 
-    template <typename Enum, std::size_t Count>
-    [[nodiscard]] std::optional<Enum> enumeration(
-        std::string_view name,
-        const std::array<Enum, Count>& values
-    ) {
+    template <typename Enum>
+    [[nodiscard]] std::optional<Enum> enumeration(std::string_view name) {
         const std::optional<std::string> text = string(name);
         if (!text) {
             return std::nullopt;
         }
-        for (const Enum value : values) {
-            if (canonical_name(value) == *text) {
-                return value;
-            }
+        if (const auto value = from_canonical_name<Enum>(*text)) {
+            return value;
         }
         fail(
             MalformedRequestReason::UnknownEnumValue,
             name,
-            path(name) + " must be one of: " + allowed_names(values)
+            path(name) + " must be one of: " + allowed_names<Enum>()
         );
         return std::nullopt;
     }
@@ -356,6 +345,136 @@ private:
     std::optional<MalformedRequest>& error_;
 };
 
+struct QueryParameter {
+    std::string name;
+    std::string value;
+};
+
+std::optional<int> hex_digit(char character) {
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return std::nullopt;
+}
+
+// Decodes %XX escapes. '+' is an ordinary character: this API does not use
+// form encoding, and no parameter value legitimately contains a space.
+std::optional<std::string> percent_decode(std::string_view text) {
+    std::string decoded;
+    decoded.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] != '%') {
+            decoded += text[index];
+            continue;
+        }
+        if (text.size() - index < 3) {
+            return std::nullopt;
+        }
+        const auto high = hex_digit(text[index + 1]);
+        const auto low = hex_digit(text[index + 2]);
+        if (!high || !low) {
+            return std::nullopt;
+        }
+        decoded += static_cast<char>(*high * 16 + *low);
+        index += 2;
+    }
+    return decoded;
+}
+
+MalformedRequest invalid_query(std::string message) {
+    return malformed(
+        MalformedRequestReason::InvalidQuery,
+        "",
+        std::move(message)
+    );
+}
+
+// Parses name=value pairs separated by '&'. Every problem is an error:
+// empty pairs, pairs without '=', bad escapes, names outside `allowed`, and
+// repeated names. An unknown name is echoed only when it is a plain
+// identifier, so arbitrary bytes never reach a JSON response.
+std::variant<std::vector<QueryParameter>, MalformedRequest> parse_query(
+    std::string_view query,
+    std::initializer_list<std::string_view> allowed
+) {
+    std::vector<QueryParameter> parameters;
+    if (query.empty()) {
+        return parameters;
+    }
+    std::set<std::string> seen;
+    while (true) {
+        const std::size_t separator = query.find('&');
+        const std::string_view pair = query.substr(0, separator);
+        const std::size_t equals = pair.find('=');
+        if (pair.empty() || equals == std::string_view::npos || equals == 0) {
+            return invalid_query(
+                "each query parameter must have the form name=value"
+            );
+        }
+        auto name = percent_decode(pair.substr(0, equals));
+        auto value = percent_decode(pair.substr(equals + 1));
+        if (!name || !value) {
+            return invalid_query(
+                "query string contains an invalid percent escape"
+            );
+        }
+        if (std::find(allowed.begin(), allowed.end(), *name) == allowed.end()) {
+            if (!is_valid_identifier(*name)) {
+                return malformed(
+                    MalformedRequestReason::UnexpectedField,
+                    "",
+                    "query string contains an unrecognized parameter"
+                );
+            }
+            return malformed(
+                MalformedRequestReason::UnexpectedField,
+                *name,
+                *name + " is not a recognized query parameter"
+            );
+        }
+        if (!seen.insert(*name).second) {
+            return malformed(
+                MalformedRequestReason::DuplicateField,
+                *name,
+                *name + " appears more than once"
+            );
+        }
+        parameters.push_back(QueryParameter{
+            .name = std::move(*name),
+            .value = std::move(*value),
+        });
+        if (separator == std::string_view::npos) {
+            return parameters;
+        }
+        query.remove_prefix(separator + 1);
+    }
+}
+
+// A canonical base-10 integer: no sign, no leading zeros. The service owns
+// the allowed range.
+std::optional<std::size_t> parse_limit(std::string_view text) {
+    if (text.empty() || (text.size() > 1 && text.front() == '0') ||
+        !std::all_of(text.begin(), text.end(), is_ascii_digit)) {
+        return std::nullopt;
+    }
+    std::size_t limit = 0;
+    const auto result = std::from_chars(
+        text.data(),
+        text.data() + text.size(),
+        limit
+    );
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return limit;
+}
+
 // ---------------------------------------------------------------------------
 // Response rendering
 
@@ -388,6 +507,10 @@ std::string_view reason_name(MalformedRequestReason reason) {
             return "decimal_out_of_range";
         case MalformedRequestReason::UnknownEnumValue:
             return "unknown_enum_value";
+        case MalformedRequestReason::InvalidQuery:
+            return "invalid_query";
+        case MalformedRequestReason::InvalidLimit:
+            return "invalid_limit";
     }
     throw std::logic_error("unknown malformed-request reason");
 }
@@ -562,18 +685,51 @@ ResponseJson market_json(const TopOfBookEvent& market) {
     return json;
 }
 
-// The part of an order resource that depends on how processing ended.
+ResponseJson source_json(const OrderSource& source) {
+    ResponseJson json = ResponseJson::object();
+    json["kind"] = name_of(source.kind);
+    json["id"] = source.source_id;
+    return json;
+}
+
+// A fill that accounting booked, with the notional it booked.
+struct BookedFill {
+    Fill fill;
+    Money notional;
+};
+
+// A recorded rejection or fault. POST renders it as the response `error`;
+// every order resource carries the same object as `rejection`.
+struct OrderRejection {
+    std::string_view code;
+    std::string reason;
+    std::optional<std::string> field;
+    std::string message;
+};
+
+// The part of an order resource that depends on how processing ended, with
+// the status a submission of that outcome returns.
 struct OrderOutcome {
     std::string status;
     Quantity filled_quantity;
     Quantity unfilled_quantity;
     std::optional<SimulatedCancellationReason> cancellation_reason;
-    const ApplyFillReceipt* booked_fill{nullptr};
+    std::optional<BookedFill> booked_fill;
+    std::optional<OrderRejection> rejection;
+    int submission_status;
 };
 
-OrderOutcome receipt_outcome(const PaperOrderReceipt& receipt) {
-    const SimulatedExecutionReport& execution = receipt.execution;
-    if (execution.fill.has_value() != receipt.accounting.has_value()) {
+// The accounting contract's notional for a fill. The journal stores the
+// price and quantity it was computed from, so it is derived identically.
+Money booked_notional(const Fill& fill) {
+    return calculate_notional(fill.price, fill.quantity);
+}
+
+OrderOutcome executed_outcome(
+    const SimulatedExecutionReport& execution,
+    std::optional<Money> notional
+) {
+    if (execution.fill.has_value() != notional.has_value()) {
         throw std::logic_error("a simulated fill must be booked exactly once");
     }
     return OrderOutcome{
@@ -582,50 +738,169 @@ OrderOutcome receipt_outcome(const PaperOrderReceipt& receipt) {
                                           : Quantity{},
         .unfilled_quantity = execution.unfilled_quantity,
         .cancellation_reason = execution.cancellation_reason,
-        .booked_fill = receipt.accounting ? &*receipt.accounting : nullptr,
+        .booked_fill = execution.fill
+            ? std::optional<BookedFill>(BookedFill{
+                  .fill = *execution.fill,
+                  .notional = *notional,
+              })
+            : std::nullopt,
+        .rejection = std::nullopt,
+        .submission_status = 201,
     };
 }
 
+// Rejected and faulted orders book nothing, so no quantity was filled.
 OrderOutcome unexecuted_outcome(
     const OrderIntent& intent,
-    std::string status
+    std::string status,
+    OrderRejection rejection,
+    int submission_status
 ) {
     return OrderOutcome{
         .status = std::move(status),
         .filled_quantity = Quantity{},
         .unfilled_quantity = intent.quantity,
         .cancellation_reason = std::nullopt,
-        .booked_fill = nullptr,
+        .booked_fill = std::nullopt,
+        .rejection = std::move(rejection),
+        .submission_status = submission_status,
     };
 }
 
-ResponseJson fill_json(const ApplyFillReceipt& booked) {
-    const Fill& fill = booked.fill;
-    ResponseJson json = ResponseJson::object();
+OrderOutcome fault_outcome(
+    const OrderIntent& intent,
+    PaperOrderProcessingErrorCode code,
+    const std::string& message
+) {
+    return unexecuted_outcome(
+        intent,
+        "faulted",
+        OrderRejection{
+            .code = "processing_fault",
+            .reason = name_of(code),
+            .field = std::nullopt,
+            .message = message,
+        },
+        500
+    );
+}
+
+// One overload per way a recorded order can end, whether it comes from a
+// submission just processed or from the journal.
+OrderOutcome outcome_of(const OrderIntent&, const PaperOrderReceipt& receipt) {
+    return executed_outcome(
+        receipt.execution,
+        receipt.accounting
+            ? std::optional<Money>(receipt.accounting->notional)
+            : std::nullopt
+    );
+}
+
+OrderOutcome outcome_of(
+    const OrderIntent&,
+    const SimulatedExecutionReport& execution
+) {
+    return executed_outcome(
+        execution,
+        execution.fill
+            ? std::optional<Money>(booked_notional(*execution.fill))
+            : std::nullopt
+    );
+}
+
+OrderOutcome outcome_of(
+    const OrderIntent& intent,
+    const PreTradeRiskRejection& rejection
+) {
+    const bool is_stale =
+        rejection.code == PreTradeRiskErrorCode::StaleMarketState;
+    return unexecuted_outcome(
+        intent,
+        "rejected",
+        OrderRejection{
+            .code = is_stale ? "market_data_stale" : "risk_rejected",
+            .reason = name_of(rejection.code),
+            .field = request_field(rejection.field),
+            .message = rejection.message,
+        },
+        422
+    );
+}
+
+OrderOutcome outcome_of(
+    const OrderIntent& intent,
+    const SimulatedExecutionError& rejection
+) {
+    return unexecuted_outcome(
+        intent,
+        "rejected",
+        OrderRejection{
+            .code = "execution_rejected",
+            .reason = name_of(rejection.code),
+            .field = request_field(rejection.field),
+            .message = rejection.message,
+        },
+        422
+    );
+}
+
+OrderOutcome outcome_of(
+    const OrderIntent& intent,
+    const PaperOrderProcessingError& fault
+) {
+    return fault_outcome(intent, fault.code, fault.message);
+}
+
+// The unbooked execution of a fault is deliberately not rendered as a fill.
+OrderOutcome outcome_of(
+    const OrderIntent& intent,
+    const PaperOrderFaultRecord& fault
+) {
+    return fault_outcome(intent, fault.code, fault.message);
+}
+
+template <typename OutcomeVariant>
+OrderOutcome order_outcome(
+    const OrderIntent& intent,
+    const OutcomeVariant& outcome
+) {
+    return std::visit(
+        [&intent](const auto& alternative) {
+            return outcome_of(intent, alternative);
+        },
+        outcome
+    );
+}
+
+ResponseJson rejection_json(const OrderRejection& rejection) {
+    return error_json(
+        rejection.code,
+        rejection.message,
+        rejection.field,
+        rejection.reason
+    );
+}
+
+void write_fill_fields(ResponseJson& json, const Fill& fill, Money notional) {
     json["fill_id"] = fill.fill_id;
     json["side"] = name_of(fill.side);
     json["price"] = fill.price.to_string();
     json["quantity"] = fill.quantity.to_string();
-    json["notional"] = booked.notional.to_string();
+    json["notional"] = notional.to_string();
     json["fee"] = fill.fee.to_string();
     json["filled_at"] = format_timestamp(fill.timestamp);
-    return json;
 }
 
 ResponseJson order_json(
-    const RecordedPaperOrder& recorded,
+    const OrderIntent& intent,
+    const TopOfBookEvent& market,
     const OrderOutcome& outcome
 ) {
-    const OrderIntent& intent = recorded.intent;
-    ResponseJson source = ResponseJson::object();
-    source["kind"] = name_of(intent.source.kind);
-    source["id"] = intent.source.source_id;
-
     ResponseJson json = ResponseJson::object();
     json["trading_mode"] = "paper";
     json["account_id"] = intent.account_id;
     json["client_order_id"] = intent.client_order_id;
-    json["source"] = std::move(source);
+    json["source"] = source_json(intent.source);
     json["instrument"] = intent.instrument.value();
     json["side"] = name_of(intent.side);
     json["type"] = name_of(intent.type);
@@ -641,26 +916,40 @@ ResponseJson order_json(
     json["cancellation_reason"] = outcome.cancellation_reason
         ? ResponseJson(name_of(*outcome.cancellation_reason))
         : ResponseJson(nullptr);
-    json["fill"] = outcome.booked_fill
-        ? fill_json(*outcome.booked_fill)
+    ResponseJson fill = nullptr;
+    if (outcome.booked_fill) {
+        fill = ResponseJson::object();
+        write_fill_fields(
+            fill,
+            outcome.booked_fill->fill,
+            outcome.booked_fill->notional
+        );
+    }
+    json["fill"] = std::move(fill);
+    json["rejection"] = outcome.rejection
+        ? rejection_json(*outcome.rejection)
         : ResponseJson(nullptr);
-    json["market"] = market_json(recorded.market);
+    json["market"] = market_json(market);
     return json;
 }
 
-HttpResponse recorded_order_response(
-    int status,
-    const RecordedPaperOrder& recorded,
-    const OrderOutcome& outcome,
-    std::optional<ResponseJson> error
-) {
-    ResponseJson body = ResponseJson::object();
-    if (error) {
-        body["error"] = std::move(*error);
-    }
-    body["order"] = order_json(recorded, outcome);
-    body["account"] = account_json(recorded.account);
-    return json_response(status, body);
+ResponseJson order_record_json(const PaperOrderRecord& record) {
+    return order_json(
+        record.intent,
+        record.market,
+        order_outcome(record.intent, record.outcome)
+    );
+}
+
+ResponseJson fill_record_json(const PaperFillRecord& record) {
+    ResponseJson json = ResponseJson::object();
+    json["trading_mode"] = "paper";
+    json["account_id"] = record.account_id;
+    json["client_order_id"] = record.client_order_id;
+    json["source"] = source_json(record.source);
+    json["instrument"] = record.fill.instrument.value();
+    write_fill_fields(json, record.fill, booked_notional(record.fill));
+    return json;
 }
 
 HttpResponse render_service_error(const PaperTradingError& failure) {
@@ -687,6 +976,22 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 failure.message,
                 nonempty(failure.field)
             );
+        case PaperTradingErrorCode::InvalidPageLimit:
+            return error_response(
+                400,
+                "malformed_request",
+                failure.message,
+                nonempty(failure.field),
+                "invalid_limit"
+            );
+        case PaperTradingErrorCode::InvalidCursor:
+            return error_response(
+                400,
+                "malformed_request",
+                failure.message,
+                nonempty(failure.field),
+                "invalid_cursor"
+            );
         case PaperTradingErrorCode::AccountAlreadyExists:
             return error_response(
                 409,
@@ -698,6 +1003,13 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
             return error_response(
                 404,
                 "account_not_found",
+                failure.message,
+                nonempty(failure.field)
+            );
+        case PaperTradingErrorCode::OrderNotFound:
+            return error_response(
+                404,
+                "order_not_found",
                 failure.message,
                 nonempty(failure.field)
             );
@@ -811,20 +1123,19 @@ std::variant<PaperOrderRequest, MalformedRequest> parse_order_request(
     std::optional<OrderSourceKind> source_kind;
     std::optional<std::string> source_id;
     if (auto source = fields.object("source", {"kind", "id"})) {
-        source_kind = source->enumeration("kind", kOrderSourceKinds);
+        source_kind = source->enumeration<OrderSourceKind>("kind");
         source_id = source->string("id");
     }
     auto instrument = fields.string("instrument");
-    const auto side = fields.enumeration("side", kSides);
-    const auto type = fields.enumeration("type", kOrderTypes);
+    const auto side = fields.enumeration<Side>("side");
+    const auto type = fields.enumeration<OrderType>("type");
     const auto quantity = fields.decimal<Quantity>("quantity");
     std::optional<Price> limit_price;
     if (fields.contains("limit_price")) {
         limit_price = fields.decimal<Price>("limit_price");
     }
-    const auto time_in_force = fields.enumeration(
-        "time_in_force",
-        kTimesInForce
+    const auto time_in_force = fields.enumeration<TimeInForce>(
+        "time_in_force"
     );
     if (error) {
         return *error;
@@ -843,6 +1154,43 @@ std::variant<PaperOrderRequest, MalformedRequest> parse_order_request(
         .limit_price = limit_price,
         .time_in_force = *time_in_force,
     };
+}
+
+std::variant<HistoryPageRequest, MalformedRequest> parse_history_query(
+    std::string_view query
+) {
+    auto parsed = parse_query(query, {"limit", "cursor"});
+    if (auto* invalid = std::get_if<MalformedRequest>(&parsed)) {
+        return std::move(*invalid);
+    }
+    HistoryPageRequest request;
+    for (QueryParameter& parameter :
+         std::get<std::vector<QueryParameter>>(parsed)) {
+        if (parameter.name == "cursor") {
+            request.cursor = std::move(parameter.value);
+            continue;
+        }
+        request.limit = parse_limit(parameter.value);
+        if (!request.limit) {
+            return malformed(
+                MalformedRequestReason::InvalidLimit,
+                "limit",
+                "limit must be an integer from 1 to " +
+                    std::to_string(kMaximumHistoryPageLimit)
+            );
+        }
+    }
+    return request;
+}
+
+std::optional<MalformedRequest> reject_query_parameters(
+    std::string_view query
+) {
+    auto parsed = parse_query(query, {});
+    if (auto* invalid = std::get_if<MalformedRequest>(&parsed)) {
+        return std::move(*invalid);
+    }
+    return std::nullopt;
 }
 
 std::string format_timestamp(Timestamp timestamp) {
@@ -924,65 +1272,54 @@ HttpResponse render_order_submission(
         return render_service_error(*failure);
     }
     const auto& recorded = std::get<RecordedPaperOrder>(result);
-    return std::visit(
-        [&recorded](const auto& outcome) -> HttpResponse {
-            using Outcome = std::decay_t<decltype(outcome)>;
-            if constexpr (std::is_same_v<Outcome, PaperOrderReceipt>) {
-                return recorded_order_response(
-                    201,
-                    recorded,
-                    receipt_outcome(outcome),
-                    std::nullopt
-                );
-            } else if constexpr (
-                std::is_same_v<Outcome, PreTradeRiskRejection>
-            ) {
-                const bool is_stale =
-                    outcome.code == PreTradeRiskErrorCode::StaleMarketState;
-                return recorded_order_response(
-                    422,
-                    recorded,
-                    unexecuted_outcome(recorded.intent, "rejected"),
-                    error_json(
-                        is_stale ? "market_data_stale" : "risk_rejected",
-                        outcome.message,
-                        request_field(outcome.field),
-                        name_of(outcome.code)
-                    )
-                );
-            } else if constexpr (
-                std::is_same_v<Outcome, SimulatedExecutionError>
-            ) {
-                return recorded_order_response(
-                    422,
-                    recorded,
-                    unexecuted_outcome(recorded.intent, "rejected"),
-                    error_json(
-                        "execution_rejected",
-                        outcome.message,
-                        request_field(outcome.field),
-                        name_of(outcome.code)
-                    )
-                );
-            } else {
-                static_assert(
-                    std::is_same_v<Outcome, PaperOrderProcessingError>
-                );
-                return recorded_order_response(
-                    500,
-                    recorded,
-                    unexecuted_outcome(recorded.intent, "faulted"),
-                    error_json(
-                        "processing_fault",
-                        outcome.message,
-                        std::nullopt,
-                        name_of(outcome.code)
-                    )
-                );
-            }
-        },
-        recorded.result
-    );
+    const OrderOutcome outcome =
+        order_outcome(recorded.intent, recorded.result);
+    ResponseJson body = ResponseJson::object();
+    if (outcome.rejection) {
+        body["error"] = rejection_json(*outcome.rejection);
+    }
+    body["order"] = order_json(recorded.intent, recorded.market, outcome);
+    body["account"] = account_json(recorded.account);
+    return json_response(outcome.submission_status, body);
+}
+
+HttpResponse render_order_history(const PaperOrderHistoryResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& page = std::get<PaperOrderHistoryPage>(result);
+    ResponseJson orders = ResponseJson::array();
+    for (const PaperOrderRecord& record : page.orders) {
+        orders.push_back(order_record_json(record));
+    }
+    ResponseJson body = ResponseJson::object();
+    body["orders"] = std::move(orders);
+    body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
+}
+
+HttpResponse render_order_record(const PaperOrderRecordResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    ResponseJson body = ResponseJson::object();
+    body["order"] = order_record_json(std::get<PaperOrderRecord>(result));
+    return json_response(200, body);
+}
+
+HttpResponse render_fill_history(const PaperFillHistoryResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& page = std::get<PaperFillHistoryPage>(result);
+    ResponseJson fills = ResponseJson::array();
+    for (const PaperFillRecord& record : page.fills) {
+        fills.push_back(fill_record_json(record));
+    }
+    ResponseJson body = ResponseJson::object();
+    body["fills"] = std::move(fills);
+    body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
 }
 
 HttpResponse render_malformed_request(const MalformedRequest& malformed) {

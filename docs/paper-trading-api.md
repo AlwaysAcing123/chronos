@@ -28,6 +28,9 @@ HTTP client
             -> PostgreSQL snapshot and journal (one transaction)
 
 replay driver or future live feed -> MarketState -> PaperTradingService
+
+HTTP GET history -> PaperTradingService -> journal read model
+                                           (persisted rows only)
 ```
 
 Business rules live only in the core and the service. The HTTP layer never
@@ -100,7 +103,27 @@ curl -s -X POST localhost:8080/api/v1/accounts/demo-1/orders \
        "limit_price":"337","time_in_force":"ioc"}'
 
 curl -s localhost:8080/api/v1/accounts/demo-1
+curl -s 'localhost:8080/api/v1/accounts/demo-1/orders?limit=20'
+curl -s localhost:8080/api/v1/accounts/demo-1/orders/buy-1
+curl -s localhost:8080/api/v1/accounts/demo-1/fills
 ```
+
+The history endpoints read indexes added by
+`migrations/002_paper_order_read_indexes.sql`. PostgreSQL runs the mounted
+migrations only when it initializes an empty volume, so an existing volume
+needs the new file applied once. It is idempotent:
+
+```sh
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
+```
+
+The file is sent on standard input rather than read from the container's
+`/docker-entrypoint-initdb.d` mount, which Docker Desktop on macOS may present
+as empty when it lacks access to the repository's folder.
+
+The endpoints return correct results without the indexes, but each page may
+then scan far more of the journal.
 
 ## Representation rules
 
@@ -117,6 +140,11 @@ curl -s localhost:8080/api/v1/accounts/demo-1
 - Optional fields are omitted when absent. `null` is not accepted.
 - Clients never send a quote, price source, submission time, account ID in
   the body, or risk limit.
+- Query strings are strict on every route. The history lists accept only
+  `limit` and `cursor`, each at most once; every other route accepts no query
+  parameters. Unknown, repeated, or malformed parameters return `400` rather
+  than being ignored. Names and values are percent-decoded; `+` is not a
+  space.
 
 ### Decimals
 
@@ -295,6 +323,7 @@ quote, where only 4 shares were displayed:
       "fee": "0.35",
       "filled_at": "2026-09-25T13:39:59.969574414Z"
     },
+    "rejection": null,
     "market": {
       "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
       "ingest_sequence": "121297",
@@ -318,6 +347,104 @@ executed order. A cancelled order has `cancellation_reason`
 A recorded rejection returns `422` with the same `order` and `account`
 objects, `order.status` set to `rejected`, and an `error` object. A recorded
 processing fault returns `500` with `order.status` set to `faulted`.
+
+`order.rejection` is `null` for an executed order. For a rejected or faulted
+order it has the error shape below and equals the submission's `error`, so an
+order resource read back later explains itself. A faulted order reports no
+fill even though the journal keeps the simulated fill that accounting
+rejected.
+
+### `GET /api/v1/accounts/{account_id}/orders`
+
+Lists the account's recorded submissions, newest first: filled, partially
+filled, cancelled, risk-rejected, execution-rejected, and faulted orders.
+Every item is the order resource described above, read from the journal
+without re-running risk, execution, or accounting.
+
+```json
+{
+  "orders": [
+    {"client_order_id": "buy-2", "status": "rejected", "...": "..."},
+    {"client_order_id": "buy-1", "status": "filled", "...": "..."}
+  ],
+  "next_cursor": "djF8b3JkZXJzfGRlbW8tMXw0Mg"
+}
+```
+
+An existing account with no orders returns `{"orders": [], "next_cursor":
+null}`; an unknown account returns `404 account_not_found`.
+
+### `GET /api/v1/accounts/{account_id}/orders/{client_order_id}`
+
+Returns `{"order": ...}`, the complete persisted outcome of one submission,
+with exactly the `order` object its submission returned. An existing account
+without that order returns `404 order_not_found`; an unknown account returns
+`404 account_not_found`.
+
+### `GET /api/v1/accounts/{account_id}/fills`
+
+Lists the fills accounting booked, newest first, with the same pagination.
+Only executed orders book fills; a faulted order's rejected simulated fill is
+never listed.
+
+```json
+{
+  "fills": [
+    {
+      "trading_mode": "paper",
+      "account_id": "demo-1",
+      "client_order_id": "buy-1",
+      "source": {"kind": "manual", "id": "me"},
+      "instrument": "AAPL",
+      "fill_id": "buy-1:fill:0",
+      "side": "buy",
+      "price": "337",
+      "quantity": "4",
+      "notional": "1348",
+      "fee": "0.35",
+      "filled_at": "2026-09-25T13:39:59.969574414Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`notional` is the accounting contract's value, price times quantity rounded
+half away from zero to `0.00000001`. The journal stores the price and
+quantity it was computed from, and the read side derives it with the same
+function the account used.
+
+### Pagination
+
+- Both lists are newest first, ordered by the journal's record identity.
+  Within one account it increases in commit order, because every order record
+  is inserted while the account row is locked.
+- `limit` is an integer from 1 to 200; the default is 50.
+- `next_cursor` is an opaque string, or `null` when no older item exists.
+  Pass it back unchanged as `cursor` with the same account and list. A cursor
+  from the orders list is rejected by the fills list and by other accounts.
+- Following a cursor chain never repeats an item, even while new orders are
+  recorded: new orders are newer than the first page and appear only when a
+  chain is restarted without a cursor.
+- A non-null `next_cursor` means an older item existed when the page was read.
+  The journal is append-only, so the next page is not empty.
+
+### Reconciling an uncertain submission
+
+After `503 persistence_unavailable` or `500 internal_error` from a submission,
+the order may or may not have been recorded:
+
+1. `GET /api/v1/accounts/{account_id}/orders/{client_order_id}`.
+2. `200` means it was recorded; the resource is its final outcome. Do not
+   resubmit.
+3. `404 order_not_found` means it was not recorded when read. Resubmitting
+   the same `client_order_id` is safe.
+4. If that resubmission returns `409 duplicate_client_order_id`, the original
+   commit completed after the read; repeat step 1.
+
+The database accepts each client order ID at most once per account, so this
+procedure can never record an order twice. It does not change the submission
+contract.
 
 ## Errors
 
@@ -345,8 +472,9 @@ with the same ID.
 
 | Status | `code` | Recorded | Meaning and retry |
 |---:|---|:---:|---|
-| 400 | `malformed_request` | no | Body, decimal, enum, or identifier cannot form a typed request; `reason` is one of `invalid_json`, `invalid_type`, `missing_field`, `unexpected_field`, `duplicate_field`, `invalid_decimal`, `too_many_fractional_digits`, `decimal_out_of_range`, `unknown_enum_value`, `invalid_identifier` |
+| 400 | `malformed_request` | no | Body, query, decimal, enum, identifier, limit, or cursor cannot form a typed request; `reason` is one of `invalid_json`, `invalid_type`, `missing_field`, `unexpected_field`, `duplicate_field`, `invalid_decimal`, `too_many_fractional_digits`, `decimal_out_of_range`, `unknown_enum_value`, `invalid_identifier`, `invalid_query`, `invalid_limit`, `invalid_cursor` |
 | 404 | `account_not_found` | no | No such paper account |
+| 404 | `order_not_found` | no | The account has no order with this `client_order_id` |
 | 404 | `route_not_found` | no | No such path |
 | 405 | `method_not_allowed` | no | Wrong method; `Allow` names the right one |
 | 409 | `account_already_exists` | no | The account ID is taken; the original is unchanged |
@@ -378,6 +506,12 @@ order submission with the same `client_order_id`. The database accepts each
 identifier at most once, so an order retry either records the order or returns
 `duplicate_client_order_id`. Reads can be retried unchanged. Internal details,
 including libpq messages, go to the server log and never to clients.
+
+The Recorded column describes submissions. Reads never record anything. A
+read of a journal row that could not have been written fails closed with
+`500 internal_error` rather than returning a misleading resource; so does a
+record whose values the v1 contract cannot represent, such as a malformed
+intent journaled by an in-process caller.
 
 ## Market-state ownership
 
@@ -437,6 +571,10 @@ accounts for a new market timeline.
   `account_version_conflict`.
 - A lost connection surfaces as `persistence_unavailable` for the request that
   observes it. The next operation reconnects automatically.
+- Each history read runs in one repeatable-read, read-only transaction that
+  checks the account and fetches at most `limit + 1` rows through an index on
+  `(account_id, order_record_id)`, so an empty history is reliably
+  distinguished from a missing account and no read loads the whole journal.
 - One user's orders never consume another account's shadow liquidity. Within
   one account, orders against the same market snapshot cannot reuse liquidity
   that earlier orders consumed, including across restarts.
@@ -467,8 +605,8 @@ These are intentionally not implemented in this slice:
 - **Live updates.** A WebSocket endpoint can publish `MarketState` updates and
   journal events. The journal already assigns `paper_events` a database
   sequence for ordered consumers.
-- **Order and fill history, valuation, and cancel/replace** need their own
-  read models, a mark-price policy, and a resting-order state machine.
+- **Valuation and cancel/replace** need a mark-price policy and a
+  resting-order state machine.
 - **Model runtimes** will build `PaperOrderRequest` values with
   `source.kind = model` and call the same service in process.
 
@@ -482,6 +620,8 @@ These are intentionally not implemented in this slice:
 - Startup replay is unpaced, so the served market does not move while the
   server runs.
 - An interrupted market stream recovers only by restarting the server.
-- No valuation, order history, fill history, or cancel/replace endpoints yet.
+- No valuation, unrealized PnL, or cancel/replace endpoints yet.
+- History lists page backward from the newest item only; there is no time
+  range filter or ascending order.
 - The top-of-book simulator's assumptions above make simulated PnL optimistic
   or pessimistic in ways not yet measured.

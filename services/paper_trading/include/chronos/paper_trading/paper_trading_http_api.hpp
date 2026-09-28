@@ -18,10 +18,13 @@ using DiagnosticLog = std::function<void(std::string_view line)>;
 //   POST /api/v1/accounts
 //   GET  /api/v1/accounts/{account_id}
 //   POST /api/v1/accounts/{account_id}/orders
+//   GET  /api/v1/accounts/{account_id}/orders
+//   GET  /api/v1/accounts/{account_id}/orders/{client_order_id}
+//   GET  /api/v1/accounts/{account_id}/fills
 //
-// The router holds no trading logic: it checks the method and media type,
-// parses the body through the JSON contract, calls the service, and renders
-// the typed result. `service` must outlive the router.
+// The router holds no trading logic: it checks the method, query string, and
+// media type, parses the request through the JSON contract, calls the
+// service, and renders the typed result. `service` must outlive the router.
 class PaperTradingHttpApi final {
 public:
     PaperTradingHttpApi(PaperTradingService& service, DiagnosticLog log);

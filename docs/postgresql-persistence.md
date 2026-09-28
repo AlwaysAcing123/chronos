@@ -108,6 +108,68 @@ audit and future event-driven consumers. The repository exposes no mutation or
 deletion operation for journal records. Both are written in the same
 transaction.
 
+## Journal read model
+
+`list_orders`, `find_order`, and `list_fills` read the journal for the
+paper-trading history API. They map persisted rows only; risk, execution,
+and accounting are never re-run to reconstruct a result.
+
+- **Consistency.** Each read runs in one repeatable-read, read-only
+  transaction that first checks the account, so a missing account is always
+  distinguished from an empty history.
+- **Bounded work.** Pages are newest first by `order_record_id` and fetch at
+  most `limit + 1` rows; the extra row only signals an older page. There is no
+  `OFFSET`. `paper_order_account_record_idx` serves order pages and lookups
+  scanned by account, and the partial `paper_order_account_booked_fill_idx`
+  serves fill pages.
+- **Keyset order.** Within one account, `order_record_id` increases in commit
+  order: the identity sequence allocates in call order (cache 1), and a
+  submission inserts its record only after locking the account row with the
+  optimistic version update. A page chain that continues from
+  `order_record_id < last` therefore never repeats a record while new orders
+  are committed. Allocating record identities outside that lock, or giving
+  the sequence a cache, would break this property.
+- **Booked fills.** Only `receipt` records book fills. A processing fault can
+  journal the simulated fill that accounting rejected, so fill reads filter on
+  `outcome_kind = 'receipt'` and never report it.
+- **Notional.** The journal stores fill price and quantity, not notional. The
+  read side derives notional with the same `calculate_notional` function the
+  account used, so it is exact under the current accounting contract.
+- **Fail closed.** A row whose fields could not have been written together
+  raises `std::runtime_error`. Examples include an execution status that
+  disagrees with its fill and quantities, an execution that names a different
+  market observation, a rejection without a code, a declared enum value
+  spelled as `unknown:<n>`, or a code outside the vocabulary. Malformed
+  intents that the journal preserves on purpose round-trip exactly.
+
+## Migrations
+
+Migrations are ordered files in `migrations/`. Each owns its transaction,
+records its version in `chronos_schema_migrations`, and is idempotent, so
+applying a file again is safe. An applied migration is never edited; schema
+changes add a new file.
+
+- `001_paper_trading.sql`: account snapshots and the order and event journal.
+- `002_paper_order_read_indexes.sql`: keyset indexes for the history API.
+
+PostgreSQL's image runs the mounted files only when it initializes an empty
+volume. For an existing local volume, apply a new file once:
+
+```sh
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
+```
+
+Sending the file on standard input avoids depending on the container's
+`/docker-entrypoint-initdb.d` bind mount, which Docker Desktop on macOS can
+present as empty when it lacks permission to read the repository's folder.
+Integration tests apply every migration file in order before running.
+
+`002` uses a plain `CREATE INDEX`, which blocks writes while it builds. That
+is fine locally and in CI; a large production table would need
+`CREATE INDEX CONCURRENTLY` outside a transaction, under a deliberate
+migration policy that Chronos does not yet define.
+
 ## Local development
 
 Chronos pins the official PostgreSQL 18.6 Debian image by digest and binds it
@@ -163,6 +225,9 @@ tests prove:
 - Duplicate client order IDs roll back the snapshot version and all events.
 - Risk rejections are durable and idempotency-protected.
 - Stale concurrent sessions cannot overwrite committed state.
+- History reads reconstruct filled, partial, cancelled, rejected, and faulted
+  orders exactly, page stably while orders arrive, list only booked fills,
+  reject inconsistent rows, and survive connection loss.
 - Processed IDs remain effective after recovery.
 - Malformed rejected inputs remain persistable and auditable.
 - Text containing NUL bytes is rejected without persisting anything.
@@ -180,12 +245,14 @@ database.
 - No statement or lock timeout; a blocked row lock blocks the caller
 - No authentication or user-to-account authorization layer
 - No TLS policy or production secret manager configuration
-- No migration runner CLI or rollback migrations
+- No migration runner CLI, rollback migrations, or schema-version check at
+  server startup
 - Snapshot recovery is validated against database constraints and domain
   invariants but is not yet independently recomputed from the complete journal
 - No retention, archival, backup, replication, or disaster-recovery policy
 - The paper-trading API uses this component through request-scoped
-  sessions; see [paper-trading-api.md](paper-trading-api.md)
+  sessions and the journal read model; see
+  [paper-trading-api.md](paper-trading-api.md)
 
 These belong to the backend and production-hardening milestones. They do not
 weaken the current guarantees for local, atomic, restart-safe paper trading.

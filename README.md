@@ -43,6 +43,9 @@ Chronos simulates trading only. It does not place real-money orders.
 - An optional local HTTP API for health, account creation and retrieval, and
   immediate-or-cancel order submission, with exact decimal strings and stable
   machine-readable errors
+- Durable order and fill history read from the journal, with stable
+  newest-first keyset pagination and order lookup for reconciling uncertain
+  submissions
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution, plus real-PostgreSQL service and API tests
 
@@ -170,8 +173,17 @@ CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos
 The server binds to `127.0.0.1:8080` by default. It has no authentication
 and is not production-secure. See
 [docs/paper-trading-api.md](docs/paper-trading-api.md) for the request and
-response contract, decimal and timestamp rules, error codes, market-state
-ownership, and limitations.
+response contract, history pagination, decimal and timestamp rules, error
+codes, market-state ownership, and limitations.
+
+A local database volume created before
+`migrations/002_paper_order_read_indexes.sql` existed needs that file applied
+once; it is idempotent:
+
+```sh
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
+```
 
 ## Repository map
 
@@ -222,5 +234,7 @@ The paper-trading HTTP contract is documented in
 [docs/paper-trading-api.md](docs/paper-trading-api.md), and its transport and
 dependency decision in
 [docs/decisions/0004-paper-trading-http-api.md](docs/decisions/0004-paper-trading-http-api.md).
+The journal read model and pagination decision is recorded in
+[docs/decisions/0005-paper-journal-read-model.md](docs/decisions/0005-paper-journal-read-model.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

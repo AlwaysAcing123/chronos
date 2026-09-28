@@ -1,3 +1,4 @@
+#include "chronos/paper_trading/history_cursor.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
 #include "paper_trading_test_support.hpp"
 #include "postgres_test_support.hpp"
@@ -13,6 +14,7 @@
 #include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace {
 
@@ -35,7 +37,18 @@ using chronos::Side;
 using chronos::SimulatedCancellationReason;
 using chronos::SimulatedExecutionStatus;
 using chronos::Timestamp;
+using chronos::PaperFillRecord;
+using chronos::PaperOrderRecord;
+using chronos::SimulatedExecutionReport;
 using chronos::paper_trading::CreatePaperAccountRequest;
+using chronos::paper_trading::encode_history_cursor;
+using chronos::paper_trading::HistoryCursorKind;
+using chronos::paper_trading::HistoryPageRequest;
+using chronos::paper_trading::PaperFillHistoryPage;
+using chronos::paper_trading::PaperFillHistoryResult;
+using chronos::paper_trading::PaperOrderHistoryPage;
+using chronos::paper_trading::PaperOrderHistoryResult;
+using chronos::paper_trading::PaperOrderRecordResult;
 using chronos::paper_trading::PaperAccountResult;
 using chronos::paper_trading::PaperAccountView;
 using chronos::paper_trading::PaperOrderSubmissionResult;
@@ -638,6 +651,362 @@ void test_health_reports_persistence_and_market_stream() {
     REQUIRE(!after.market.interruption.has_value());
 }
 
+// ---------------------------------------------------------------------------
+// Journal reads
+
+PaperOrderHistoryPage require_order_history(PaperOrderHistoryResult result) {
+    REQUIRE(std::holds_alternative<PaperOrderHistoryPage>(result));
+    return std::get<PaperOrderHistoryPage>(std::move(result));
+}
+
+PaperFillHistoryPage require_fill_history(PaperFillHistoryResult result) {
+    REQUIRE(std::holds_alternative<PaperFillHistoryPage>(result));
+    return std::get<PaperFillHistoryPage>(std::move(result));
+}
+
+PaperOrderRecord require_order_record(PaperOrderRecordResult result) {
+    REQUIRE(std::holds_alternative<PaperOrderRecord>(result));
+    return std::get<PaperOrderRecord>(std::move(result));
+}
+
+std::vector<std::string> client_order_ids(const PaperOrderHistoryPage& page) {
+    std::vector<std::string> ids;
+    for (const auto& record : page.orders) {
+        ids.push_back(record.intent.client_order_id);
+    }
+    return ids;
+}
+
+std::vector<std::string> client_order_ids(const PaperFillHistoryPage& page) {
+    std::vector<std::string> ids;
+    for (const auto& record : page.fills) {
+        ids.push_back(record.client_order_id);
+    }
+    return ids;
+}
+
+HistoryPageRequest page(
+    std::optional<std::size_t> limit,
+    std::optional<std::string> cursor = std::nullopt
+) {
+    return HistoryPageRequest{.limit = limit, .cursor = std::move(cursor)};
+}
+
+void test_history_distinguishes_missing_accounts_from_empty_history() {
+    const auto market = market_state();
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "empty-reads");
+
+    const auto orders = require_order_history(
+        service->list_orders(account_id, {})
+    );
+    REQUIRE(orders.orders.empty());
+    REQUIRE(!orders.next_cursor.has_value());
+    const auto fills = require_fill_history(service->list_fills(account_id, {}));
+    REQUIRE(fills.fills.empty());
+    REQUIRE(!fills.next_cursor.has_value());
+    REQUIRE(require_error(
+        service->get_order(account_id, "never-sent"),
+        PaperTradingErrorCode::OrderNotFound
+    ).field == "client_order_id");
+
+    const std::string missing = unique_test_id("missing-reads");
+    require_error(
+        service->list_orders(missing, {}),
+        PaperTradingErrorCode::AccountNotFound
+    );
+    require_error(
+        service->list_fills(missing, {}),
+        PaperTradingErrorCode::AccountNotFound
+    );
+    require_error(
+        service->get_order(missing, "never-sent"),
+        PaperTradingErrorCode::AccountNotFound
+    );
+
+    REQUIRE(require_error(
+        service->list_orders("bad id", {}),
+        PaperTradingErrorCode::InvalidIdentifier
+    ).field == "account_id");
+    for (const std::string& invalid : {
+             std::string("bad id"),
+             std::string("nul\0id", 6),
+             std::string(65, 'x'),
+         }) {
+        REQUIRE(require_error(
+            service->get_order(account_id, invalid),
+            PaperTradingErrorCode::InvalidIdentifier
+        ).field == "client_order_id");
+    }
+}
+
+void test_history_pages_follow_opaque_cursors_newest_first() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "history-pages");
+    for (const std::string_view id : {"fill-0", "fill-1", "fill-2"}) {
+        require_recorded(service->submit_order(
+            order_request(account_id, std::string(id), Side::Buy, "1")
+        ));
+    }
+    require_recorded(service->submit_order(order_request(
+        account_id,
+        "passive",
+        Side::Buy,
+        "1",
+        OrderType::Limit,
+        "100"
+    )));
+    require_recorded(service->submit_order(
+        order_request(account_id, "too-big", Side::Buy, "50")
+    ));
+
+    const auto first = require_order_history(
+        service->list_orders(account_id, page(2))
+    );
+    REQUIRE((client_order_ids(first) ==
+             std::vector<std::string>{"too-big", "passive"}));
+    REQUIRE(first.next_cursor.has_value());
+    const auto second = require_order_history(
+        service->list_orders(account_id, page(2, first.next_cursor))
+    );
+    REQUIRE((client_order_ids(second) ==
+             std::vector<std::string>{"fill-2", "fill-1"}));
+    const auto last = require_order_history(
+        service->list_orders(account_id, page(2, second.next_cursor))
+    );
+    REQUIRE((client_order_ids(last) == std::vector<std::string>{"fill-0"}));
+    REQUIRE(!last.next_cursor.has_value());
+    REQUIRE(require_order_history(service->list_orders(account_id, {}))
+                .orders.size() == 5);
+
+    const auto fills = require_fill_history(
+        service->list_fills(account_id, page(2))
+    );
+    REQUIRE((client_order_ids(fills) ==
+             std::vector<std::string>{"fill-2", "fill-1"}));
+    REQUIRE(fills.fills.front().account_id == account_id);
+    const auto older_fills = require_fill_history(
+        service->list_fills(account_id, page(2, fills.next_cursor))
+    );
+    REQUIRE((client_order_ids(older_fills) ==
+             std::vector<std::string>{"fill-0"}));
+    REQUIRE(!older_fills.next_cursor.has_value());
+}
+
+void test_page_limits_and_cursors_are_validated_by_the_service() {
+    const auto market = market_state();
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "page-rules");
+    const std::string other_account = create_account(*service, "page-other");
+    using chronos::paper_trading::kMaximumHistoryPageLimit;
+
+    for (const std::size_t invalid : {std::size_t{0}, kMaximumHistoryPageLimit + 1}) {
+        REQUIRE(require_error(
+            service->list_orders(account_id, page(invalid)),
+            PaperTradingErrorCode::InvalidPageLimit
+        ).field == "limit");
+        require_error(
+            service->list_fills(account_id, page(invalid)),
+            PaperTradingErrorCode::InvalidPageLimit
+        );
+    }
+    require_order_history(
+        service->list_orders(account_id, page(kMaximumHistoryPageLimit))
+    );
+
+    const std::string fills_cursor = encode_history_cursor(
+        HistoryCursorKind::Fills,
+        account_id,
+        5
+    );
+    REQUIRE(require_error(
+        service->list_orders(account_id, page(std::nullopt, fills_cursor)),
+        PaperTradingErrorCode::InvalidCursor
+    ).field == "cursor");
+    require_error(
+        service->list_orders(
+            account_id,
+            page(
+                std::nullopt,
+                encode_history_cursor(HistoryCursorKind::Orders, other_account, 5)
+            )
+        ),
+        PaperTradingErrorCode::InvalidCursor
+    );
+    for (const std::string& cursor : {
+             std::string(),
+             std::string("not a cursor"),
+             encode_history_cursor(HistoryCursorKind::Fills, account_id, 0),
+             encode_history_cursor(HistoryCursorKind::Fills, account_id, -1),
+         }) {
+        require_error(
+            service->list_fills(account_id, page(std::nullopt, cursor)),
+            PaperTradingErrorCode::InvalidCursor
+        );
+    }
+    require_fill_history(service->list_fills(
+        account_id,
+        page(std::nullopt, fills_cursor)
+    ));
+
+    // Request validation needs no database, so it precedes the account check.
+    require_error(
+        service->list_orders(unique_test_id("missing-page"), page(0)),
+        PaperTradingErrorCode::InvalidPageLimit
+    );
+}
+
+void test_default_page_holds_fifty_orders() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "default-page");
+    for (int index = 0; index < 51; ++index) {
+        require_recorded(service->submit_order(order_request(
+            account_id,
+            "passive-" + std::to_string(index),
+            Side::Buy,
+            "1",
+            OrderType::Limit,
+            "100"
+        )));
+    }
+
+    const auto first = require_order_history(
+        service->list_orders(account_id, {})
+    );
+    REQUIRE(first.orders.size() ==
+            chronos::paper_trading::kDefaultHistoryPageLimit);
+    REQUIRE(first.orders.front().intent.client_order_id == "passive-50");
+    const auto rest = require_order_history(
+        service->list_orders(account_id, page(std::nullopt, first.next_cursor))
+    );
+    REQUIRE((client_order_ids(rest) == std::vector<std::string>{"passive-0"}));
+    REQUIRE(!rest.next_cursor.has_value());
+}
+
+void test_uncertain_submission_is_reconciled_by_lookup() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const std::string application = unique_test_id("reconcile");
+    const auto service = make_service(
+        *market,
+        with_application_name(connection_string, application)
+    );
+    const std::string account_id = create_account(*service, "reconcile");
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    require_error(
+        service->submit_order(order_request(account_id, "uncertain", Side::Buy, "2")),
+        PaperTradingErrorCode::PersistenceUnavailable
+    );
+    require_error(
+        service->get_order(account_id, "uncertain"),
+        PaperTradingErrorCode::OrderNotFound
+    );
+
+    const RecordedPaperOrder recorded = require_recorded(service->submit_order(
+        order_request(account_id, "uncertain", Side::Buy, "2")
+    ));
+    const PaperOrderRecord reconciled = require_order_record(
+        service->get_order(account_id, "uncertain")
+    );
+    REQUIRE(reconciled.intent == recorded.intent);
+    REQUIRE(reconciled.market == recorded.market);
+    REQUIRE(std::get<SimulatedExecutionReport>(reconciled.outcome) ==
+            require_receipt(recorded).execution);
+}
+
+void test_manual_and_model_orders_read_back_identically() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0, "AAPL", QuoteLevels{.ask_quantity = "4"}));
+    const auto service = make_service(*market);
+    const std::string manual_account = create_account(*service, "read-manual");
+    const std::string model_account = create_account(*service, "read-model");
+    require_recorded(service->submit_order(
+        order_request(manual_account, "same-id", Side::Buy, "6")
+    ));
+    require_recorded(service->submit_order(order_request(
+        model_account,
+        "same-id",
+        Side::Buy,
+        "6",
+        OrderType::Market,
+        std::nullopt,
+        OrderSourceKind::Model
+    )));
+
+    const auto manual = require_order_record(
+        service->get_order(manual_account, "same-id")
+    );
+    const auto model = require_order_record(
+        service->get_order(model_account, "same-id")
+    );
+    REQUIRE(manual.intent.source.kind == OrderSourceKind::Manual);
+    REQUIRE(model.intent.source.kind == OrderSourceKind::Model);
+    REQUIRE(manual.market == model.market);
+    const auto& manual_execution =
+        std::get<SimulatedExecutionReport>(manual.outcome);
+    const auto& model_execution =
+        std::get<SimulatedExecutionReport>(model.outcome);
+    REQUIRE(manual_execution.status == model_execution.status);
+    REQUIRE(manual_execution.fill == model_execution.fill);
+    REQUIRE(
+        manual_execution.unfilled_quantity == model_execution.unfilled_quantity
+    );
+
+    const PaperFillRecord manual_fill = require_fill_history(
+        service->list_fills(manual_account, {})
+    ).fills.front();
+    const PaperFillRecord model_fill = require_fill_history(
+        service->list_fills(model_account, {})
+    ).fills.front();
+    REQUIRE(manual_fill.fill == model_fill.fill);
+    REQUIRE(manual_fill.source.kind == OrderSourceKind::Manual);
+    REQUIRE(model_fill.source.kind == OrderSourceKind::Model);
+}
+
+void test_history_reads_report_outages_then_recover() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const std::string application = unique_test_id("read-outage-service");
+    const auto service = make_service(
+        *market,
+        with_application_name(connection_string, application)
+    );
+    const std::string account_id = create_account(*service, "read-outage");
+    require_recorded(service->submit_order(
+        order_request(account_id, "before", Side::Buy, "1")
+    ));
+
+    PostgresTestConnection observer(connection_string);
+    terminate_backends(observer, application);
+    require_error(
+        service->list_orders(account_id, {}),
+        PaperTradingErrorCode::PersistenceUnavailable
+    );
+    REQUIRE(require_order_history(service->list_orders(account_id, {}))
+                .orders.size() == 1);
+    // Each outage needs a live connection to lose, so a successful read
+    // re-establishes it before the next backend is terminated.
+    terminate_backends(observer, application);
+    require_error(
+        service->list_fills(account_id, {}),
+        PaperTradingErrorCode::PersistenceUnavailable
+    );
+    REQUIRE(require_fill_history(service->list_fills(account_id, {}))
+                .fills.size() == 1);
+    terminate_backends(observer, application);
+    require_error(
+        service->get_order(account_id, "before"),
+        PaperTradingErrorCode::PersistenceUnavailable
+    );
+    require_order_record(service->get_order(account_id, "before"));
+}
+
 }  // namespace
 
 int main() {
@@ -651,7 +1020,7 @@ int main() {
     }
     connection_string = configured_connection;
     PostgresPaperOrderRepository(connection_string)
-        .apply_migration(chronos::test::migration_sql());
+        .apply_migration(chronos::test::all_migrations_sql());
 
     return chronos::test::run_tests({
         {
@@ -721,6 +1090,34 @@ int main() {
         {
             "health reports persistence and market stream",
             test_health_reports_persistence_and_market_stream,
+        },
+        {
+            "history distinguishes missing accounts",
+            test_history_distinguishes_missing_accounts_from_empty_history,
+        },
+        {
+            "history pages follow opaque cursors",
+            test_history_pages_follow_opaque_cursors_newest_first,
+        },
+        {
+            "page limits and cursors are validated",
+            test_page_limits_and_cursors_are_validated_by_the_service,
+        },
+        {
+            "default page holds fifty orders",
+            test_default_page_holds_fifty_orders,
+        },
+        {
+            "uncertain submission is reconciled by lookup",
+            test_uncertain_submission_is_reconciled_by_lookup,
+        },
+        {
+            "manual and model orders read back identically",
+            test_manual_and_model_orders_read_back_identically,
+        },
+        {
+            "history reads report outages then recover",
+            test_history_reads_report_outages_then_recover,
         },
     });
 }

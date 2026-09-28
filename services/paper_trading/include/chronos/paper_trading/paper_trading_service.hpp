@@ -55,8 +55,11 @@ enum class PaperTradingErrorCode {
     InvalidIdentifier,
     UnsupportedInstrument,
     InvalidStartingCash,
+    InvalidPageLimit,
+    InvalidCursor,
     AccountAlreadyExists,
     AccountNotFound,
+    OrderNotFound,
     MarketDataUnavailable,
     DuplicateClientOrderId,
     AccountVersionConflict,
@@ -98,6 +101,43 @@ using PaperOrderSubmissionResult = std::variant<
     PaperTradingError
 >;
 
+// History pages are newest first. See docs/paper-trading-api.md.
+inline constexpr std::size_t kDefaultHistoryPageLimit = 50;
+inline constexpr std::size_t kMaximumHistoryPageLimit = 200;
+
+struct HistoryPageRequest {
+    // Absent means kDefaultHistoryPageLimit.
+    std::optional<std::size_t> limit;
+    // Absent means the newest page; otherwise the next_cursor of a previous
+    // page of the same account and kind.
+    std::optional<std::string> cursor;
+};
+
+struct PaperOrderHistoryPage {
+    std::vector<PaperOrderRecord> orders;
+    std::optional<std::string> next_cursor;
+};
+
+struct PaperFillHistoryPage {
+    std::vector<PaperFillRecord> fills;
+    std::optional<std::string> next_cursor;
+};
+
+using PaperOrderHistoryResult = std::variant<
+    PaperOrderHistoryPage,
+    PaperTradingError
+>;
+
+using PaperOrderRecordResult = std::variant<
+    PaperOrderRecord,
+    PaperTradingError
+>;
+
+using PaperFillHistoryResult = std::variant<
+    PaperFillHistoryPage,
+    PaperTradingError
+>;
+
 struct PaperTradingHealth {
     bool persistence_available;
     MarketStateStatus market;
@@ -132,6 +172,23 @@ public:
 
     [[nodiscard]] PaperOrderSubmissionResult submit_order(
         const PaperOrderRequest& request
+    );
+
+    // Read the durable journal only; nothing is re-evaluated. An order that
+    // returned an uncertain 500 or 503 can be reconciled with get_order.
+    [[nodiscard]] PaperOrderHistoryResult list_orders(
+        std::string_view account_id,
+        const HistoryPageRequest& request
+    );
+
+    [[nodiscard]] PaperOrderRecordResult get_order(
+        std::string_view account_id,
+        std::string_view client_order_id
+    );
+
+    [[nodiscard]] PaperFillHistoryResult list_fills(
+        std::string_view account_id,
+        const HistoryPageRequest& request
     );
 
     [[nodiscard]] PaperTradingHealth health();

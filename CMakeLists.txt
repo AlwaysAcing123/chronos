@@ -218,6 +218,7 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
     endforeach()
 
     add_library(chronos_paper_trading_service
+        services/paper_trading/src/history_cursor.cpp
         services/paper_trading/src/paper_trading_service.cpp
     )
 
@@ -478,6 +479,21 @@ if(BUILD_TESTING)
     endif()
 
     if(CHRONOS_ENABLE_PAPER_TRADING_API)
+        add_executable(chronos_paper_trading_history_cursor_tests
+            tests/paper_trading_history_cursor_tests.cpp
+        )
+
+        target_link_libraries(chronos_paper_trading_history_cursor_tests
+            PRIVATE
+                chronos_paper_trading_service
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_paper_trading_history_cursor_tests
+            COMMAND chronos_paper_trading_history_cursor_tests
+        )
+
         add_executable(chronos_paper_trading_http_contract_tests
             tests/paper_trading_http_contract_tests.cpp
         )

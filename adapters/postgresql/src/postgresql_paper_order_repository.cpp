@@ -4,7 +4,9 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -616,6 +618,487 @@ PaperPersistenceConflict conflict(
     };
 }
 
+std::int64_t persisted_int64(
+    const PostgresResult& result,
+    int row,
+    std::string_view field
+) {
+    return parse_integer<std::int64_t>(result.value(row, field), field);
+}
+
+std::uint64_t persisted_uint64(
+    const PostgresResult& result,
+    int row,
+    std::string_view field
+) {
+    return parse_integer<std::uint64_t>(result.value(row, field), field);
+}
+
+// Reads a top-of-book observation from the `<prefix>stream_id`,
+// `<prefix>bid_price_raw`, and related columns. The account snapshot
+// (`active_`) and the order journal (`market_`) share this shape.
+TopOfBookEvent persisted_top_of_book(
+    const PostgresResult& result,
+    int row,
+    std::string_view prefix,
+    InstrumentId instrument
+) {
+    const auto column = [prefix](std::string_view name) {
+        return std::string(prefix) + std::string(name);
+    };
+    const auto bid_price = optional_int64(result, row, column("bid_price_raw"));
+    const auto bid_quantity = optional_int64(
+        result,
+        row,
+        column("bid_quantity_raw")
+    );
+    const auto ask_price = optional_int64(result, row, column("ask_price_raw"));
+    const auto ask_quantity = optional_int64(
+        result,
+        row,
+        column("ask_quantity_raw")
+    );
+    if (bid_price.has_value() != bid_quantity.has_value() ||
+        ask_price.has_value() != ask_quantity.has_value()) {
+        throw std::runtime_error(
+            "persisted book level is only partially populated"
+        );
+    }
+    const auto venue = result.optional_value(row, column("venue"));
+    return TopOfBookEvent{
+        .header = MarketEventHeader{
+            .instrument = std::move(instrument),
+            .stream = MarketDataStreamId(
+                result.value(row, column("stream_id"))
+            ),
+            .venue = venue
+                ? std::optional<VenueId>(VenueId(*venue))
+                : std::nullopt,
+            .event_timestamp = Timestamp::from_nanoseconds(
+                persisted_int64(result, row, column("event_timestamp_ns"))
+            ),
+            .receive_timestamp = Timestamp::from_nanoseconds(
+                persisted_int64(result, row, column("receive_timestamp_ns"))
+            ),
+            .ingest_sequence = persisted_uint64(
+                result,
+                row,
+                column("ingest_sequence")
+            ),
+            .venue_sequence = optional_uint64(
+                result,
+                row,
+                column("venue_sequence")
+            ),
+            .quality = MarketDataQuality::from_raw(parse_integer<std::uint32_t>(
+                result.value(row, column("quality_flags")),
+                column("quality_flags")
+            )),
+        },
+        .bid = bid_price
+            ? std::optional<BookLevel>(BookLevel{
+                  .price = Price::from_raw(*bid_price),
+                  .quantity = Quantity::from_raw(*bid_quantity),
+              })
+            : std::nullopt,
+        .ask = ask_price
+            ? std::optional<BookLevel>(BookLevel{
+                  .price = Price::from_raw(*ask_price),
+                  .quantity = Quantity::from_raw(*ask_quantity),
+              })
+            : std::nullopt,
+    };
+}
+
+// Every read in one operation sees the same committed database state.
+void start_consistent_read(PGconn* connection, std::string_view operation) {
+    const auto isolation = execute(
+        connection,
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    );
+    require_status(isolation, PGRES_COMMAND_OK, operation);
+}
+
+bool account_exists(PGconn* connection, std::string_view account_id) {
+    PostgresParameters parameters;
+    parameters.add(account_id);
+    const auto result = execute(
+        connection,
+        "SELECT 1 FROM paper_accounts WHERE account_id = $1",
+        parameters
+    );
+    require_status(result, PGRES_TUPLES_OK, "check paper account");
+    return result.row_count() == 1;
+}
+
+// ---------------------------------------------------------------------------
+// Journal read model
+
+[[noreturn]] void inconsistent_record(std::string_view detail) {
+    throw std::runtime_error(
+        "persisted paper order record is inconsistent: " + std::string(detail)
+    );
+}
+
+// Outcomes, fills, and the intents of executed orders are written with
+// canonical names only (see outcome_text).
+template <typename Enum>
+Enum canonical_value(const std::string& text, std::string_view field) {
+    if (const auto value = from_canonical_name<Enum>(text)) {
+        return *value;
+    }
+    inconsistent_record(std::string(field) + " is not a recognized value");
+}
+
+// A malformed intent is journaled faithfully as "unknown:<integer>" (see
+// intent_text), so its exact in-memory value is restored rather than
+// rejected. A declared value must have been written by its canonical name.
+template <typename Enum>
+Enum journaled_intent_value(const std::string& text, std::string_view field) {
+    if (const auto value = from_canonical_name<Enum>(text)) {
+        return *value;
+    }
+    constexpr std::string_view kUndeclaredPrefix = "unknown:";
+    if (text.starts_with(kUndeclaredPrefix)) {
+        const auto value = static_cast<Enum>(
+            parse_integer<std::underlying_type_t<Enum>>(
+                std::string_view(text).substr(kUndeclaredPrefix.size()),
+                field
+            )
+        );
+        if (!canonical_name(value) && intent_text(value) == text) {
+            return value;
+        }
+    }
+    inconsistent_record(std::string(field) + " is not a journaled value");
+}
+
+constexpr std::string_view kOrderRecordColumns = R"SQL(
+    order_record_id, client_order_id, intent_account_id, instrument,
+    source_kind, source_id, side, order_type, quantity_raw,
+    limit_price_raw, time_in_force, submitted_at_ns, market_instrument,
+    market_stream_id, market_venue, market_event_timestamp_ns,
+    market_receive_timestamp_ns, market_ingest_sequence,
+    market_venue_sequence, market_quality_flags, market_bid_price_raw,
+    market_bid_quantity_raw, market_ask_price_raw, market_ask_quantity_raw,
+    outcome_kind, outcome_code, outcome_field, outcome_message,
+    execution_status, unfilled_quantity_raw, cancellation_reason,
+    execution_market_ingest_sequence, fill_id, fill_side, fill_price_raw,
+    fill_quantity_raw, fill_fee_raw, fill_timestamp_ns,
+    processed_by_execution
+)SQL";
+
+OrderIntent persisted_intent(const PostgresResult& result, int row) {
+    const auto limit_price = optional_int64(result, row, "limit_price_raw");
+    return OrderIntent{
+        .client_order_id = result.value(row, "client_order_id"),
+        .account_id = result.value(row, "intent_account_id"),
+        .source = OrderSource{
+            .kind = journaled_intent_value<OrderSourceKind>(
+                result.value(row, "source_kind"),
+                "source_kind"
+            ),
+            .source_id = result.value(row, "source_id"),
+        },
+        .instrument = InstrumentId(result.value(row, "instrument")),
+        .side = journaled_intent_value<Side>(result.value(row, "side"), "side"),
+        .type = journaled_intent_value<OrderType>(
+            result.value(row, "order_type"),
+            "order_type"
+        ),
+        .quantity = Quantity::from_raw(
+            persisted_int64(result, row, "quantity_raw")
+        ),
+        .limit_price = limit_price
+            ? std::optional<Price>(Price::from_raw(*limit_price))
+            : std::nullopt,
+        .time_in_force = journaled_intent_value<TimeInForce>(
+            result.value(row, "time_in_force"),
+            "time_in_force"
+        ),
+        .submitted_at = Timestamp::from_nanoseconds(
+            persisted_int64(result, row, "submitted_at_ns")
+        ),
+    };
+}
+
+// The simulator produces exactly these status, fill, and quantity shapes.
+bool is_consistent_execution(
+    SimulatedExecutionStatus status,
+    const std::optional<SimulatedCancellationReason>& reason,
+    Quantity unfilled,
+    const std::optional<Fill>& fill,
+    Quantity ordered
+) {
+    switch (status) {
+        case SimulatedExecutionStatus::Filled:
+            return fill && !reason && unfilled.raw() == 0 &&
+                fill->quantity == ordered;
+        case SimulatedExecutionStatus::PartiallyFilledAndCancelled:
+            return fill &&
+                reason ==
+                    SimulatedCancellationReason::DisplayedLiquidityExhausted &&
+                unfilled.raw() > 0 && fill->quantity + unfilled == ordered;
+        case SimulatedExecutionStatus::Cancelled:
+            return !fill && reason.has_value() && unfilled == ordered;
+    }
+    return false;
+}
+
+SimulatedExecutionReport persisted_execution(
+    const PostgresResult& result,
+    int row,
+    const OrderIntent& intent,
+    const TopOfBookEvent& market
+) {
+    const auto status = canonical_value<SimulatedExecutionStatus>(
+        result.value(row, "execution_status"),
+        "execution_status"
+    );
+    const auto reason_text = result.optional_value(row, "cancellation_reason");
+    const std::optional<SimulatedCancellationReason> reason = reason_text
+        ? std::optional<SimulatedCancellationReason>(
+              canonical_value<SimulatedCancellationReason>(
+                  *reason_text,
+                  "cancellation_reason"
+              )
+          )
+        : std::nullopt;
+    const Quantity unfilled = Quantity::from_raw(
+        persisted_int64(result, row, "unfilled_quantity_raw")
+    );
+    const std::uint64_t market_sequence = persisted_uint64(
+        result,
+        row,
+        "execution_market_ingest_sequence"
+    );
+    if (market_sequence != market.header.ingest_sequence) {
+        inconsistent_record("execution used a different market observation");
+    }
+
+    std::optional<Fill> fill;
+    if (!result.is_null(row, "fill_id")) {
+        fill = Fill{
+            .fill_id = result.value(row, "fill_id"),
+            .instrument = intent.instrument,
+            .side = canonical_value<Side>(
+                result.value(row, "fill_side"),
+                "fill_side"
+            ),
+            .price = Price::from_raw(
+                persisted_int64(result, row, "fill_price_raw")
+            ),
+            .quantity = Quantity::from_raw(
+                persisted_int64(result, row, "fill_quantity_raw")
+            ),
+            .fee = Money::from_raw(
+                persisted_int64(result, row, "fill_fee_raw")
+            ),
+            .timestamp = Timestamp::from_nanoseconds(
+                persisted_int64(result, row, "fill_timestamp_ns")
+            ),
+        };
+        if (fill->side != intent.side) {
+            inconsistent_record("fill side differs from the order side");
+        }
+    }
+    if (!is_consistent_execution(
+            status,
+            reason,
+            unfilled,
+            fill,
+            intent.quantity
+        )) {
+        inconsistent_record("execution status, fill, and quantities disagree");
+    }
+    return SimulatedExecutionReport{
+        .intent = intent,
+        .status = status,
+        .fill = std::move(fill),
+        .unfilled_quantity = unfilled,
+        .cancellation_reason = reason,
+        .market_ingest_sequence = market_sequence,
+    };
+}
+
+PaperOrderRecordOutcome persisted_outcome(
+    const PostgresResult& result,
+    int row,
+    const OrderIntent& intent,
+    const TopOfBookEvent& market
+) {
+    const std::string kind = result.value(row, "outcome_kind");
+    const bool processed = parse_boolean(
+        result.value(row, "processed_by_execution"),
+        "processed_by_execution"
+    );
+    const auto code = result.optional_value(row, "outcome_code");
+    const auto field = result.optional_value(row, "outcome_field");
+    const auto message = result.optional_value(row, "outcome_message");
+
+    if (kind == "receipt") {
+        if (code || field || message || !processed) {
+            inconsistent_record("an executed order carries a rejection");
+        }
+        return persisted_execution(result, row, intent, market);
+    }
+    if (kind == "risk_rejection" || kind == "execution_error") {
+        if (!code || !field || !message || processed) {
+            inconsistent_record("a rejection is incomplete or was executed");
+        }
+        if (kind == "risk_rejection") {
+            return PreTradeRiskRejection{
+                .code = canonical_value<PreTradeRiskErrorCode>(
+                    *code,
+                    "outcome_code"
+                ),
+                .field = *field,
+                .message = *message,
+            };
+        }
+        return SimulatedExecutionError{
+            .code = canonical_value<SimulatedExecutionErrorCode>(
+                *code,
+                "outcome_code"
+            ),
+            .field = *field,
+            .message = *message,
+        };
+    }
+    if (kind == "processing_error") {
+        if (!code || field || !message) {
+            inconsistent_record("a processing fault is incomplete");
+        }
+        return PaperOrderFaultRecord{
+            .code = canonical_value<PaperOrderProcessingErrorCode>(
+                *code,
+                "outcome_code"
+            ),
+            .message = *message,
+            .unbooked_execution = processed
+                ? std::optional<SimulatedExecutionReport>(
+                      persisted_execution(result, row, intent, market)
+                  )
+                : std::nullopt,
+        };
+    }
+    inconsistent_record("outcome kind is not recognized");
+}
+
+PaperOrderRecord persisted_order(const PostgresResult& result, int row) {
+    OrderIntent intent = persisted_intent(result, row);
+    TopOfBookEvent market = persisted_top_of_book(
+        result,
+        row,
+        "market_",
+        InstrumentId(result.value(row, "market_instrument"))
+    );
+    PaperOrderRecordOutcome outcome = persisted_outcome(
+        result,
+        row,
+        intent,
+        market
+    );
+    return PaperOrderRecord{
+        .record_id = persisted_int64(result, row, "order_record_id"),
+        .intent = std::move(intent),
+        .market = std::move(market),
+        .outcome = std::move(outcome),
+    };
+}
+
+// Only executed orders reach this mapping, so their intents passed risk and
+// use canonical names.
+PaperFillRecord persisted_fill(const PostgresResult& result, int row) {
+    const Side order_side = canonical_value<Side>(
+        result.value(row, "side"),
+        "side"
+    );
+    Fill fill{
+        .fill_id = result.value(row, "fill_id"),
+        .instrument = InstrumentId(result.value(row, "instrument")),
+        .side = canonical_value<Side>(
+            result.value(row, "fill_side"),
+            "fill_side"
+        ),
+        .price = Price::from_raw(
+            persisted_int64(result, row, "fill_price_raw")
+        ),
+        .quantity = Quantity::from_raw(
+            persisted_int64(result, row, "fill_quantity_raw")
+        ),
+        .fee = Money::from_raw(persisted_int64(result, row, "fill_fee_raw")),
+        .timestamp = Timestamp::from_nanoseconds(
+            persisted_int64(result, row, "fill_timestamp_ns")
+        ),
+    };
+    if (fill.side != order_side) {
+        inconsistent_record("fill side differs from the order side");
+    }
+    return PaperFillRecord{
+        .record_id = persisted_int64(result, row, "order_record_id"),
+        .account_id = result.value(row, "account_id"),
+        .client_order_id = result.value(row, "client_order_id"),
+        .source = OrderSource{
+            .kind = canonical_value<OrderSourceKind>(
+                result.value(row, "source_kind"),
+                "source_kind"
+            ),
+            .source_id = result.value(row, "source_id"),
+        },
+        .fill = std::move(fill),
+    };
+}
+
+void validate_page_request(const PaperJournalPageRequest& request) {
+    if (request.limit == 0 ||
+        request.limit >=
+            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("journal page limit is out of range");
+    }
+    if (request.before_record_id && *request.before_record_id <= 0) {
+        throw std::invalid_argument(
+            "journal page must start before a positive record"
+        );
+    }
+}
+
+void add_page_parameters(
+    PostgresParameters& parameters,
+    std::string_view account_id,
+    const PaperJournalPageRequest& request
+) {
+    parameters.add(account_id);
+    parameters.add_optional(request.before_record_id);
+    parameters.add(static_cast<std::int64_t>(request.limit + 1));
+}
+
+// The query fetched at most limit + 1 rows, newest first; the extra row only
+// signals that an older page exists.
+template <typename Record, typename MapRow>
+PaperJournalPage<Record> journal_page(
+    const PostgresResult& result,
+    std::size_t limit,
+    MapRow map_row
+) {
+    const auto rows = static_cast<std::size_t>(result.row_count());
+    const std::size_t returned = std::min(rows, limit);
+    PaperJournalPage<Record> page;
+    page.records.reserve(returned);
+    for (std::size_t row = 0; row < returned; ++row) {
+        Record record = map_row(result, static_cast<int>(row));
+        if (!page.records.empty() &&
+            record.record_id >= page.records.back().record_id) {
+            inconsistent_record("journal page is not newest first");
+        }
+        page.records.push_back(std::move(record));
+    }
+    if (rows > limit) {
+        page.next_before_record_id = page.records.back().record_id;
+    }
+    return page;
+}
+
 }  // namespace
 
 struct PostgresPaperOrderRepository::Impl {
@@ -745,13 +1228,8 @@ std::optional<StoredPaperOrderProcessor>
 PostgresPaperOrderRepository::load_account(std::string_view account_id) {
     impl_->ensure_connected();
     PostgresTransaction transaction(impl_->connection);
-    const auto isolation = execute(
+    start_consistent_read(
         impl_->connection,
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
-    );
-    require_status(
-        isolation,
-        PGRES_COMMAND_OK,
         "start consistent account recovery"
     );
 
@@ -848,78 +1326,13 @@ PostgresPaperOrderRepository::load_account(std::string_view account_id) {
         ),
     };
 
-    const auto stream = result.optional_value(0, "active_stream_id");
-    if (stream) {
-        const std::uint64_t ingest_sequence = parse_integer<std::uint64_t>(
-            result.value(0, "active_ingest_sequence"),
-            "active_ingest_sequence"
-        );
-        const std::uint32_t quality = parse_integer<std::uint32_t>(
-            result.value(0, "active_quality_flags"),
-            "active_quality_flags"
-        );
-        const auto bid_price = optional_int64(
+    if (!result.is_null(0, "active_stream_id")) {
+        state.execution.active_market = persisted_top_of_book(
             result,
             0,
-            "active_bid_price_raw"
+            "active_",
+            state.account.instrument
         );
-        const auto bid_quantity = optional_int64(
-            result,
-            0,
-            "active_bid_quantity_raw"
-        );
-        const auto ask_price = optional_int64(
-            result,
-            0,
-            "active_ask_price_raw"
-        );
-        const auto ask_quantity = optional_int64(
-            result,
-            0,
-            "active_ask_quantity_raw"
-        );
-        if (bid_price.has_value() != bid_quantity.has_value() ||
-            ask_price.has_value() != ask_quantity.has_value()) {
-            throw std::runtime_error(
-                "persisted book level is only partially populated"
-            );
-        }
-        const auto venue_text = result.optional_value(0, "active_venue");
-        const std::optional<VenueId> venue = venue_text
-            ? std::optional<VenueId>(VenueId(*venue_text))
-            : std::nullopt;
-        state.execution.active_market = TopOfBookEvent{
-            .header = MarketEventHeader{
-                .instrument = state.account.instrument,
-                .stream = MarketDataStreamId(*stream),
-                .venue = venue,
-                .event_timestamp = Timestamp::from_nanoseconds(
-                    required_int64("active_event_timestamp_ns")
-                ),
-                .receive_timestamp = Timestamp::from_nanoseconds(
-                    required_int64("active_receive_timestamp_ns")
-                ),
-                .ingest_sequence = ingest_sequence,
-                .venue_sequence = optional_uint64(
-                    result,
-                    0,
-                    "active_venue_sequence"
-                ),
-                .quality = MarketDataQuality::from_raw(quality),
-            },
-            .bid = bid_price
-                ? std::optional<BookLevel>(BookLevel{
-                      .price = Price::from_raw(*bid_price),
-                      .quantity = Quantity::from_raw(*bid_quantity),
-                  })
-                : std::nullopt,
-            .ask = ask_price
-                ? std::optional<BookLevel>(BookLevel{
-                      .price = Price::from_raw(*ask_price),
-                      .quantity = Quantity::from_raw(*ask_quantity),
-                  })
-                : std::nullopt,
-        };
     }
 
     PostgresParameters id_parameters;
@@ -1212,6 +1625,126 @@ PaperAccountJournalSummary PostgresPaperOrderRepository::journal_summary(
             "account_version"
         ),
     };
+}
+
+PaperOrderPageResult PostgresPaperOrderRepository::list_orders(
+    std::string_view account_id,
+    const PaperJournalPageRequest& request
+) {
+    validate_page_request(request);
+    PostgresParameters parameters;
+    add_page_parameters(parameters, account_id, request);
+
+    impl_->ensure_connected();
+    PostgresTransaction transaction(impl_->connection);
+    start_consistent_read(impl_->connection, "start order history read");
+    if (!account_exists(impl_->connection, account_id)) {
+        transaction.commit();
+        return PaperJournalReadMiss::AccountNotFound;
+    }
+    const auto result = execute(
+        impl_->connection,
+        "SELECT " + std::string(kOrderRecordColumns) + R"SQL(
+            FROM paper_order_records
+            WHERE account_id = $1
+              AND ($2::bigint IS NULL OR order_record_id < $2)
+            ORDER BY order_record_id DESC
+            LIMIT $3
+        )SQL",
+        parameters
+    );
+    require_status(result, PGRES_TUPLES_OK, "load order history page");
+    auto page = journal_page<PaperOrderRecord>(
+        result,
+        request.limit,
+        persisted_order
+    );
+    transaction.commit();
+    return page;
+}
+
+PaperFillPageResult PostgresPaperOrderRepository::list_fills(
+    std::string_view account_id,
+    const PaperJournalPageRequest& request
+) {
+    validate_page_request(request);
+    PostgresParameters parameters;
+    add_page_parameters(parameters, account_id, request);
+
+    impl_->ensure_connected();
+    PostgresTransaction transaction(impl_->connection);
+    start_consistent_read(impl_->connection, "start fill history read");
+    if (!account_exists(impl_->connection, account_id)) {
+        transaction.commit();
+        return PaperJournalReadMiss::AccountNotFound;
+    }
+    // Only receipts book fills. A processing fault may journal the
+    // simulated fill that accounting rejected; it is excluded here.
+    const auto result = execute(
+        impl_->connection,
+        R"SQL(
+            SELECT
+                order_record_id, account_id, client_order_id, source_kind,
+                source_id, instrument, side, fill_id, fill_side, fill_price_raw,
+                fill_quantity_raw, fill_fee_raw, fill_timestamp_ns
+            FROM paper_order_records
+            WHERE account_id = $1
+              AND outcome_kind = 'receipt'
+              AND fill_id IS NOT NULL
+              AND ($2::bigint IS NULL OR order_record_id < $2)
+            ORDER BY order_record_id DESC
+            LIMIT $3
+        )SQL",
+        parameters
+    );
+    require_status(result, PGRES_TUPLES_OK, "load fill history page");
+    auto page = journal_page<PaperFillRecord>(
+        result,
+        request.limit,
+        persisted_fill
+    );
+    transaction.commit();
+    return page;
+}
+
+PaperOrderLookupResult PostgresPaperOrderRepository::find_order(
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    // An empty client order ID is not unique, so it cannot identify an order.
+    if (client_order_id.empty()) {
+        throw std::invalid_argument("client order ID must not be empty");
+    }
+    PostgresParameters parameters;
+    parameters.add(account_id);
+    parameters.add(client_order_id);
+
+    impl_->ensure_connected();
+    PostgresTransaction transaction(impl_->connection);
+    start_consistent_read(impl_->connection, "start order lookup");
+    if (!account_exists(impl_->connection, account_id)) {
+        transaction.commit();
+        return PaperJournalReadMiss::AccountNotFound;
+    }
+    const auto result = execute(
+        impl_->connection,
+        "SELECT " + std::string(kOrderRecordColumns) + R"SQL(
+            FROM paper_order_records
+            WHERE account_id = $1
+              AND client_order_id = $2
+              AND client_order_id <> ''
+        )SQL",
+        parameters
+    );
+    require_status(result, PGRES_TUPLES_OK, "look up paper order");
+    if (result.row_count() > 1) {
+        inconsistent_record("client order ID is recorded more than once");
+    }
+    PaperOrderLookupResult lookup = result.row_count() == 0
+        ? PaperOrderLookupResult(PaperJournalReadMiss::OrderNotFound)
+        : PaperOrderLookupResult(persisted_order(result, 0));
+    transaction.commit();
+    return lookup;
 }
 
 bool PostgresPaperOrderRepository::check_availability() {

@@ -1,5 +1,7 @@
 #include "chronos/paper_trading/paper_trading_service.hpp"
 
+#include "chronos/paper_trading/history_cursor.hpp"
+
 #include <algorithm>
 #include <mutex>
 #include <optional>
@@ -94,6 +96,61 @@ PaperTradingError persistence_conflict(PaperPersistenceConflict conflict) {
             );
     }
     throw std::logic_error("unknown paper persistence conflict");
+}
+
+PaperTradingError order_not_found() {
+    return error(
+        PaperTradingErrorCode::OrderNotFound,
+        "client_order_id",
+        "no order with this client_order_id is recorded for the account"
+    );
+}
+
+// Validates a page request and resolves its cursor to a journal position.
+std::variant<PaperJournalPageRequest, PaperTradingError> journal_page_request(
+    std::string_view account_id,
+    const HistoryPageRequest& request,
+    HistoryCursorKind kind
+) {
+    const std::size_t limit = request.limit.value_or(kDefaultHistoryPageLimit);
+    if (limit == 0 || limit > kMaximumHistoryPageLimit) {
+        return error(
+            PaperTradingErrorCode::InvalidPageLimit,
+            "limit",
+            "limit must be from 1 to " +
+                std::to_string(kMaximumHistoryPageLimit)
+        );
+    }
+    std::optional<std::int64_t> before_record_id;
+    if (request.cursor) {
+        before_record_id = decode_history_cursor(
+            *request.cursor,
+            kind,
+            account_id
+        );
+        if (!before_record_id) {
+            return error(
+                PaperTradingErrorCode::InvalidCursor,
+                "cursor",
+                "cursor was not issued for this history of this account"
+            );
+        }
+    }
+    return PaperJournalPageRequest{
+        .limit = limit,
+        .before_record_id = before_record_id,
+    };
+}
+
+std::optional<std::string> next_cursor(
+    HistoryCursorKind kind,
+    std::string_view account_id,
+    const std::optional<std::int64_t>& next_before_record_id
+) {
+    if (!next_before_record_id) {
+        return std::nullopt;
+    }
+    return encode_history_cursor(kind, account_id, *next_before_record_id);
 }
 
 PaperAccountView account_view(const PersistentPaperOrderSession& session) {
@@ -299,6 +356,109 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
                 std::move(persisted)
             ).result,
             .account = account_view(*session),
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+PaperOrderHistoryResult PaperTradingService::list_orders(
+    std::string_view account_id,
+    const HistoryPageRequest& request
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    auto page_request = journal_page_request(
+        account_id,
+        request,
+        HistoryCursorKind::Orders
+    );
+    if (auto* invalid = std::get_if<PaperTradingError>(&page_request)) {
+        return std::move(*invalid);
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto page = repository_->list_orders(
+            account_id,
+            std::get<PaperJournalPageRequest>(page_request)
+        );
+        if (std::holds_alternative<PaperJournalReadMiss>(page)) {
+            return account_not_found();
+        }
+        auto& journal = std::get<PaperJournalPage<PaperOrderRecord>>(page);
+        return PaperOrderHistoryPage{
+            .orders = std::move(journal.records),
+            .next_cursor = next_cursor(
+                HistoryCursorKind::Orders,
+                account_id,
+                journal.next_before_record_id
+            ),
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+PaperOrderRecordResult PaperTradingService::get_order(
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    if (auto invalid = invalid_identifier(client_order_id, "client_order_id")) {
+        return *invalid;
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto lookup = repository_->find_order(account_id, client_order_id);
+        if (const auto* miss = std::get_if<PaperJournalReadMiss>(&lookup)) {
+            return *miss == PaperJournalReadMiss::AccountNotFound
+                ? account_not_found()
+                : order_not_found();
+        }
+        return std::get<PaperOrderRecord>(std::move(lookup));
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+PaperFillHistoryResult PaperTradingService::list_fills(
+    std::string_view account_id,
+    const HistoryPageRequest& request
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    auto page_request = journal_page_request(
+        account_id,
+        request,
+        HistoryCursorKind::Fills
+    );
+    if (auto* invalid = std::get_if<PaperTradingError>(&page_request)) {
+        return std::move(*invalid);
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto page = repository_->list_fills(
+            account_id,
+            std::get<PaperJournalPageRequest>(page_request)
+        );
+        if (std::holds_alternative<PaperJournalReadMiss>(page)) {
+            return account_not_found();
+        }
+        auto& journal = std::get<PaperJournalPage<PaperFillRecord>>(page);
+        return PaperFillHistoryPage{
+            .fills = std::move(journal.records),
+            .next_cursor = next_cursor(
+                HistoryCursorKind::Fills,
+                account_id,
+                journal.next_before_record_id
+            ),
         };
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);
