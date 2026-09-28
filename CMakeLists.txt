@@ -18,6 +18,12 @@ option(
     OFF
 )
 
+option(
+    CHRONOS_ENABLE_POSTGRESQL_ADAPTER
+    "Build the optional PostgreSQL paper-trading persistence adapter"
+    OFF
+)
+
 add_library(chronos_build_options INTERFACE)
 
 target_compile_options(chronos_build_options
@@ -106,6 +112,25 @@ target_link_libraries(chronos_paper_execution
         chronos_market_data
     PRIVATE chronos_build_options
 )
+
+if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
+    find_package(PostgreSQL REQUIRED)
+
+    add_library(chronos_postgresql_persistence
+        adapters/postgresql/src/postgresql_paper_order_repository.cpp
+    )
+
+    target_include_directories(chronos_postgresql_persistence
+        PUBLIC adapters/postgresql/include
+    )
+
+    target_link_libraries(chronos_postgresql_persistence
+        PUBLIC
+            chronos_paper_execution
+            PostgreSQL::PostgreSQL
+        PRIVATE chronos_build_options
+    )
+endif()
 
 if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
     include(FetchContent)
@@ -259,6 +284,31 @@ if(BUILD_TESTING)
         NAME chronos_paper_order_processor_tests
         COMMAND chronos_paper_order_processor_tests
     )
+
+    if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
+        add_executable(chronos_postgresql_persistence_tests
+            tests/postgresql_paper_order_repository_tests.cpp
+        )
+
+        target_compile_definitions(chronos_postgresql_persistence_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_postgresql_persistence_tests
+            PRIVATE
+                chronos_postgresql_persistence
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_postgresql_persistence_tests
+            COMMAND chronos_postgresql_persistence_tests
+        )
+
+        set_tests_properties(chronos_postgresql_persistence_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+    endif()
 
     if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
         add_executable(chronos_databento_adapter_tests

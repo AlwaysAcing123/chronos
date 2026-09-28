@@ -1,0 +1,24 @@
+name: chronos
+
+services:
+  postgres:
+    image: postgres:18.6-trixie@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+    environment:
+      POSTGRES_DB: chronos
+      POSTGRES_PASSWORD: chronos_local
+      POSTGRES_USER: chronos
+    ports:
+      - "127.0.0.1:${CHRONOS_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - chronos-postgres-data:/var/lib/postgresql
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chronos -d chronos"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  chronos-postgres-data:

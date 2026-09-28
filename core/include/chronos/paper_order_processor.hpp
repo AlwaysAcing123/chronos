@@ -33,6 +33,13 @@ using PaperOrderResult = std::variant<
     PaperOrderProcessingError
 >;
 
+struct PaperOrderProcessorRecoveryState {
+    PreTradeRiskLimits risk_limits;
+    PaperAccountRecoveryState account;
+    TopOfBookExecutionRecoveryState execution;
+    bool is_healthy{true};
+};
+
 class PaperOrderProcessor final {
 public:
     PaperOrderProcessor(
@@ -56,6 +63,11 @@ public:
     }
 
     [[nodiscard]] bool is_healthy() const noexcept { return is_healthy_; }
+
+    [[nodiscard]] PaperOrderProcessorRecoveryState recovery_state() const;
+    [[nodiscard]] static PaperOrderProcessor restore(
+        PaperOrderProcessorRecoveryState recovery_state
+    );
 
     [[nodiscard]] PaperOrderResult submit(
         const OrderIntent& intent,

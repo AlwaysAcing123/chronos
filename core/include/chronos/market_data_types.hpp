@@ -30,6 +30,12 @@ class MarketDataQuality final {
 public:
     constexpr MarketDataQuality() = default;
 
+    [[nodiscard]] static constexpr MarketDataQuality from_raw(
+        std::uint32_t bits
+    ) {
+        return MarketDataQuality(bits);
+    }
+
     [[nodiscard]] constexpr bool contains(MarketDataQualityFlag flag) const {
         return (bits_ & bit_for(flag)) != 0;
     }
