@@ -702,6 +702,21 @@ void test_quantity_notional_cash_and_position_limits() {
         risk.evaluate(order("sell", Side::Sell, "6"), owned, quote),
         PreTradeRiskErrorCode::InsufficientPosition
     );
+
+    const OrderIntent old_order = order(
+        "old-submission",
+        Side::Sell,
+        "1",
+        OrderType::Market,
+        std::nullopt,
+        OrderSourceKind::Manual,
+        "user-1",
+        0
+    );
+    require_rejection(
+        risk.evaluate(old_order, owned, quote),
+        PreTradeRiskErrorCode::SubmissionTimestampMovedBackward
+    );
 }
 
 void test_fee_zero_notional_and_overflow_rules() {
