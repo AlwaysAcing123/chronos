@@ -190,6 +190,14 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             "order instrument does not match the paper account"
         );
     }
+    if (account.state().last_fill_timestamp &&
+        intent.submitted_at < *account.state().last_fill_timestamp) {
+        return rejection(
+            PreTradeRiskErrorCode::SubmissionTimestampMovedBackward,
+            "submitted_at",
+            "order submission timestamp precedes the latest account fill"
+        );
+    }
 
     auto market_validation = validate_market_event(MarketEvent(market));
     if (std::holds_alternative<MarketEventValidationFailure>(

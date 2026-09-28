@@ -91,6 +91,7 @@ target_link_libraries(chronos_market_replay
 )
 
 add_library(chronos_paper_execution
+    core/src/paper_order_processor.cpp
     core/src/pre_trade_risk.cpp
     core/src/top_of_book_execution.cpp
 )
@@ -242,6 +243,21 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_paper_execution_tests
         COMMAND chronos_paper_execution_tests
+    )
+
+    add_executable(chronos_paper_order_processor_tests
+        tests/paper_order_processor_tests.cpp
+    )
+
+    target_link_libraries(chronos_paper_order_processor_tests
+        PRIVATE
+            chronos_paper_execution
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_paper_order_processor_tests
+        COMMAND chronos_paper_order_processor_tests
     )
 
     if(CHRONOS_ENABLE_DATABENTO_ADAPTER)

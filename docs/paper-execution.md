@@ -17,20 +17,30 @@ account.
 ```text
 manual UI or model policy
     -> OrderIntent
-    -> pre-trade validation and risk
-    -> ApprovedOrderIntent
-    -> top-of-book execution
-    -> simulated report and optional Fill
+    -> PaperOrderProcessor
+        -> pre-trade validation and risk
+        -> ApprovedOrderIntent
+        -> top-of-book execution
+        -> simulated report and optional Fill
+        -> paper-account accounting
+    -> PaperOrderReceipt
 ```
 
 Only the risk engine can construct an `ApprovedOrderIntent`. This makes the
 approved value a typed capability: the execution simulator cannot be called
 with an arbitrary, unchecked `OrderIntent`.
 
-The next milestone connects the optional `Fill` to `PaperAccount` and verifies
-end-to-end accounting reconciliation. Until that coordinator exists, risk,
-execution, and fill application are separate in-memory operations rather than
-one atomic transaction.
+`PaperOrderProcessor` is the normal end-to-end entry point. It owns one fresh
+paper account, its risk engine, and its execution simulator. Approval never
+escapes `submit`: the processor evaluates the current account, executes the
+order immediately, and applies any resulting fill before returning. This
+prevents a caller from caching an approval while other fills change cash or
+position.
+
+A successful `PaperOrderReceipt` contains the execution report, an accounting
+receipt when a fill occurred, and the complete account state afterward.
+Cancelled orders have no accounting receipt and leave the account unchanged.
+Risk and execution rejections also leave accounting state unchanged.
 
 ## Order intent
 
@@ -66,6 +76,7 @@ It then enforces:
 - Sufficient owned position for a sell
 - Sufficient cash to pay the fee for a possible partial sell fill
 - Checked fixed-point arithmetic with structured overflow rejection
+- An order timestamp that does not precede the account's latest fill
 
 Notional and buying power are checked conservatively using the complete
 requested quantity at the current opposite best price, even if displayed
@@ -112,6 +123,27 @@ paper account never changes another user's market or simulated liquidity.
 - Rejected execution attempts do not consume liquidity or reserve their client
   order ID, so a caller may correct the routing error and retry.
 
+## Accounting and reconciliation
+
+Every non-empty simulated fill is applied exactly once to the processor's
+owned `PaperAccount`. The fill in the accounting receipt is the same value as
+the fill in the execution report. Cash, position, cost basis, realized PnL,
+and fees therefore change through the existing accounting contract rather
+than a second execution-specific calculation.
+
+The processor exposes only a const account view. Callers can request an
+explicit mark-to-market snapshot and verify the accounting identity:
+
+```text
+equity - starting cash = net total PnL
+```
+
+If accounting ever rejects a risk-approved simulated fill, the processor
+returns an invariant-violation error and permanently enters a faulted state.
+It will reject subsequent submissions instead of continuing with execution
+liquidity and account state out of sync. This is a defensive failure mode;
+ordinary input errors are returned earlier as risk or execution rejections.
+
 ## Fees and time
 
 This slice uses one configurable flat fee per non-empty simulated fill. A
@@ -132,12 +164,13 @@ will be added before Chronos claims realistic trading evaluation.
 - No latency or slippage beyond crossing the visible spread
 - In-memory state and an unbounded processed-ID set
 - No durable audit log or restart recovery
-- No atomic risk/execution/account update yet
-- No reservation of cash, position, or risk capacity between approval and fill
+- No durable transaction spanning risk, execution, and accounting
+- One processor instance is not safe for concurrent calls
+- No recovery constructor for an existing account and execution state
 - No API, authentication, authorization, or user interface
 
-Because account state is not versioned in an approval, callers must not cache
-an approval while applying other fills to the same account. The next
-order-processing coordinator will serialize and atomically persist risk,
-execution, and accounting events so stale approvals cannot overspend cash or
-position.
+The low-level risk and execution classes remain independently testable, but
+application code should use `PaperOrderProcessor` so approvals cannot outlive
+the account state against which they were checked. The next persistence
+milestone will record order, risk, execution, and accounting events in one
+recoverable transaction.

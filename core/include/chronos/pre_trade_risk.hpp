@@ -33,6 +33,7 @@ enum class PreTradeRiskErrorCode {
     MissingLimitPrice,
     NonpositiveLimitPrice,
     NegativeSubmissionTimestamp,
+    SubmissionTimestampMovedBackward,
     InvalidMarketState,
     MarketInstrumentMismatch,
     SuspectMarketState,

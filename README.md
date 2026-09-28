@@ -27,13 +27,16 @@ Chronos simulates trading only. It does not place real-money orders.
 - Deterministic top-of-book IOC market and limit execution
 - Partial fills, cancellation reasons, idempotency, and per-account shadow
   liquidity
+- End-to-end order processing that immediately books simulated fills into the
+  owned paper account
+- Exact reconciliation from order and fill through cash, position, fees, and
+  PnL
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution
 
-The core now accepts and simulates orders in memory. It does not yet connect
-execution reports to account updates atomically, persist order state, or
-provide an API or web application. See [plan.md](plan.md) for the complete
-roadmap.
+The core now accepts, simulates, and books paper orders in memory through one
+controlled path. It does not yet persist order and account state or provide an
+API or web application. See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 

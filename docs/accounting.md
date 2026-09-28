@@ -6,7 +6,9 @@ This document defines the first permanent accounting boundary in Chronos. The ac
 
 The fixed-point representation and scale tradeoffs are recorded in `decisions/0002-fixed-point-scales.md`.
 
-This layer does not decide whether an order should fill or what its price should be. Market data, order validation, risk policy, and execution simulation will produce fills in later stages.
+This layer does not decide whether an order should fill or what its price
+should be. The paper-order processor now connects market data, order
+validation, risk policy, and execution simulation to this accounting boundary.
 
 ## Version-one decisions
 

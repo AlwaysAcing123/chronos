@@ -1,0 +1,456 @@
+#include "chronos/paper_order_processor.hpp"
+#include "test_support.hpp"
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace {
+
+using chronos::AccountState;
+using chronos::ApplyFillErrorCode;
+using chronos::BookLevel;
+using chronos::InstrumentId;
+using chronos::Money;
+using chronos::OrderIntent;
+using chronos::OrderSource;
+using chronos::OrderSourceKind;
+using chronos::OrderType;
+using chronos::PaperOrderProcessor;
+using chronos::PaperOrderProcessingError;
+using chronos::PaperOrderProcessingErrorCode;
+using chronos::PaperOrderReceipt;
+using chronos::PaperOrderResult;
+using chronos::PreTradeRiskErrorCode;
+using chronos::PreTradeRiskLimits;
+using chronos::PreTradeRiskRejection;
+using chronos::Price;
+using chronos::Quantity;
+using chronos::Side;
+using chronos::SimulatedCancellationReason;
+using chronos::SimulatedExecutionError;
+using chronos::SimulatedExecutionErrorCode;
+using chronos::SimulatedExecutionStatus;
+using chronos::TimeInForce;
+using chronos::Timestamp;
+using chronos::TopOfBookEvent;
+
+static_assert(!std::is_copy_constructible_v<PaperOrderProcessor>);
+static_assert(std::is_move_constructible_v<PaperOrderProcessor>);
+
+Money money(std::string_view value) { return Money::parse(value); }
+Price price(std::string_view value) { return Price::parse(value); }
+Quantity quantity(std::string_view value) { return Quantity::parse(value); }
+
+PreTradeRiskLimits risk_limits(
+    std::int64_t maximum_quote_age_nanoseconds = 1'000
+) {
+    return PreTradeRiskLimits{
+        .maximum_order_quantity = quantity("100"),
+        .maximum_order_notional = money("100000"),
+        .maximum_position_quantity = quantity("100"),
+        .maximum_quote_age_nanoseconds = maximum_quote_age_nanoseconds,
+        .fee_per_fill = money("0.01"),
+    };
+}
+
+TopOfBookEvent market(
+    std::uint64_t sequence,
+    std::int64_t receive_timestamp,
+    std::string_view bid_price = "99",
+    std::string_view bid_quantity = "5",
+    std::string_view ask_price = "101",
+    std::string_view ask_quantity = "5"
+) {
+    return TopOfBookEvent{
+        .header = chronos::MarketEventHeader{
+            .instrument = InstrumentId("AAPL"),
+            .stream = chronos::MarketDataStreamId("market-stream"),
+            .venue = std::nullopt,
+            .event_timestamp =
+                Timestamp::from_nanoseconds(receive_timestamp - 1),
+            .receive_timestamp =
+                Timestamp::from_nanoseconds(receive_timestamp),
+            .ingest_sequence = sequence,
+            .venue_sequence = std::nullopt,
+            .quality = chronos::MarketDataQuality{},
+        },
+        .bid = BookLevel{
+            .price = price(bid_price),
+            .quantity = quantity(bid_quantity),
+        },
+        .ask = BookLevel{
+            .price = price(ask_price),
+            .quantity = quantity(ask_quantity),
+        },
+    };
+}
+
+OrderIntent order(
+    std::string client_order_id,
+    Side side,
+    std::string_view order_quantity,
+    std::int64_t submitted_at,
+    OrderType type = OrderType::Market,
+    std::optional<Price> limit_price = std::nullopt,
+    OrderSourceKind source_kind = OrderSourceKind::Manual,
+    std::string source_id = "user-1"
+) {
+    return OrderIntent{
+        .client_order_id = std::move(client_order_id),
+        .account_id = "account-1",
+        .source = OrderSource{
+            .kind = source_kind,
+            .source_id = std::move(source_id),
+        },
+        .instrument = InstrumentId("AAPL"),
+        .side = side,
+        .type = type,
+        .quantity = quantity(order_quantity),
+        .limit_price = limit_price,
+        .time_in_force = TimeInForce::ImmediateOrCancel,
+        .submitted_at = Timestamp::from_nanoseconds(submitted_at),
+    };
+}
+
+PaperOrderProcessor processor(
+    Money starting_cash = money("1000"),
+    PreTradeRiskLimits limits = risk_limits()
+) {
+    return PaperOrderProcessor(
+        "account-1",
+        InstrumentId("AAPL"),
+        starting_cash,
+        limits
+    );
+}
+
+PaperOrderReceipt require_receipt(PaperOrderResult result) {
+    REQUIRE(std::holds_alternative<PaperOrderReceipt>(result));
+    return std::get<PaperOrderReceipt>(std::move(result));
+}
+
+const PreTradeRiskRejection& require_risk_rejection(
+    const PaperOrderResult& result,
+    PreTradeRiskErrorCode code
+) {
+    REQUIRE(std::holds_alternative<PreTradeRiskRejection>(result));
+    const auto& rejection = std::get<PreTradeRiskRejection>(result);
+    REQUIRE(rejection.code == code);
+    REQUIRE(!rejection.field.empty());
+    REQUIRE(!rejection.message.empty());
+    return rejection;
+}
+
+const SimulatedExecutionError& require_execution_error(
+    const PaperOrderResult& result,
+    SimulatedExecutionErrorCode code
+) {
+    REQUIRE(std::holds_alternative<SimulatedExecutionError>(result));
+    const auto& error = std::get<SimulatedExecutionError>(result);
+    REQUIRE(error.code == code);
+    REQUIRE(!error.field.empty());
+    REQUIRE(!error.message.empty());
+    return error;
+}
+
+const PaperOrderProcessingError& require_processing_error(
+    const PaperOrderResult& result,
+    PaperOrderProcessingErrorCode code
+) {
+    REQUIRE(std::holds_alternative<PaperOrderProcessingError>(result));
+    const auto& error = std::get<PaperOrderProcessingError>(result);
+    REQUIRE(error.code == code);
+    REQUIRE(!error.message.empty());
+    return error;
+}
+
+void require_empty_account(const AccountState& state) {
+    REQUIRE(state.starting_cash == money("1000"));
+    REQUIRE(state.cash == money("1000"));
+    REQUIRE(state.position == Quantity{});
+    REQUIRE(state.open_cost_basis == Money{});
+    REQUIRE(state.gross_realized_pnl == Money{});
+    REQUIRE(state.fees_paid == Money{});
+    REQUIRE(!state.last_fill_timestamp.has_value());
+}
+
+void test_filled_buy_is_booked_and_reconciles() {
+    PaperOrderProcessor engine = processor();
+    const auto receipt = require_receipt(engine.submit(
+        order(
+            "model-buy",
+            Side::Buy,
+            "3",
+            110,
+            OrderType::Market,
+            std::nullopt,
+            OrderSourceKind::Model,
+            "model-v1"
+        ),
+        market(10, 100)
+    ));
+
+    REQUIRE(receipt.execution.status == SimulatedExecutionStatus::Filled);
+    REQUIRE(receipt.execution.fill.has_value());
+    REQUIRE(receipt.execution.intent.source.kind == OrderSourceKind::Model);
+    REQUIRE(receipt.execution.intent.source.source_id == "model-v1");
+    REQUIRE(receipt.accounting.has_value());
+    REQUIRE(receipt.accounting->fill == *receipt.execution.fill);
+    REQUIRE(receipt.accounting->notional == money("303"));
+    REQUIRE(receipt.account_after.cash == money("696.99"));
+    REQUIRE(receipt.account_after.position == quantity("3"));
+    REQUIRE(receipt.account_after.open_cost_basis == money("303"));
+    REQUIRE(receipt.account_after.fees_paid == money("0.01"));
+    REQUIRE(
+        receipt.account_after.last_fill_timestamp ==
+        Timestamp::from_nanoseconds(110)
+    );
+
+    const auto snapshot = engine.account().snapshot(price("100"));
+    REQUIRE(snapshot.market_value == money("300"));
+    REQUIRE(snapshot.gross_unrealized_pnl == money("-3"));
+    REQUIRE(snapshot.gross_total_pnl == money("-3"));
+    REQUIRE(snapshot.net_total_pnl == money("-3.01"));
+    REQUIRE(snapshot.equity == money("996.99"));
+    REQUIRE(
+        snapshot.equity - snapshot.state.starting_cash ==
+        snapshot.net_total_pnl
+    );
+}
+
+void test_buy_then_sell_updates_realized_and_unrealized_pnl() {
+    PaperOrderProcessor engine = processor();
+    require_receipt(engine.submit(
+        order("buy", Side::Buy, "2", 110),
+        market(10, 100)
+    ));
+    const auto sale = require_receipt(engine.submit(
+        order("sell", Side::Sell, "1", 130),
+        market(11, 120, "103", "5", "105", "5")
+    ));
+
+    REQUIRE(sale.execution.fill->price == price("103"));
+    REQUIRE(sale.accounting->gross_realized_pnl_change == money("2"));
+    REQUIRE(sale.account_after.cash == money("900.98"));
+    REQUIRE(sale.account_after.position == quantity("1"));
+    REQUIRE(sale.account_after.open_cost_basis == money("101"));
+    REQUIRE(sale.account_after.gross_realized_pnl == money("2"));
+    REQUIRE(sale.account_after.fees_paid == money("0.02"));
+
+    const auto snapshot = engine.account().snapshot(price("102"));
+    REQUIRE(snapshot.market_value == money("102"));
+    REQUIRE(snapshot.gross_unrealized_pnl == money("1"));
+    REQUIRE(snapshot.gross_total_pnl == money("3"));
+    REQUIRE(snapshot.net_total_pnl == money("2.98"));
+    REQUIRE(snapshot.equity == money("1002.98"));
+    REQUIRE(
+        snapshot.equity - snapshot.state.starting_cash ==
+        snapshot.net_total_pnl
+    );
+}
+
+void test_partial_fill_books_only_the_executed_quantity() {
+    PaperOrderProcessor engine = processor();
+    const auto receipt = require_receipt(engine.submit(
+        order("partial", Side::Buy, "7", 110),
+        market(10, 100)
+    ));
+
+    REQUIRE(
+        receipt.execution.status ==
+        SimulatedExecutionStatus::PartiallyFilledAndCancelled
+    );
+    REQUIRE(receipt.execution.fill->quantity == quantity("5"));
+    REQUIRE(receipt.execution.unfilled_quantity == quantity("2"));
+    REQUIRE(
+        receipt.execution.cancellation_reason ==
+        SimulatedCancellationReason::DisplayedLiquidityExhausted
+    );
+    REQUIRE(receipt.accounting->notional == money("505"));
+    REQUIRE(receipt.account_after.cash == money("494.99"));
+    REQUIRE(receipt.account_after.position == quantity("5"));
+    REQUIRE(receipt.account_after.open_cost_basis == money("505"));
+    REQUIRE(receipt.account_after.fees_paid == money("0.01"));
+}
+
+void test_cancelled_order_does_not_change_the_account() {
+    PaperOrderProcessor engine = processor();
+    const OrderIntent passive_order = order(
+        "passive",
+        Side::Buy,
+        "1",
+        110,
+        OrderType::Limit,
+        price("100")
+    );
+    const auto receipt = require_receipt(engine.submit(
+        passive_order,
+        market(10, 100)
+    ));
+
+    REQUIRE(receipt.execution.status == SimulatedExecutionStatus::Cancelled);
+    REQUIRE(!receipt.execution.fill.has_value());
+    REQUIRE(!receipt.accounting.has_value());
+    require_empty_account(receipt.account_after);
+    require_empty_account(engine.account().state());
+
+    require_execution_error(
+        engine.submit(passive_order, market(10, 100)),
+        SimulatedExecutionErrorCode::DuplicateClientOrderId
+    );
+    require_empty_account(engine.account().state());
+}
+
+void test_risk_rejection_reserves_nothing_and_can_be_retried() {
+    PaperOrderProcessor engine = processor(money("1000"), risk_limits(5));
+    const OrderIntent retryable = order("retry", Side::Buy, "1", 110);
+
+    require_risk_rejection(
+        engine.submit(retryable, market(10, 100)),
+        PreTradeRiskErrorCode::StaleMarketState
+    );
+    require_empty_account(engine.account().state());
+
+    const auto accepted = require_receipt(engine.submit(
+        retryable,
+        market(11, 109)
+    ));
+    REQUIRE(accepted.execution.status == SimulatedExecutionStatus::Filled);
+    REQUIRE(accepted.account_after.position == quantity("1"));
+}
+
+void test_submission_time_cannot_move_behind_account_time() {
+    PaperOrderProcessor engine = processor();
+    require_receipt(engine.submit(
+        order("first", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+
+    OrderIntent retryable = order("time-retry", Side::Buy, "1", 109);
+    require_risk_rejection(
+        engine.submit(retryable, market(11, 108)),
+        PreTradeRiskErrorCode::SubmissionTimestampMovedBackward
+    );
+    REQUIRE(engine.account().state().position == quantity("1"));
+
+    retryable.submitted_at = Timestamp::from_nanoseconds(110);
+    const auto accepted = require_receipt(engine.submit(
+        retryable,
+        market(11, 108)
+    ));
+    REQUIRE(accepted.account_after.position == quantity("2"));
+    REQUIRE(
+        accepted.account_after.last_fill_timestamp ==
+        Timestamp::from_nanoseconds(110)
+    );
+}
+
+void test_duplicate_filled_order_cannot_change_account_twice() {
+    PaperOrderProcessor engine = processor();
+    const OrderIntent intent = order("once", Side::Buy, "2", 110);
+    const auto first = require_receipt(engine.submit(intent, market(10, 100)));
+    REQUIRE(first.account_after.position == quantity("2"));
+    const Money cash_after_first = first.account_after.cash;
+
+    require_execution_error(
+        engine.submit(intent, market(10, 100)),
+        SimulatedExecutionErrorCode::DuplicateClientOrderId
+    );
+    REQUIRE(engine.account().state().position == quantity("2"));
+    REQUIRE(engine.account().state().cash == cash_after_first);
+    REQUIRE(engine.is_healthy());
+}
+
+void test_accounting_invariant_failure_halts_the_processor() {
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    const PreTradeRiskLimits maximum_limits{
+        .maximum_order_quantity = quantity("10"),
+        .maximum_order_notional = Money::from_raw(maximum),
+        .maximum_position_quantity = quantity("10"),
+        .maximum_quote_age_nanoseconds = 1'000,
+        .fee_per_fill = Money{},
+    };
+    PaperOrderProcessor engine = processor(
+        Money::from_raw(maximum),
+        maximum_limits
+    );
+    require_receipt(engine.submit(
+        order("buy-before-overflow", Side::Buy, "1", 110),
+        market(10, 100, "0.9", "5", "1", "5")
+    ));
+    const AccountState state_before_failure = engine.account().state();
+
+    const PaperOrderResult failed_sale = engine.submit(
+        order("overflowing-sale", Side::Sell, "1", 130),
+        market(11, 120, "2", "5", "2.1", "5")
+    );
+    const auto& invariant_error = require_processing_error(
+        failed_sale,
+        PaperOrderProcessingErrorCode::AccountingInvariantViolation
+    );
+    REQUIRE(invariant_error.execution.has_value());
+    REQUIRE(invariant_error.accounting_error.has_value());
+    REQUIRE(
+        invariant_error.accounting_error->code ==
+        ApplyFillErrorCode::ArithmeticOverflow
+    );
+    REQUIRE(!engine.is_healthy());
+    REQUIRE(engine.account().state().cash == state_before_failure.cash);
+    REQUIRE(engine.account().state().position == state_before_failure.position);
+
+    const PaperOrderResult halted_result = engine.submit(
+        order("after-fault", Side::Buy, "1", 140),
+        market(12, 130)
+    );
+    const auto& halted = require_processing_error(
+        halted_result,
+        PaperOrderProcessingErrorCode::ProcessorFaulted
+    );
+    REQUIRE(!halted.execution.has_value());
+    REQUIRE(!halted.accounting_error.has_value());
+}
+
+}  // namespace
+
+int main() {
+    return chronos::test::run_tests({
+        {
+            "filled buy accounting reconciliation",
+            test_filled_buy_is_booked_and_reconciles,
+        },
+        {
+            "buy sell realized and unrealized pnl",
+            test_buy_then_sell_updates_realized_and_unrealized_pnl,
+        },
+        {
+            "partial fill books executed quantity",
+            test_partial_fill_books_only_the_executed_quantity,
+        },
+        {
+            "cancelled order preserves account",
+            test_cancelled_order_does_not_change_the_account,
+        },
+        {
+            "risk rejection can retry",
+            test_risk_rejection_reserves_nothing_and_can_be_retried,
+        },
+        {
+            "account time cannot regress",
+            test_submission_time_cannot_move_behind_account_time,
+        },
+        {
+            "duplicate fill cannot double book",
+            test_duplicate_filled_order_cannot_change_account_twice,
+        },
+        {
+            "accounting invariant failure halts processor",
+            test_accounting_invariant_failure_halts_the_processor,
+        },
+    });
+}
