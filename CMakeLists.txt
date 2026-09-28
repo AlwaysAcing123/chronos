@@ -137,6 +137,17 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
             chronos_databento_adapter
             chronos_build_options
     )
+
+    add_executable(chronos_databento_replay
+        tools/databento_replay.cpp
+    )
+
+    target_link_libraries(chronos_databento_replay
+        PRIVATE
+            chronos_databento_adapter
+            chronos_market_replay
+            chronos_build_options
+    )
 endif()
 
 include(CTest)

@@ -13,9 +13,12 @@ The normalizer intentionally targets only Databento US Equities Mini MBP-1. It v
 - Record type is MBP-1.
 - Publisher is `EQUS.MINI.EQUS`.
 - Venue sequence is zero because the derived dataset anonymizes component venues.
-- Depth is zero.
 - Bid and ask order counts are zero because component order counts are not aggregated.
 - The symbol has already been resolved from DBN metadata and is nonempty.
+
+The provider `depth` field identifies the source book level where the triggering
+update occurred and can be nonzero. MBP-1 still carries the resulting top of
+book in `levels[0]`, which is the level Chronos normalizes.
 
 Chronos therefore leaves `venue` and `venue_sequence` absent. A later `XNAS.ITCH` adapter will preserve its explicit Nasdaq venue and sequence instead of reusing these rules.
 
@@ -55,7 +58,12 @@ Provider flags map explicitly:
 | Maybe bad book | `PotentiallyInvalidBook` |
 | Publisher specific | `SourceSpecific` |
 
-Historical mode also adds `Replay`. Databento structural flags such as last, top-of-book, and market-by-price are recognized but do not become quality flags. Unknown provider bits are rejected. A crossed observed book is preserved and marked `PotentiallyInvalidBook` even when the source did not set that flag.
+Historical mode also adds `Replay`. Databento structural flags such as last,
+top-of-book, and market-by-price are recognized but do not become quality
+flags. Databento's reserved internal bit is valid and deliberately ignored, as
+required by the provider specification. A crossed observed book is preserved
+and marked `PotentiallyInvalidBook` even when the source did not set that
+flag.
 
 Every generated event passes the provider-independent Chronos validator before it is returned. Any failure is nested inside a structured adapter error, and no sequence state changes.
 
@@ -81,12 +89,11 @@ and emit validated events. Acquisition requires an explicit maximum quoted
 cost, refuses overwrites, and publishes a manifest only after full validation.
 The workflow is documented in `docs/historical-data-acquisition.md`.
 
-The repository still has no preserved real `AAPL`/`SPY` recording because raw
-licensed data cannot be committed and a local API key is required. It also
-does not persist normalized events. The provider-independent replay engine can
-already consume the adapter's validated event stream; the next data increment
-will run the documented short request locally and inspect its manifest,
-events, and final market view.
+Licensed recordings remain outside Git. A local, ignored `AAPL`/`SPY`
+recording has been acquired and replayed through the complete adapter-to-view
+path. The offline replay command reports its independently recomputed
+manifest, event counts, and final market view. The system does not yet persist
+normalized events.
 
 ## References
 

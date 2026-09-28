@@ -58,9 +58,25 @@ clears the clock and view and establishes an explicit new sequence boundary.
 Tests replay the same compressed synthetic DBN recording twice through the
 complete provider-to-view path and compare the results exactly.
 
+The optional Databento build also provides an offline executable for real
+recordings:
+
+```sh
+./build-databento/chronos_databento_replay \
+  --input data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst \
+  --stream-id databento-equs-mini-mbp1-20260925-1330-1340
+```
+
+It streams the DBN file through the provider adapter and replay engine without
+loading the recording into memory. Its deterministic JSON report contains the
+recomputed manifest, aggregate and per-instrument event counts, replay time
+bounds, the final ingest sequence, and final trade and top-of-book state. It
+does not contact Databento.
+
 ## Current boundary
 
-This increment is an event-step replay engine. It does not yet pace events at
-real time, schedule timers, persist normalized events, calculate features, or
-simulate execution. Those responsibilities build on the replay clock and
-market view rather than entering the provider adapter.
+This increment supports event-step replay of synthetic and local real DBN
+recordings. It does not yet pace events at real time, schedule timers, persist
+normalized events, calculate features, or simulate execution. Those
+responsibilities build on the replay clock and market view rather than
+entering the provider adapter.
