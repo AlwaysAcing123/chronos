@@ -161,6 +161,9 @@ using PaperFillHistoryResult = std::variant<
 struct PaperTradingHealth {
     bool persistence_available;
     MarketStateStatus market;
+    // The instruments new accounts may trade, in configuration order, so a
+    // client can offer them without hard-coding server configuration.
+    std::vector<InstrumentId> tradeable_instruments;
 };
 
 // The application boundary shared by the HTTP API and future transports.

@@ -770,12 +770,21 @@ void test_account_and_health_render_without_numbers() {
         .interruption = std::nullopt,
     };
     const HttpResponse healthy = chronos::paper_trading::render_health(
-        PaperTradingHealth{.persistence_available = true, .market = market}
+        PaperTradingHealth{
+            .persistence_available = true,
+            .market = market,
+            .tradeable_instruments = {InstrumentId("SPY"), InstrumentId("AAPL")},
+        }
     );
     REQUIRE(healthy.status == 200);
     const Json healthy_body = response_json(healthy);
+    require_no_json_numbers(healthy_body);
     REQUIRE(healthy_body.at("status") == "ok");
     REQUIRE(healthy_body.at("trading_mode") == "paper");
+    // Configuration order is preserved, not sorted.
+    REQUIRE(
+        healthy_body.at("tradeable_instruments") == Json::array({"SPY", "AAPL"})
+    );
     REQUIRE(
         healthy_body.at("market_data").at("last_ingest_sequence") ==
         "18446744073709551615"
@@ -790,11 +799,18 @@ void test_account_and_health_render_without_numbers() {
         .clock_error = std::nullopt,
     };
     const HttpResponse unavailable = chronos::paper_trading::render_health(
-        PaperTradingHealth{.persistence_available = false, .market = market}
+        PaperTradingHealth{
+            .persistence_available = false,
+            .market = market,
+            .tradeable_instruments = {InstrumentId("AAPL")},
+        }
     );
     REQUIRE(unavailable.status == 503);
     const Json unavailable_body = response_json(unavailable);
     REQUIRE(unavailable_body.at("persistence") == "unavailable");
+    REQUIRE(
+        unavailable_body.at("tradeable_instruments") == Json::array({"AAPL"})
+    );
     REQUIRE(unavailable_body.at("market_data").at("state") == "interrupted");
 }
 

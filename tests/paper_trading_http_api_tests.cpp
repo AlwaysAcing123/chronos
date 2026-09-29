@@ -194,6 +194,9 @@ void test_health_reports_paper_mode_persistence_and_market_state() {
     REQUIRE(empty.body.at("status") == "ok");
     REQUIRE(empty.body.at("trading_mode") == "paper");
     REQUIRE(empty.body.at("persistence") == "available");
+    REQUIRE(
+        empty.body.at("tradeable_instruments") == Json::array({"AAPL", "SPY"})
+    );
     const Json& empty_market = empty.body.at("market_data");
     REQUIRE(empty_market.at("stream_id") == chronos::test::kTestStream);
     REQUIRE(empty_market.at("state") == "accepting");

@@ -49,13 +49,17 @@ Chronos simulates trading only. It does not place real-money orders.
 - Read-only portfolio valuation at the server's current best bid, with exact
   market value, unrealized and total PnL, equity, and a fixed-point return
   percentage that reconcile before they are returned
+- A local React and TypeScript paper-trading workspace: account creation,
+  market and portfolio views, a manual order ticket that reconciles uncertain
+  submissions, and durable order and fill history, refreshed by polling
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution, plus real-PostgreSQL service and API tests
 
 The core accepts, simulates, books, persists, and recovers paper orders
-through controlled paths, and the optional API exposes that path to local
-clients. It does not yet provide a web application. See [plan.md](plan.md)
-for the complete roadmap.
+through controlled paths, the optional API exposes that path to local
+clients, and the web workspace in `apps/web/` is the first of them. Live
+streaming, authentication, model deployment, and historical charts are not
+built yet. See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -189,10 +193,31 @@ docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
 ```
 
+## Run the web workspace
+
+The browser client needs Node.js 22.22.2 (`apps/web/.nvmrc`) and a running
+API server as above. It is simulated trading only: every screen says so, and
+nothing can reach a broker or real money.
+
+```sh
+cd apps/web
+npm ci
+npm run dev        # http://127.0.0.1:5173, proxying /api and /health to :8080
+npm run check      # type check, lint, unit and component tests, build
+npx playwright install chromium
+npm run test:e2e   # browser tests against the build, with a mocked API
+```
+
+The development proxy keeps the browser same-origin with the API, so the C++
+server needs no CORS support. Reads are polled every 2 seconds; there is no
+streaming yet. See [docs/web-client.md](docs/web-client.md) for the
+architecture, exact-decimal rules, uncertain-order reconciliation, and tests.
+
 ## Repository map
 
 ```text
 adapters/   Provider-specific integrations isolated from the core
+apps/web/   React and TypeScript paper-trading workspace
 core/       C++ domain types and paper-trading core
 docs/       Contracts, architecture decisions, and accounting rules
 services/   Application service and HTTP API over the core
@@ -209,7 +234,10 @@ also tests the optional Databento adapter, and tests PostgreSQL persistence
 and the paper-trading API against a real PostgreSQL service, including a
 sanitizer build that combines the API with the Databento adapter. It fails if
 no tests are discovered and receives read-only repository access. Pushes to
-`main` and manual runs also receive an AppleClang check on macOS 15.
+`main` and manual runs also receive an AppleClang check on macOS 15. A web
+job installs `apps/web` from its lockfile on a pinned Node.js and runs type
+checking, lint, unit and component tests, the production build, and the
+Playwright suite; it needs no server, database, credentials, or market data.
 
 ## Data and credentials
 
@@ -238,6 +266,9 @@ The paper-trading HTTP contract is documented in
 [docs/paper-trading-api.md](docs/paper-trading-api.md), and its transport and
 dependency decision in
 [docs/decisions/0004-paper-trading-http-api.md](docs/decisions/0004-paper-trading-http-api.md).
+The web client's architecture and tests are documented in
+[docs/web-client.md](docs/web-client.md), and its foundation decision in
+[docs/decisions/0007-web-client-foundation.md](docs/decisions/0007-web-client-foundation.md).
 The journal read model and pagination decision is recorded in
 [docs/decisions/0005-paper-journal-read-model.md](docs/decisions/0005-paper-journal-read-model.md).
 The best-bid mark policy and portfolio-valuation rules are recorded in

@@ -39,7 +39,9 @@ HTTP GET portfolio -> PaperTradingService -> durable account + MarketState
 ```
 
 Business rules live only in the core and the service. The HTTP layer never
-evaluates risk, computes money, or touches PostgreSQL. Manual and model orders
+evaluates risk, computes money, or touches PostgreSQL. The web workspace in
+`apps/web/` is a client of this API through a same-origin development proxy
+([web-client.md](web-client.md)); it performs no financial calculation. Manual and model orders
 use the same endpoint, service call, and `OrderIntent` path; they differ only
 in `source.kind`.
 
@@ -216,6 +218,7 @@ make the server unhealthy, but it does block orders.
   "status": "ok",
   "trading_mode": "paper",
   "persistence": "available",
+  "tradeable_instruments": ["AAPL", "SPY"],
   "market_data": {
     "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
     "state": "accepting",
@@ -228,6 +231,10 @@ make the server unhealthy, but it does block orders.
 
 `state` is `accepting` or `interrupted`; `interruption` then describes the
 rejected event.
+
+`tradeable_instruments` lists the instruments new accounts may trade, in the
+order the server was configured with (`--instrument`), so a client can offer
+them without hard-coding server configuration.
 
 ### `POST /api/v1/accounts`
 
