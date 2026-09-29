@@ -1330,11 +1330,17 @@ HttpResponse render_health(const PaperTradingHealth& health) {
         ? ResponseJson(market.interruption->message)
         : ResponseJson(nullptr);
 
+    ResponseJson instruments = ResponseJson::array();
+    for (const InstrumentId& instrument : health.tradeable_instruments) {
+        instruments.push_back(instrument.value());
+    }
+
     ResponseJson body = ResponseJson::object();
     body["status"] = health.persistence_available ? "ok" : "unavailable";
     body["trading_mode"] = "paper";
     body["persistence"] =
         health.persistence_available ? "available" : "unavailable";
+    body["tradeable_instruments"] = std::move(instruments);
     body["market_data"] = std::move(market_data);
     return json_response(health.persistence_available ? 200 : 503, body);
 }

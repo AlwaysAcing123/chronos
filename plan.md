@@ -1147,7 +1147,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 7. **Complete:** Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
 8. **Complete:** Feed simulated fills into the existing accounting core and verify end-to-end reconciliation.
 9. **Complete:** Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
-10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Read-only portfolio valuation is complete: the durable account is marked at the server's current best bid with exact, reconciled market value, unrealized and total PnL, equity, and return, and refuses to value against missing, interrupted, suspect, or incompatible market data. Live updates and the web views remain.
+10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Read-only portfolio valuation is complete: the durable account is marked at the server's current best bid with exact, reconciled market value, unrealized and total PnL, equity, and return, and refuses to value against missing, interrupted, suspect, or incompatible market data. The first web workspace is complete as a local React and TypeScript client: account creation and selection, market and portfolio views, a manual market/limit IOC order ticket with reconciliation of uncertain submissions, and durable order and fill history, all refreshed by polling. Live updates (WebSocket or server-sent events), authentication, and a real-time market view remain.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
 
 The repository currently implements type-specific fixed-point price, money,
@@ -1179,8 +1179,14 @@ be looked up to reconcile an uncertain submission. A read-only portfolio
 endpoint marks the durable account at the server's current best bid, with
 exact fixed-point market value, unrealized and total PnL, equity, and return
 percentage that reconcile before they are returned, and it fails closed on
-unusable market data. Chronos does not yet implement normalized market-event
-persistence, authentication, live updates, or a web application.
+unusable market data. A local React and TypeScript workspace in `apps/web/`
+creates and opens paper accounts, shows the server's market state and exact
+portfolio valuation, submits manual paper orders through the same API and
+reconciles uncertain submissions by client order ID, and lists durable order
+and fill history. It polls the API; it does not stream. Chronos does not yet
+implement normalized market-event persistence, authentication, live updates,
+model deployment, historical charts, or the Models, Experiments, and Data
+areas of the web application.
 
 ## 20. Post-submission OCaml learning and translation
 

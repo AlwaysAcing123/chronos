@@ -549,6 +549,7 @@ PaperTradingHealth PaperTradingService::health() {
     return PaperTradingHealth{
         .persistence_available = repository_->check_availability(),
         .market = market_state_.status(),
+        .tradeable_instruments = config_.tradeable_instruments,
     };
 }
 

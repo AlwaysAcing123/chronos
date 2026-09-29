@@ -642,6 +642,11 @@ void test_health_reports_persistence_and_market_stream() {
     const auto service = make_service(*market);
     const auto before = service->health();
     REQUIRE(before.persistence_available);
+    const std::vector<InstrumentId> configured_instruments{
+        InstrumentId("AAPL"),
+        InstrumentId("SPY"),
+    };
+    REQUIRE(before.tradeable_instruments == configured_instruments);
     REQUIRE(
         before.market.stream ==
         MarketDataStreamId(std::string(chronos::test::kTestStream))
