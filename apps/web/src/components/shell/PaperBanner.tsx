@@ -6,7 +6,7 @@ export function PaperBanner() {
     <div className={styles.paperBanner} role="note" aria-label="Paper trading notice">
       <span className={styles.paperMark}>PAPER TRADING</span>
       <span className={styles.paperText}>
-        Simulated orders against recorded market data. No real money, broker, or exchange is involved.
+        Simulated orders only. No order ever reaches a broker or exchange, and no real money is involved.
       </span>
     </div>
   );

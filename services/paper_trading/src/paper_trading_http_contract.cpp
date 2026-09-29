@@ -545,6 +545,10 @@ std::string_view market_state_reason(MarketStateUnavailableCode code) {
             return "stream_interrupted";
         case MarketStateUnavailableCode::NoTopOfBook:
             return "no_top_of_book";
+        case MarketStateUnavailableCode::SourceUnavailable:
+            return "source_unavailable";
+        case MarketStateUnavailableCode::AwaitingFreshQuote:
+            return "awaiting_fresh_quote";
     }
     throw std::logic_error("unknown market-state unavailability");
 }
@@ -1030,6 +1034,69 @@ ResponseJson portfolio_json(const PaperPortfolioView& portfolio) {
     return json;
 }
 
+ResponseJson market_stream_json(const MarketStateStatus& market) {
+    ResponseJson json = ResponseJson::object();
+    json["stream_id"] = market.stream.value();
+    json["state"] = market.interruption ? "interrupted" : "accepting";
+    json["last_ingest_sequence"] = market.last_ingest_sequence
+        ? ResponseJson(std::to_string(*market.last_ingest_sequence))
+        : ResponseJson(nullptr);
+    json["market_time"] = optional_timestamp(market.market_time);
+    json["interruption"] = market.interruption
+        ? ResponseJson(market.interruption->message)
+        : ResponseJson(nullptr);
+    return json;
+}
+
+ResponseJson nonempty_or_null(const std::string& value) {
+    return value.empty() ? ResponseJson(nullptr) : ResponseJson(value);
+}
+
+ResponseJson market_source_json(const market_data::MarketDataSourceStatus& source) {
+    const market_data::MarketDataSourceDescription& description =
+        source.description;
+    ResponseJson instruments = ResponseJson::array();
+    for (const InstrumentId& instrument : description.instruments) {
+        instruments.push_back(instrument.value());
+    }
+    ResponseJson json = ResponseJson::object();
+    json["mode"] = market_data::mode_name(description.mode);
+    json["provider"] = nonempty_or_null(description.provider);
+    json["feed"] = nonempty_or_null(description.feed);
+    json["label"] = description.label;
+    json["coverage_notice"] = nullable(description.coverage_notice);
+    json["coverage_label"] = nullable(description.coverage_label);
+    json["state"] = market_data::state_name(source.state);
+    json["replay_speed"] = source.replay_speed
+        ? ResponseJson(std::string(replay_speed_name(*source.replay_speed)))
+        : ResponseJson(nullptr);
+    json["events_applied"] = std::to_string(source.events_applied);
+    json["diagnostic"] = nullable(source.diagnostic);
+    json["recording_sha256"] = nullable(source.recording_sha256);
+    json["instruments"] = std::move(instruments);
+    return json;
+}
+
+ResponseJson market_data_json(const MarketDataView& view) {
+    ResponseJson instruments = ResponseJson::array();
+    for (const InstrumentAvailability& instrument : view.market.instruments) {
+        ResponseJson item = ResponseJson::object();
+        item["instrument"] = instrument.instrument.value();
+        item["execution_quote_available"] = !instrument.unavailable.has_value();
+        item["unavailable_reason"] = instrument.unavailable
+            ? ResponseJson(std::string(market_state_reason(*instrument.unavailable)))
+            : ResponseJson(nullptr);
+        instruments.push_back(std::move(item));
+    }
+    ResponseJson json = ResponseJson::object();
+    json["trading_mode"] = "paper";
+    json["revision"] = std::to_string(view.revision);
+    json["source"] = market_source_json(view.source);
+    json["stream"] = market_stream_json(view.market.stream);
+    json["instruments"] = std::move(instruments);
+    return json;
+}
+
 HttpResponse render_service_error(const PaperTradingError& failure) {
     switch (failure.code) {
         case PaperTradingErrorCode::InvalidIdentifier:
@@ -1317,19 +1384,10 @@ std::string format_timestamp(Timestamp timestamp) {
     return text;
 }
 
-HttpResponse render_health(const PaperTradingHealth& health) {
-    const MarketStateStatus& market = health.market;
-    ResponseJson market_data = ResponseJson::object();
-    market_data["stream_id"] = market.stream.value();
-    market_data["state"] = market.interruption ? "interrupted" : "accepting";
-    market_data["last_ingest_sequence"] = market.last_ingest_sequence
-        ? ResponseJson(std::to_string(*market.last_ingest_sequence))
-        : ResponseJson(nullptr);
-    market_data["market_time"] = optional_timestamp(market.market_time);
-    market_data["interruption"] = market.interruption
-        ? ResponseJson(market.interruption->message)
-        : ResponseJson(nullptr);
-
+HttpResponse render_health(
+    const PaperTradingHealth& health,
+    const std::optional<market_data::MarketDataSourceStatus>& source
+) {
     ResponseJson instruments = ResponseJson::array();
     for (const InstrumentId& instrument : health.tradeable_instruments) {
         instruments.push_back(instrument.value());
@@ -1341,8 +1399,99 @@ HttpResponse render_health(const PaperTradingHealth& health) {
     body["persistence"] =
         health.persistence_available ? "available" : "unavailable";
     body["tradeable_instruments"] = std::move(instruments);
-    body["market_data"] = std::move(market_data);
+    body["market_data"] = market_stream_json(health.market);
+    if (source) {
+        ResponseJson summary = ResponseJson::object();
+        summary["mode"] = market_data::mode_name(source->description.mode);
+        summary["label"] = source->description.label;
+        summary["state"] = market_data::state_name(source->state);
+        body["market_data_source"] = std::move(summary);
+    }
     return json_response(health.persistence_available ? 200 : 503, body);
+}
+
+std::optional<MalformedRequest> parse_empty_object_request(
+    std::string_view body
+) {
+    auto document = parse_json_object(body);
+    if (auto* invalid = std::get_if<MalformedRequest>(&document)) {
+        return std::move(*invalid);
+    }
+    std::optional<MalformedRequest> error;
+    const FieldReader fields(std::get<RequestJson>(document), "", {}, error);
+    return error;
+}
+
+HttpResponse render_market_data(const MarketDataView& view) {
+    ResponseJson body = ResponseJson::object();
+    body["market_data"] = market_data_json(view);
+    return json_response(200, body);
+}
+
+HttpResponse render_replay_command_error(
+    const market_data::ReplayCommandError& error,
+    market_data::MarketDataMode mode
+) {
+    switch (error.code) {
+        case market_data::ReplayCommandErrorCode::NotReplay:
+            return error_response(
+                409,
+                "replay_control_unavailable",
+                error.message,
+                std::nullopt,
+                std::string(market_data::mode_name(mode))
+            );
+        case market_data::ReplayCommandErrorCode::InvalidTransition:
+            return error_response(
+                409,
+                "invalid_replay_transition",
+                error.message,
+                std::nullopt,
+                std::string(market_data::state_name(error.state))
+            );
+    }
+    throw std::logic_error("unknown replay command error");
+}
+
+HttpResponse render_event_stream_unavailable(
+    market_data::MarketDataNotifier::SubscribeError error
+) {
+    using SubscribeError = market_data::MarketDataNotifier::SubscribeError;
+    switch (error) {
+        case SubscribeError::TooManySubscribers:
+            return error_response(
+                503,
+                "event_stream_unavailable",
+                "too many event streams are open; the page falls back to "
+                "polling",
+                std::nullopt,
+                "too_many_event_streams"
+            );
+        case SubscribeError::Closed:
+            return error_response(
+                503,
+                "event_stream_unavailable",
+                "the server is shutting down",
+                std::nullopt,
+                "server_stopping"
+            );
+    }
+    throw std::logic_error("unknown subscription error");
+}
+
+std::optional<std::string> event_stream_text(
+    const market_data::MarketDataNotice& notice
+) {
+    if (const auto* changed =
+            std::get_if<market_data::MarketDataChanged>(&notice)) {
+        // The revision is a string, like every integer in the API.
+        return "event: market-data\ndata: {\"revision\":\"" +
+            std::to_string(changed->revision) + "\"}\n\n";
+    }
+    if (std::holds_alternative<market_data::MarketDataHeartbeat>(notice)) {
+        return std::string(": heartbeat\n\n");
+    }
+    return std::nullopt;
 }
 
 HttpResponse render_account(

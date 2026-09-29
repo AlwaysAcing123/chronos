@@ -35,7 +35,46 @@ MarketStateUpdateResult MarketState::apply(
             .replay_error = std::move(*error),
         };
     }
-    return std::get<MarketReplayStep>(std::move(result));
+    auto step = std::get<MarketReplayStep>(std::move(result));
+    if (fresh_since_resume_ && !suspended_ &&
+        step.market_view_update == MarketViewUpdate::TopOfBook) {
+        fresh_since_resume_->insert(step.instrument.value());
+    }
+    return step;
+}
+
+std::optional<MarketStateUpdateError> MarketState::advance_time(
+    Timestamp time
+) {
+    const std::lock_guard lock(mutex_);
+    if (interruption_) {
+        return MarketStateUpdateError{
+            .code = MarketStateUpdateErrorCode::StreamInterrupted,
+            .message =
+                "market state stopped accepting events after an earlier "
+                "stream rejection",
+            .replay_error = std::nullopt,
+        };
+    }
+    if (auto error = replay_.advance_time(time)) {
+        return MarketStateUpdateError{
+            .code = MarketStateUpdateErrorCode::TimeMovedBackward,
+            .message = error->message,
+            .replay_error = std::nullopt,
+        };
+    }
+    return std::nullopt;
+}
+
+void MarketState::suspend() {
+    const std::lock_guard lock(mutex_);
+    suspended_ = true;
+}
+
+void MarketState::resume() {
+    const std::lock_guard lock(mutex_);
+    suspended_ = false;
+    fresh_since_resume_.emplace();
 }
 
 ExecutionQuoteResult MarketState::execution_quote(
@@ -50,11 +89,29 @@ ExecutionQuoteResult MarketState::execution_quote(
         };
     }
 
+    if (suspended_) {
+        return MarketStateUnavailable{
+            .code = MarketStateUnavailableCode::SourceUnavailable,
+            .message =
+                "the market-data source is unavailable, so no quote is "
+                "current",
+        };
+    }
+
     const InstrumentMarketView* view = replay_.market_view().find(instrument);
     if (view == nullptr || !view->top_of_book) {
         return MarketStateUnavailable{
             .code = MarketStateUnavailableCode::NoTopOfBook,
             .message = "no top of book has been received for the instrument",
+        };
+    }
+    if (fresh_since_resume_ &&
+        !fresh_since_resume_->contains(instrument.value())) {
+        return MarketStateUnavailable{
+            .code = MarketStateUnavailableCode::AwaitingFreshQuote,
+            .message =
+                "no quote for the instrument has arrived since the "
+                "market-data source resumed",
         };
     }
     // An accepted top of book always advanced the replay clock.

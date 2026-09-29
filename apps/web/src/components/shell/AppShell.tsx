@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 
+import { SourceBar } from '../source/SourceBar';
 import { ConnectionStatus } from './ConnectionStatus';
 import { PaperBanner } from './PaperBanner';
 import styles from './shell.module.css';
@@ -28,6 +29,7 @@ export function AppShell({
         {accountContext}
         <ConnectionStatus />
       </header>
+      <SourceBar />
       <main id="main" className={styles.main} tabIndex={-1}>
         {children}
       </main>

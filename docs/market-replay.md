@@ -82,10 +82,87 @@ serving execution quotes permanently after any rejected event. The API uses
 the replay clock as each order's submission time, as described in
 [paper-trading-api.md](paper-trading-api.md).
 
+A live source can also suspend the state, advance its clock without an
+event, and require fresh quotes after a reconnection
+([market-data-sources.md](market-data-sources.md#live-freshness)). A replay
+uses none of these, so replay time is still exactly the receive time of the
+latest accepted event and replays remain reproducible.
+
 ## Current boundary
 
-This increment supports event-step replay of synthetic and local real DBN
-recordings. It does not yet pace events at real time, schedule timers, persist
-normalized events, calculate features, or simulate execution. Those
+The replay core supports event-step replay of synthetic and local real DBN
+recordings; the server paces it in real time as described below. The core
+does not persist normalized events, calculate features, or simulate
+execution. Those
 responsibilities build on the replay clock and market view rather than
 entering the provider adapter.
+
+## Paced replay
+
+The deterministic core above never sleeps. The paper-trading server adds a
+paced driver around it, `PacedReplaySource`, which plays a recording into the
+server's `MarketState` on its own thread while the HTTP API serves
+([market-data-sources.md](market-data-sources.md)).
+
+### Timing contract
+
+- **Receive time drives playback.** Replay time is the receive timestamp, so
+  pacing uses the same clock: an event is played when the recording's receive
+  clock reaches it, never earlier than the feed delivered it.
+- **The first event is delivered at once** when playback starts. It anchors
+  the schedule: its receive time plays at that steady-clock instant.
+- **Every later event is due at an absolute deadline**:
+
+  ```text
+  due = anchor_wall + (receive_time - anchor_receive) / multiple
+  ```
+
+  `multiple` is 1, 10, or 100; `max` has no deadline and plays as fast as
+  validation allows. The division is exact integer arithmetic on
+  nanoseconds, and every intermediate value is overflow-checked; an overflow
+  fails the replay rather than wrapping.
+- **Absolute deadlines prevent drift.** Sleeping for each relative gap would
+  add processing time and timer latency to every step, so a 10-minute
+  recording would run long. With absolute deadlines, a late event is simply
+  due now: the driver catches up without waiting until it is back on
+  schedule.
+- **Equal receive times need no wait**, and events keep the reader's order
+  and ingest sequence exactly. Nothing is reordered, skipped, or coalesced
+  before the market state.
+- **Receive-time regressions still fail closed.** An earlier receive time is
+  due at once, and the market state then rejects it and interrupts
+  permanently, exactly as without pacing.
+
+At `1x` the 10-minute AAPL/SPY recording takes about 10 minutes of unpaused
+playback, at `10x` about 1 minute, at `100x` about 6 seconds, and at `max`
+as long as validation takes (about a second).
+
+### Pause, resume, and stop
+
+- Pausing freezes playback: the next event is held and market time stops.
+- The paused wall time is added to the schedule's anchor when playback
+  resumes, so the remaining events keep their spacing instead of arriving in
+  a burst to make up for the pause.
+- Stop, used at server shutdown, interrupts any wait immediately; every wait
+  is a condition-variable wait woken by pause and stop.
+- The recording is read one event at a time, so memory stays bounded
+  regardless of recording size.
+
+### End states
+
+- The end of the recording is `completed`; the reader's verified SHA-256 is
+  logged and reported as `recording_sha256`. The market stays at the final
+  state, and orders can still trade against it.
+- A reader error, a market-state rejection, or a timing overflow is `failed`,
+  with a safe diagnostic. The market state keeps whatever it last accepted;
+  after a rejection it is interrupted and serves no quote.
+
+### Why there is no rewind
+
+Durable accounts record every execution's market observation and fill time,
+and accounting requires both to move forward. Rewinding the shared market
+state would put every existing account behind the market it traded in, so
+their orders would be rejected rather than silently mixing two timelines.
+Replaying again therefore means restarting the server and using new
+accounts. A later replay-session design can scope accounts to a replay epoch
+and make restart safe.

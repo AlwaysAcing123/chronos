@@ -14,7 +14,7 @@ describe('account entry', () => {
     renderWithServices(<App />, { api });
     const notice = screen.getByRole('note', { name: 'Paper trading notice' });
     expect(notice).toHaveTextContent('PAPER TRADING');
-    expect(notice).toHaveTextContent('No real money, broker, or exchange is involved.');
+    expect(notice).toHaveTextContent('No order ever reaches a broker or exchange, and no real money is involved.');
     expect(await screen.findByText('API online')).toBeInTheDocument();
   });
 

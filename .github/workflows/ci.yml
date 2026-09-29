@@ -125,6 +125,44 @@ jobs:
           --output-on-failure
           --no-tests=error
 
+  # Fake transports, a manual clock, and a loopback WebSocket server: no
+  # credentials and no connection to Alpaca.
+  alpaca-adapter:
+    name: Alpaca adapter
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      CC: gcc-14
+      CXX: g++-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install provider dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DCHRONOS_ENABLE_ALPACA_ADAPTER=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: >
+          ctest --test-dir build
+          --output-on-failure
+          --no-tests=error
+
   postgresql-persistence:
     name: PostgreSQL persistence and paper-trading API
     runs-on: ubuntu-24.04
@@ -180,7 +218,7 @@ jobs:
           --no-tests=error
 
   paper-trading-api-integration:
-    name: Paper-trading API with Databento and sanitizers
+    name: Paper-trading API with Databento, Alpaca, and sanitizers
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -219,7 +257,8 @@ jobs:
           sudo apt-get install --yes libpq-dev libssl-dev libzstd-dev
 
       # One build tree shares a single hash-pinned cpp-httplib configuration
-      # between the API server and the Databento SDK; see ADR 0004.
+      # between the API server, the Databento SDK, and the Alpaca adapter;
+      # see ADR 0004 and ADR 0009.
       - name: Configure
         run: >
           cmake -S . -B build
@@ -229,6 +268,7 @@ jobs:
           -DCHRONOS_ENABLE_POSTGRESQL_ADAPTER=ON
           -DCHRONOS_ENABLE_PAPER_TRADING_API=ON
           -DCHRONOS_ENABLE_DATABENTO_ADAPTER=ON
+          -DCHRONOS_ENABLE_ALPACA_ADAPTER=ON
 
       - name: Build
         run: cmake --build build --parallel

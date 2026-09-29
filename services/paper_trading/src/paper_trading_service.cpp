@@ -544,6 +544,24 @@ PaperPortfolioResult PaperTradingService::get_portfolio(
     }
 }
 
+MarketAvailability PaperTradingService::market_availability() const {
+    MarketAvailability availability{
+        .stream = market_state_.status(),
+        .instruments = {},
+    };
+    for (const InstrumentId& instrument : config_.tradeable_instruments) {
+        const ExecutionQuoteResult quote = market_state_.execution_quote(instrument);
+        const auto* unavailable = std::get_if<MarketStateUnavailable>(&quote);
+        availability.instruments.push_back(InstrumentAvailability{
+            .instrument = instrument,
+            .unavailable = unavailable
+                ? std::optional<MarketStateUnavailableCode>(unavailable->code)
+                : std::nullopt,
+        });
+    }
+    return availability;
+}
+
 PaperTradingHealth PaperTradingService::health() {
     const std::lock_guard lock(mutex_);
     return PaperTradingHealth{

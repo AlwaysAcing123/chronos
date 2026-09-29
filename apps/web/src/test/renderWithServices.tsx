@@ -4,26 +4,37 @@ import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 
 import { SELECTED_ACCOUNT_KEY, RECENT_ACCOUNTS_KEY } from '../state/accountSelection';
+import type { OpenNoticeStream } from '../state/marketDataStream';
 import { createQueryClient } from '../state/queryClient';
 import type { RefreshPolicy } from '../state/refreshPolicy';
 import { ChronosServicesProvider } from '../state/services';
 import type { FakeApi } from './fakeApi';
 import { createFakeApi } from './fakeApi';
 import type { Json } from './fixtures';
-import { ACCOUNT_ID, accountJson, fillJson, healthJson, partialOrderJson, portfolioJson } from './fixtures';
+import { ACCOUNT_ID, accountJson, fillJson, healthJson, marketDataJson, partialOrderJson, portfolioJson } from './fixtures';
 
 // Tests trigger reads explicitly; the polling test opts back in.
-export const NO_POLLING: RefreshPolicy = { healthMs: false, accountMs: false };
+export const NO_POLLING: RefreshPolicy = {
+  healthMs: false,
+  accountMs: false,
+  marketMs: false,
+  streamedMarketMs: false,
+};
 
 export function renderWithServices(
   ui: ReactElement,
-  { api = createFakeApi(), refresh = NO_POLLING }: { api?: FakeApi; refresh?: RefreshPolicy } = {},
+  {
+    api = createFakeApi(),
+    refresh = NO_POLLING,
+    openNoticeStream,
+  }: { api?: FakeApi; refresh?: RefreshPolicy; openNoticeStream?: OpenNoticeStream } = {},
 ) {
   const queryClient = createQueryClient();
   const user = userEvent.setup();
+  const services = openNoticeStream ? { client: api.client, refresh, openNoticeStream } : { client: api.client, refresh };
   const view = render(
     <QueryClientProvider client={queryClient}>
-      <ChronosServicesProvider services={{ client: api.client, refresh }}>{ui}</ChronosServicesProvider>
+      <ChronosServicesProvider services={services}>{ui}</ChronosServicesProvider>
     </QueryClientProvider>,
   );
   return { ...view, api, queryClient, user };
@@ -37,6 +48,12 @@ export function rememberSelectedAccount(accountId: string = ACCOUNT_ID) {
 
 export const accountPath = `/api/v1/accounts/${ACCOUNT_ID}`;
 
+/** Serves health and market data for a running replay. */
+export function serveServer(api: FakeApi, marketData: Json = marketDataJson()) {
+  api.on('GET', '/health', { status: 200, body: healthJson() });
+  api.on('GET', '/api/v1/market-data', { status: 200, body: { market_data: marketData } });
+}
+
 /** Serves a healthy account with one partially filled order and its fill. */
 export function serveAccount(
   api: FakeApi,
@@ -47,7 +64,7 @@ export function serveAccount(
     fills = [fillJson()],
   }: { account?: Json; portfolio?: Json; orders?: Json[]; fills?: Json[] } = {},
 ) {
-  api.on('GET', '/health', { status: 200, body: healthJson() });
+  serveServer(api);
   api.on('GET', accountPath, { status: 200, body: { account } });
   api.on('GET', `${accountPath}/portfolio`, { status: 200, body: { portfolio } });
   api.on('GET', `${accountPath}/orders`, { status: 200, body: { orders, next_cursor: null } });

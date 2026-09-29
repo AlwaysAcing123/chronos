@@ -51,15 +51,30 @@ Chronos simulates trading only. It does not place real-money orders.
   percentage that reconcile before they are returned
 - A local React and TypeScript paper-trading workspace: account creation,
   market and portfolio views, a manual order ticket that reconciles uncertain
-  submissions, and durable order and fill history, refreshed by polling
+  submissions, and durable order and fill history
+- Paced historical replay inside the running server: a recording plays by
+  receive time at `1x`, `10x`, `100x`, or `max` against an absolute
+  steady-clock schedule, with start, pause, and resume controls
+- A provider-independent market-data source boundary with one lifecycle
+  vocabulary, and a market-data resource reporting the source, stream, and
+  per-instrument quote availability
+- Coalesced Server-Sent Events change notices that let the web workspace
+  refresh market-dependent views as the market moves, with polling as the
+  fallback
+- Optional live market data from Alpaca's free IEX stream: one exact,
+  fail-closed WebSocket adapter with an explicit connect, authenticate, and
+  subscribe lifecycle, reconnection with backoff, and quotes that are never
+  executable while the feed is down or before a fresh quote arrives. IEX is
+  one exchange, not SIP or the NBBO, and is labelled so everywhere
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   risk, and execution, plus real-PostgreSQL service and API tests
 
 The core accepts, simulates, books, persists, and recovers paper orders
 through controlled paths, the optional API exposes that path to local
-clients, and the web workspace in `apps/web/` is the first of them. Live
-streaming, authentication, model deployment, and historical charts are not
-built yet. See [plan.md](plan.md) for the complete roadmap.
+clients, and the web workspace in `apps/web/` is the first of them. A
+replayed market now moves while the server runs, and an optional live IEX
+feed can replace it. Authentication, model deployment, and historical charts
+are not built yet. See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -154,8 +169,8 @@ instructions.
 
 The HTTP API is optional and requires the PostgreSQL adapter. Its first
 configuration downloads hash-pinned cpp-httplib and nlohmann/json releases.
-Adding the Databento adapter lets the server replay a local recording into its
-market state before it starts listening.
+Adding the Databento adapter lets the server play a local recording into its
+market state, paced by the recording's receive time, while it serves requests.
 
 ```sh
 docker compose up -d --wait postgres
@@ -174,8 +189,37 @@ CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos
   ./build-api/chronos_paper_trading_server \
     --stream-id databento-equs-mini-mbp1-20260925-1330-1340 \
     --instrument AAPL --instrument SPY \
-    --replay-dbn data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst
+    --replay-dbn data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst \
+    --replay-speed 10x
+
+# Playback waits in `ready`; start, pause, and resume it with empty commands
+curl -s -X POST localhost:8080/api/v1/market-data/replay/start \
+  -H 'Content-Type: application/json' -d '{}'
 ```
+
+`--replay-speed` accepts `1x` (the default), `10x`, `100x`, or `max`, and
+`--replay-autostart` starts playback without waiting for Start. The web
+workspace offers the same controls. A replay cannot be rewound; restart the
+server, and use a new account, to play it again. See
+[docs/market-replay.md](docs/market-replay.md#paced-replay).
+
+To trade against live IEX quotes instead, build with
+`-DCHRONOS_ENABLE_ALPACA_ADAPTER=ON` and start the server with `--alpaca-iex`
+in place of the replay options. Credentials are read only from
+`APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`, never from the command line:
+
+```sh
+APCA_API_KEY_ID=... APCA_API_SECRET_KEY=... \
+CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos' \
+  ./build-api/chronos_paper_trading_server \
+    --stream-id alpaca-iex-2026-09-29 --instrument AAPL --instrument SPY \
+    --alpaca-iex
+```
+
+Chronos consumes Alpaca market data only; orders are still simulated and
+accounted by Chronos. Use a new stream ID and new accounts for each live
+session. See [docs/alpaca-adapter.md](docs/alpaca-adapter.md) for the
+lifecycle, exact numeric mapping, freshness rules, and IEX limitations.
 
 The server binds to `127.0.0.1:8080` by default. It has no authentication
 and is not production-secure. See
@@ -209,8 +253,9 @@ npm run test:e2e   # browser tests against the build, with a mocked API
 ```
 
 The development proxy keeps the browser same-origin with the API, so the C++
-server needs no CORS support. Reads are polled every 2 seconds; there is no
-streaming yet. See [docs/web-client.md](docs/web-client.md) for the
+server needs no CORS support. Market-dependent views refresh on the server's
+change notices (Server-Sent Events), and everything falls back to polling
+every 2 seconds when the stream is unavailable. See [docs/web-client.md](docs/web-client.md) for the
 architecture, exact-decimal rules, uncertain-order reconciliation, and tests.
 
 ## Repository map
@@ -230,9 +275,11 @@ plan.md     Product requirements and delivery roadmap
 GitHub Actions builds and tests every pull request and every push to `main`
 with GCC 14 and Clang 18 on Ubuntu 24.04. A separate job runs the test suite
 with AddressSanitizer and UndefinedBehaviorSanitizer enabled. The workflow
-also tests the optional Databento adapter, and tests PostgreSQL persistence
-and the paper-trading API against a real PostgreSQL service, including a
-sanitizer build that combines the API with the Databento adapter. It fails if
+also tests the optional Databento and Alpaca adapters, and tests PostgreSQL
+persistence and the paper-trading API against a real PostgreSQL service,
+including a sanitizer build that combines the API with both adapters. The
+Alpaca tests use fake transports and a loopback WebSocket server; CI needs no
+credentials and never connects to Alpaca. It fails if
 no tests are discovered and receives read-only repository access. Pushes to
 `main` and manual runs also receive an AppleClang check on macOS 15. A web
 job installs `apps/web` from its lockfile on a pinned Node.js and runs type
@@ -243,7 +290,9 @@ Playwright suite; it needs no server, database, credentials, or market data.
 
 Raw or normalized licensed market data, credentials, model artifacts, build
 outputs, and generated reports must not be committed. Provider credentials are
-read from local environment variables and never passed on the command line.
+read from local environment variables (`DATABENTO_API_KEY`, `APCA_API_KEY_ID`,
+`APCA_API_SECRET_KEY`) and never passed on the command line;
+[.env.example](.env.example) lists the variable names only.
 
 The normalized event contract is documented in
 [docs/market-data-contract.md](docs/market-data-contract.md). The provider
@@ -273,5 +322,13 @@ The journal read model and pagination decision is recorded in
 [docs/decisions/0005-paper-journal-read-model.md](docs/decisions/0005-paper-journal-read-model.md).
 The best-bid mark policy and portfolio-valuation rules are recorded in
 [docs/decisions/0006-portfolio-valuation.md](docs/decisions/0006-portfolio-valuation.md).
+The market-data source boundary, live freshness, and browser change
+notifications are documented in
+[docs/market-data-sources.md](docs/market-data-sources.md), and the pacing and
+notification decision in
+[docs/decisions/0008-paced-replay-and-change-stream.md](docs/decisions/0008-paced-replay-and-change-stream.md).
+The Alpaca IEX live adapter is documented in
+[docs/alpaca-adapter.md](docs/alpaca-adapter.md), and its decision in
+[docs/decisions/0009-alpaca-iex-live-adapter.md](docs/decisions/0009-alpaca-iex-live-adapter.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

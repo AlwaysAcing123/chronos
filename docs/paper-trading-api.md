@@ -29,7 +29,10 @@ HTTP client
             -> risk -> top-of-book execution -> accounting
             -> PostgreSQL snapshot and journal (one transaction)
 
-replay driver or future live feed -> MarketState -> PaperTradingService
+market-data source (paced replay
+  or Alpaca IEX live)              -> MarketStateFeed -> MarketState
+                                                     -> MarketDataNotifier -> SSE
+MarketState -> PaperTradingService
 
 HTTP GET history -> PaperTradingService -> journal read model
                                            (persisted rows only)
@@ -48,7 +51,9 @@ in `source.kind`.
 ## Running locally
 
 Build the API with the PostgreSQL adapter. Adding the Databento adapter lets
-the server replay a local recording into its market state at startup.
+the server play a local recording into its market state; adding the Alpaca
+adapter (`-DCHRONOS_ENABLE_ALPACA_ADAPTER=ON`) lets it stream live Alpaca IEX
+quotes instead ([alpaca-adapter.md](alpaca-adapter.md)).
 
 ```sh
 docker compose up -d --wait postgres
@@ -69,9 +74,15 @@ CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos
 ```
 
 The database URL is read from `CHRONOS_POSTGRES_URL`, never from the command
-line. The server replays the whole recording before listening, so it serves
-the recording's final validated market; replay is not paced. Without
-`--replay-dbn`, the market is empty and every order returns
+line. With `--replay-dbn` the server listens at once and plays the recording
+in the background, paced by its receive timestamps
+([market-replay.md](market-replay.md#paced-replay)). Playback waits in
+`ready` until a client sends Start, unless `--replay-autostart` is given;
+`--replay-speed` selects `1x` (the default), `10x`, `100x`, or `max`. With
+`--alpaca-iex` the server listens at once while the live feed connects,
+reading credentials only from `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`;
+a missing variable stops startup with a message naming it. Without a
+source, the market is empty and every order returns
 `market_data_unavailable`. `SIGINT` or `SIGTERM` stops the server cleanly.
 The server refuses to start on a port that is already in use; the HTTP
 library's default `SO_REUSEPORT` is disabled so that an accidental second
@@ -89,6 +100,15 @@ Server options and their defaults:
 | `--max-position-quantity` | `10000` | Risk limit applied to new accounts |
 | `--max-quote-age-ms` | `5000` | Maximum quote age in market time |
 | `--fee-per-fill` | `0` | Flat fee per non-empty fill |
+| `--replay-dbn` | none | Local Databento EQUS.MINI MBP-1 recording to replay (Databento builds) |
+| `--replay-speed` | `1x` | `1x`, `10x`, `100x`, or `max`; requires `--replay-dbn` |
+| `--replay-autostart` | off | Start playing at once instead of waiting for Start; requires `--replay-dbn` |
+| `--alpaca-iex` | off | Stream live Alpaca IEX trades and quotes (Alpaca builds); at most 30 instruments; not with `--replay-dbn` |
+
+Every option except `--instrument` may be given once, and each instrument once.
+An option for a source that is not selected, or not built, is rejected, and
+at most one source may be selected. Switching sources requires a restart;
+use a new stream ID and new accounts for each source and each live session.
 
 Risk limits are server configuration, persisted with each account when it is
 created. Clients cannot choose them, and later configuration changes do not
@@ -114,6 +134,11 @@ curl -s 'localhost:8080/api/v1/accounts/demo-1/orders?limit=20'
 curl -s localhost:8080/api/v1/accounts/demo-1/orders/buy-1
 curl -s localhost:8080/api/v1/accounts/demo-1/fills
 curl -s localhost:8080/api/v1/accounts/demo-1/portfolio
+
+curl -s localhost:8080/api/v1/market-data
+curl -s -X POST localhost:8080/api/v1/market-data/replay/start \
+  -H 'Content-Type: application/json' -d '{}'
+curl -s -N localhost:8080/api/v1/market-data/events
 ```
 
 The history endpoints read indexes added by
@@ -225,12 +250,20 @@ make the server unhealthy, but it does block orders.
     "last_ingest_sequence": "121302",
     "market_time": "2026-09-25T13:39:59.969574414Z",
     "interruption": null
+  },
+  "market_data_source": {
+    "mode": "historical_replay",
+    "label": "Databento EQUS.MINI MBP-1 replay",
+    "state": "running"
   }
 }
 ```
 
 `state` is `accepting` or `interrupted`; `interruption` then describes the
-rejected event.
+rejected event. `market_data_source` summarizes the source; a live feed that
+is still establishing itself reports `connecting`, `authenticating`, or
+`subscribing` while the server is already healthy. The full source status is
+in `/api/v1/market-data`.
 
 `tradeable_instruments` lists the instruments new accounts may trade, in the
 order the server was configured with (`--instrument`), so a client can offer
@@ -553,6 +586,135 @@ The database accepts each client order ID at most once per account, so this
 procedure can never record an order twice. It does not change the submission
 contract.
 
+### `GET /api/v1/market-data`
+
+The server's market-data source and market state. It reads no database, so
+browsers can refresh it on every change notice.
+
+```json
+{
+  "market_data": {
+    "trading_mode": "paper",
+    "revision": "4817",
+    "source": {
+      "mode": "historical_replay",
+      "provider": "Databento",
+      "feed": "EQUS.MINI MBP-1",
+      "label": "Databento EQUS.MINI MBP-1 replay",
+      "coverage_notice": null,
+      "coverage_label": null,
+      "state": "running",
+      "replay_speed": "10x",
+      "events_applied": "4817",
+      "diagnostic": null,
+      "recording_sha256": null,
+      "instruments": ["AAPL", "SPY"]
+    },
+    "stream": {
+      "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
+      "state": "accepting",
+      "last_ingest_sequence": "4816",
+      "market_time": "2026-09-25T13:30:24.113204113Z",
+      "interruption": null
+    },
+    "instruments": [
+      {"instrument": "AAPL", "execution_quote_available": true, "unavailable_reason": null},
+      {"instrument": "SPY", "execution_quote_available": true, "unavailable_reason": null}
+    ]
+  }
+}
+```
+
+- `source.mode` is `none`, `historical_replay`, or `live`; `provider`,
+  `feed`, `coverage_notice`, and `coverage_label` are `null` when not
+  applicable. `coverage_label` restates the notice in a few words for compact
+  displays; a client must still show the full notice.
+- `source.state` is one of `none`, `ready`, `running`, `paused`,
+  `completed`, `connecting`, `authenticating`, `subscribing`, `live`,
+  `reconnecting`, `failed`, or `stopped`
+  ([market-data-sources.md](market-data-sources.md#lifecycle)).
+- `replay_speed` is present exactly for a replay. `events_applied` counts
+  the events the source applied to the market state, exactly.
+- `diagnostic` is the latest safe explanation, such as why a replay failed.
+  `recording_sha256` is the verified checksum once a recording completes.
+- `stream` has the same shape as `/health`'s `market_data`.
+- `instruments` lists every tradeable instrument; `unavailable_reason` is the
+  source-level `market_data_unavailable` reason for that instrument.
+  `source_unavailable` means the source cannot establish that its last quote
+  is current (for example, a live disconnect or failed replay), and
+  `awaiting_fresh_quote` means a live source resumed but has not delivered a
+  new quote for that instrument. Account-specific rules such as maximum quote
+  age can still reject a source-level available quote.
+
+A live Alpaca source looks like this; its `coverage_notice` must be shown
+wherever its quotes are:
+
+```json
+"source": {
+  "mode": "live",
+  "provider": "Alpaca",
+  "feed": "IEX",
+  "label": "Alpaca IEX",
+  "coverage_notice": "IEX only: quotes and trades from the Investors Exchange alone. This is not consolidated SIP data, not the NBBO, and not every US exchange.",
+  "coverage_label": "IEX only, not SIP or NBBO",
+  "state": "reconnecting",
+  "replay_speed": null,
+  "events_applied": "18342",
+  "diagnostic": "the connection closed: the WebSocket connection closed; reconnecting in 1.000 s",
+  "recording_sha256": null,
+  "instruments": ["AAPL", "SPY"]
+}
+```
+- `revision` is the change-notice revision this view is at least as new as.
+
+### `POST /api/v1/market-data/replay/{command}`
+
+`command` is `start`, `pause`, or `resume`. The body must be exactly `{}`
+with `Content-Type: application/json`; any field, any other JSON value,
+malformed JSON, duplicate keys, or a query string is rejected with
+`400 malformed_request`. Success returns `200` with the market-data resource
+after the command.
+
+| Command | Allowed in | Result |
+|---|---|---|
+| `start` | `ready` | `running`; the first event is delivered at once |
+| `pause` | `running` | `paused`; market time stops |
+| `resume` | `paused` | `running`; playback continues where it stopped |
+
+Any other combination returns `409 invalid_replay_transition` with `reason`
+set to the current state, such as `completed`. A server without a replay
+source returns `409 replay_control_unavailable` with `reason` set to the
+source mode (`none` or `live`). There is no rewind or restart: a completed
+replay stays at its final state until the server is restarted.
+
+### `GET /api/v1/market-data/events`
+
+A Server-Sent Events stream of change notices for local browsers. It carries
+no market data: each notice only says that the market or source changed, and
+the client refetches the resources it shows.
+
+```text
+retry: 3000
+
+event: market-data
+data: {"revision":"4817"}
+
+: heartbeat
+```
+
+- The first notice is sent at once, so a reconnecting view refreshes.
+- Notices are coalesced: at most one per 250 ms per connection, carrying the
+  latest revision. Every market event still reaches the market state; only
+  notices are merged, and there is no per-connection queue.
+- A comment heartbeat every 10 s keeps idle connections open and detects
+  closed ones.
+- The response is `text/event-stream` with `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, and `X-Chronos-Trading-Mode: paper`. A
+  query string returns `400`.
+- At most 8 streams are open at once; another returns
+  `503 event_stream_unavailable` with reason `too_many_event_streams`, and
+  during shutdown `server_stopping`. Clients then fall back to polling.
+
 ## Errors
 
 Every error body has the same shape:
@@ -597,6 +759,9 @@ with the same ID.
 | 500 | `processing_fault` | yes | Accounting rejected a risk-approved fill; the account is halted |
 | 500 | `valuation_failed` | no | The portfolio could not be valued exactly; `reason` is `nonpositive_starting_cash`, `arithmetic_overflow`, or `accounting_identity_failed` |
 | 500 | `internal_error` | unknown | Unexpected server failure; retry the identical request with the same identifiers |
+| 409 | `invalid_replay_transition` | no | The replay command does not apply in the current state; `reason` is the state |
+| 409 | `replay_control_unavailable` | no | The server's source is not a replay; `reason` is the source mode |
+| 503 | `event_stream_unavailable` | no | Too many change streams are open, or the server is stopping |
 | 503 | `market_data_unavailable` | no | No usable market for the account; `reason` is below |
 | 503 | `persistence_unavailable` | unknown | PostgreSQL was unreachable; retry the identical request with the same identifiers |
 
@@ -606,6 +771,8 @@ with the same ID.
 |---|---|---|
 | `no_top_of_book` | orders, portfolio | No observation of the account's instrument has been accepted |
 | `stream_interrupted` | orders, portfolio | The stream rejected an event; see `/health` |
+| `source_unavailable` | orders, portfolio | The active source cannot establish that its last quote is current |
+| `awaiting_fresh_quote` | orders, portfolio | A live source resumed and has not delivered a new quote for the instrument |
 | `missing_best_bid` | portfolio | The current book has no bid to mark the position |
 | `suspect_market_state` | portfolio | The observation is flagged as a potentially invalid book or questionable receive timestamp |
 | `stale_market_state` | portfolio | The observation is older than the account's maximum quote age relative to market time |
@@ -642,23 +809,30 @@ intent journaled by an in-process caller.
 
 ## Market-state ownership
 
-The server owns market data through `MarketState`. A replay driver applies
-validated events now; a live feed will call the same `apply` operation later.
-Clients cannot supply the quote they trade against.
+The server owns market data through `MarketState`. Its one market-data
+source applies validated events through `MarketStateFeed`
+([market-data-sources.md](market-data-sources.md)). Clients cannot supply the
+quote they trade against.
 
 - **Instrument matching.** Each order executes against the latest top of book
   for the account's instrument. A request `instrument` that differs from the
   account's is recorded as the risk rejection `instrument_mismatch`.
 - **Market time.** An order's `submitted_at` is the market clock: the receive
-  timestamp of the latest event accepted on the stream. Replays are therefore
+  timestamp of the latest event accepted on the stream; for a live source, the
+  local receive time of its latest read, including idle polls. Replays are therefore
   reproducible regardless of wall-clock time.
 - **Freshness.** The existing risk rule rejects a quote whose receive time is
-  more than the account's `maximum_quote_age_ns` behind market time. A quote
-  ages only as later events arrive, so in a replayed market, a quiet
+  more than the account's `maximum_quote_age_ns` behind market time. In a
+  replayed market a quote ages only as later events arrive, so a quiet
   instrument becomes stale while another instrument keeps updating. A live
-  feed must also advance time with heartbeats, or a silent feed would never
-  become stale. Portfolio valuation uses the same recency classifier and
-  returns `503 market_data_unavailable` / `stale_market_state` for the same
+  source also advances market time to its local receive clock on every read,
+  including idle polls every second, so a silent live feed's quotes become
+  stale in real time; and while it is not connected and subscribed, no quote
+  is served at all (`source_unavailable`, then `awaiting_fresh_quote` until
+  each instrument's first quote on the new connection)
+  ([market-data-sources.md](market-data-sources.md#live-freshness)).
+  Portfolio valuation uses the same recency classifier and returns
+  `503 market_data_unavailable` / `stale_market_state` for the same
   observation.
 - **Missing data.** Without a top of book for the instrument, the order is not
   recorded and returns `503 market_data_unavailable` / `no_top_of_book`. The
@@ -687,6 +861,12 @@ server on a different stream returns `execution_rejected` /
 `market_stream_mismatch` for those accounts, and an earlier point on the same
 stream returns `risk_rejected` / `submission_timestamp_moved_backward`. Use new
 accounts for a new market timeline.
+
+A paced replay always starts again from the first event when the server
+restarts. An account that traded later in the recording is therefore behind
+the replay until playback passes its latest execution, and its orders and
+portfolio fail with the errors above until then. Create a new account for
+each replay session.
 
 The portfolio applies the same rule, through the same function as execution
 (`market_lineage_violation`), so an account is valued only against a market it
@@ -762,9 +942,14 @@ These are intentionally not implemented in this slice:
 - One database connection per server process; a slow database operation
   delays every request, and there is no statement or lock timeout.
 - Loading an account per request costs time proportional to its journal.
-- Startup replay is unpaced, so the served market does not move while the
-  server runs.
-- An interrupted market stream recovers only by restarting the server.
+- A replay cannot be rewound or restarted in place; restart the server, and
+  use new accounts, to replay again.
+- An interrupted market stream recovers only by restarting the server. A live
+  feed's disconnections recover by themselves; a failed live source (such as
+  rejected credentials or malformed data) needs a restart.
+- Alpaca IEX is one exchange, not SIP or the NBBO, and publishes no venue
+  sequence, so upstream gaps cannot be detected.
+- Accounts still trade one instrument each.
 - No cancel/replace endpoints yet.
 - The portfolio is a point-in-time value at the current best bid; there is no
   valuation history, equity curve, or alternative mark policy. The mark

@@ -18,11 +18,15 @@ struct HttpServerOptions {
     std::size_t maximum_request_body_bytes{16 * 1024};
     std::chrono::seconds read_timeout{5};
     std::chrono::seconds write_timeout{5};
+    // Threads for ordinary requests. Each open event stream holds one more,
+    // reserved up to the API's event-stream capacity, so streams can never
+    // starve ordinary requests.
     std::size_t worker_threads{4};
 };
 
 // Serves PaperTradingHttpApi over HTTP/1.1. This is the only component that
-// depends on the HTTP library. Responses are JSON, are never cached, and carry
+// depends on the HTTP library. Responses are JSON or, for the event stream,
+// Server-Sent Events; none is cached, and all carry
 // `X-Chronos-Trading-Mode: paper`. `api` must outlive the server.
 class PaperTradingHttpServer final {
 public:
@@ -45,7 +49,8 @@ public:
     // Serves requests on the bound socket until stop() is called.
     void listen();
 
-    // Safe to call from another thread, including before listen() starts.
+    // Closes event streams, then stops serving. Safe to call from another
+    // thread, including before listen() starts.
     void stop();
 
 private:

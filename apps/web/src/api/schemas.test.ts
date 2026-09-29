@@ -5,11 +5,21 @@ import {
   cancelledOrderJson,
   fillJson,
   healthJson,
+  marketDataJson,
   partialOrderJson,
   portfolioJson,
   rejectedOrderJson,
+  liveSourceJson,
+  replaySourceJson,
 } from '../test/fixtures';
-import { AccountSchema, FillPageSchema, HealthSchema, OrderSchema, PortfolioSchema } from './schemas';
+import {
+  AccountSchema,
+  FillPageSchema,
+  HealthSchema,
+  MarketDataSchema,
+  OrderSchema,
+  PortfolioSchema,
+} from './schemas';
 
 describe('response decoders', () => {
   it('keep every financial value as the exact server string', () => {
@@ -81,5 +91,52 @@ describe('response decoders', () => {
   it('ignore unknown keys so additive server changes stay compatible', () => {
     const page = FillPageSchema.parse({ fills: [fillJson({ added_later: 'x' })], next_cursor: null, extra: 1 });
     expect(page.fills[0]).not.toHaveProperty('added_later');
+  });
+
+  it('decode market data with exact counts and refuse contradictions', () => {
+    const decoded = MarketDataSchema.parse(
+      marketDataJson({ source: replaySourceJson({ events_applied: '18446744073709551615' }) }),
+    );
+    expect(decoded.source.events_applied).toBe('18446744073709551615');
+    expect(decoded.revision).toBe('7');
+    // A live source has no playback speed; an unavailable quote says why.
+    expect(
+      MarketDataSchema.safeParse(marketDataJson({ source: replaySourceJson({ mode: 'live' }) })).success,
+    ).toBe(false);
+    expect(
+      MarketDataSchema.safeParse({
+        ...marketDataJson(),
+        instruments: [{ instrument: 'AAPL', execution_quote_available: false, unavailable_reason: null }],
+      }).success,
+    ).toBe(false);
+    expect(
+      MarketDataSchema.safeParse(marketDataJson({ source: replaySourceJson({ events_applied: 5 }) })).success,
+    ).toBe(false);
+    expect(
+      MarketDataSchema.safeParse(marketDataJson({ source: replaySourceJson({ state: 'rewinding' }) })).success,
+    ).toBe(false);
+    expect(
+      MarketDataSchema.safeParse(marketDataJson({ source: replaySourceJson({ recording_sha256: 'abc' }) })).success,
+    ).toBe(false);
+  });
+
+  it('decode a live source with its coverage notice and live unavailability reasons', () => {
+    const decoded = MarketDataSchema.parse(
+      marketDataJson({
+        source: liveSourceJson({ state: 'reconnecting', diagnostic: 'the connection closed' }),
+        reasons: { AAPL: 'source_unavailable', SPY: 'awaiting_fresh_quote' },
+      }),
+    );
+    expect(decoded.source.label).toBe('Alpaca IEX');
+    expect(decoded.source.coverage_notice).toMatch(/not the NBBO/);
+    expect(decoded.source.replay_speed).toBeNull();
+    expect(decoded.instruments.map((item) => item.unavailable_reason)).toEqual([
+      'source_unavailable',
+      'awaiting_fresh_quote',
+    ]);
+    // A live source cannot claim a playback speed.
+    expect(MarketDataSchema.safeParse(marketDataJson({ source: liveSourceJson({ replay_speed: '1x' }) })).success).toBe(
+      false,
+    );
   });
 });

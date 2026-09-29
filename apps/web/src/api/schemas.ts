@@ -99,26 +99,95 @@ export const MarketObservationSchema = z.object({
 });
 export type MarketObservation = z.infer<typeof MarketObservationSchema>;
 
-export const HealthSchema = z
+// The validated stream behind the server's market state.
+export const MarketStreamSchema = z
   .object({
-    status: z.enum(['ok', 'unavailable']),
-    trading_mode: PaperTradingMode,
-    persistence: z.enum(['available', 'unavailable']),
-    tradeable_instruments: z.array(IdentifierSchema).min(1),
-    market_data: z.object({
-      stream_id: z.string().min(1),
-      state: z.enum(['accepting', 'interrupted']),
-      last_ingest_sequence: UnsignedIntegerSchema.nullable(),
-      market_time: TimestampSchema.nullable(),
-      interruption: z.string().nullable(),
-    }),
+    stream_id: z.string().min(1),
+    state: z.enum(['accepting', 'interrupted']),
+    last_ingest_sequence: UnsignedIntegerSchema.nullable(),
+    market_time: TimestampSchema.nullable(),
+    interruption: z.string().nullable(),
   })
-  .refine(
-    (health) =>
-      (health.market_data.state === 'interrupted') === (health.market_data.interruption !== null),
-    { message: 'an interrupted stream must describe its interruption' },
-  );
+  .refine((stream) => (stream.state === 'interrupted') === (stream.interruption !== null), {
+    message: 'an interrupted stream must describe its interruption',
+  });
+export type MarketStream = z.infer<typeof MarketStreamSchema>;
+
+export const HealthSchema = z.object({
+  status: z.enum(['ok', 'unavailable']),
+  trading_mode: PaperTradingMode,
+  persistence: z.enum(['available', 'unavailable']),
+  tradeable_instruments: z.array(IdentifierSchema).min(1),
+  market_data: MarketStreamSchema,
+});
 export type Health = z.infer<typeof HealthSchema>;
+
+export const MarketDataModeSchema = z.enum(['none', 'historical_replay', 'live']);
+export type MarketDataMode = z.infer<typeof MarketDataModeSchema>;
+
+export const MarketDataSourceStateSchema = z.enum([
+  'none',
+  'ready',
+  'running',
+  'paused',
+  'completed',
+  'connecting',
+  'authenticating',
+  'subscribing',
+  'live',
+  'reconnecting',
+  'failed',
+  'stopped',
+]);
+export type MarketDataSourceState = z.infer<typeof MarketDataSourceStateSchema>;
+
+export const ReplaySpeedSchema = z.enum(['1x', '10x', '100x', 'max']);
+export type ReplaySpeed = z.infer<typeof ReplaySpeedSchema>;
+
+export const MarketDataSourceSchema = z
+  .object({
+    mode: MarketDataModeSchema,
+    provider: z.string().min(1).nullable(),
+    feed: z.string().min(1).nullable(),
+    label: z.string().min(1),
+    // A limitation of the feed that every view must show.
+    coverage_notice: z.string().min(1).nullable(),
+    // The same limitation in a few words, for the source bar.
+    coverage_label: z.string().min(1).nullable(),
+    state: MarketDataSourceStateSchema,
+    replay_speed: ReplaySpeedSchema.nullable(),
+    events_applied: UnsignedIntegerSchema,
+    diagnostic: z.string().nullable(),
+    recording_sha256: z.string().regex(/^[0-9a-f]{64}$/, 'expected a SHA-256 digest').nullable(),
+    instruments: z.array(IdentifierSchema),
+  })
+  .refine((source) => (source.mode === 'historical_replay') === (source.replay_speed !== null), {
+    message: 'only a replay has a playback speed',
+    path: ['replay_speed'],
+  });
+export type MarketDataSource = z.infer<typeof MarketDataSourceSchema>;
+
+export const InstrumentAvailabilitySchema = z
+  .object({
+    instrument: IdentifierSchema,
+    execution_quote_available: z.boolean(),
+    unavailable_reason: z.string().min(1).nullable(),
+  })
+  .refine((item) => item.execution_quote_available === (item.unavailable_reason === null), {
+    message: 'an unavailable quote must say why',
+  });
+export type InstrumentAvailability = z.infer<typeof InstrumentAvailabilitySchema>;
+
+export const MarketDataSchema = z.object({
+  trading_mode: PaperTradingMode,
+  revision: UnsignedIntegerSchema,
+  source: MarketDataSourceSchema,
+  stream: MarketStreamSchema,
+  instruments: z.array(InstrumentAvailabilitySchema),
+});
+export type MarketData = z.infer<typeof MarketDataSchema>;
+
+export const MarketDataEnvelopeSchema = z.object({ market_data: MarketDataSchema });
 
 export const AccountStatusSchema = z.enum(['active', 'halted']);
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;

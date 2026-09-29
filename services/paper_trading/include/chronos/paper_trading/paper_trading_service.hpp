@@ -158,6 +158,18 @@ using PaperFillHistoryResult = std::variant<
     PaperTradingError
 >;
 
+// Whether an order for one tradeable instrument could execute now.
+struct InstrumentAvailability {
+    InstrumentId instrument;
+    // Why no execution quote is available, or nullopt when one is.
+    std::optional<MarketStateUnavailableCode> unavailable;
+};
+
+struct MarketAvailability {
+    MarketStateStatus stream;
+    std::vector<InstrumentAvailability> instruments;
+};
+
 struct PaperTradingHealth {
     bool persistence_available;
     MarketStateStatus market;
@@ -221,6 +233,10 @@ public:
     );
 
     [[nodiscard]] PaperTradingHealth health();
+
+    // Reads only the market state, so it neither waits for the database
+    // nor takes the service lock; browsers refresh it on every change.
+    [[nodiscard]] MarketAvailability market_availability() const;
 
 private:
     std::mutex mutex_;

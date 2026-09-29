@@ -3,8 +3,10 @@
 #include "chronos/market_replay.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <variant>
 
@@ -20,6 +22,11 @@ struct ExecutionQuote {
 enum class MarketStateUnavailableCode {
     StreamInterrupted,
     NoTopOfBook,
+    // The active source cannot establish that its last quote is current.
+    SourceUnavailable,
+    // A source resumed and has not yet delivered a quote for the instrument,
+    // so the last one describes the market before the gap.
+    AwaitingFreshQuote,
 };
 
 struct MarketStateUnavailable {
@@ -35,6 +42,7 @@ using ExecutionQuoteResult = std::variant<
 enum class MarketStateUpdateErrorCode {
     ReplayRejected,
     StreamInterrupted,
+    TimeMovedBackward,
 };
 
 struct MarketStateUpdateError {
@@ -62,8 +70,17 @@ struct MarketStateStatus {
 // Market time is the receive timestamp of the latest accepted event, the
 // replay clock. Orders are timestamped with it, so quote age is measured in
 // the stream's own time and a replay is reproducible regardless of wall-clock
-// time. A quote ages only while later events arrive; a future live feed must
-// therefore also advance time with heartbeats.
+// time. A quote ages only while later events arrive, so a live feed also
+// advances time between events (advance_time) from its local receive clock;
+// a replay never does.
+//
+// A source can also become unavailable without corrupting an accepted event:
+// a live feed can disconnect, or a replay reader can fail after a valid
+// prefix. It suspends the state, making every quote unavailable. A resumable
+// source starts a new freshness epoch when it returns: each instrument stays
+// unavailable until a new top of book for it is accepted, so a quote from
+// before the gap is never served as current. A successfully completed replay
+// remains available at its final market state.
 //
 // Every rejected event interrupts the state permanently: a gap, duplicate,
 // stream mismatch, or receive-time regression means the view may no longer
@@ -94,10 +111,28 @@ public:
 
     [[nodiscard]] MarketStateStatus status() const;
 
+    // Advances market time without an event; it may stay equal but never
+    // move backward. Only a live source calls this.
+    [[nodiscard]] std::optional<MarketStateUpdateError> advance_time(
+        Timestamp time
+    );
+
+    // Makes every quote unavailable until resume(). Idempotent.
+    void suspend();
+
+    // Ends a suspension and starts a new freshness epoch: each instrument's
+    // quote stays unavailable until a top of book for it is accepted.
+    void resume();
+
 private:
     mutable std::mutex mutex_;
     MarketReplay replay_;
     std::optional<MarketReplayError> interruption_;
+    bool suspended_{false};
+    // Instruments with a top of book accepted since the latest resume().
+    // Absent until the first resume(), so a state that is never suspended
+    // requires no fresh quote.
+    std::optional<std::set<std::string, std::less<>>> fresh_since_resume_;
 };
 
 }  // namespace chronos

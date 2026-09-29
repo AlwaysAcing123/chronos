@@ -745,6 +745,22 @@ void test_unrecorded_service_errors_map_to_stable_status_codes() {
             "invalid_identifier");
     REQUIRE(render(PaperTradingErrorCode::MarketDataUnavailable).at("reason") ==
             "no_top_of_book");
+    for (const auto& [code, reason] : {
+             std::pair{MarketStateUnavailableCode::StreamInterrupted, "stream_interrupted"},
+             std::pair{MarketStateUnavailableCode::SourceUnavailable, "source_unavailable"},
+             std::pair{MarketStateUnavailableCode::AwaitingFreshQuote, "awaiting_fresh_quote"},
+         }) {
+        const Json live = response_json(chronos::paper_trading::render_order_submission(
+            PaperTradingError{
+                .code = PaperTradingErrorCode::MarketDataUnavailable,
+                .field = "",
+                .message = "unavailable",
+                .market_state = code,
+            }
+        )).at("error");
+        REQUIRE(live.at("code") == "market_data_unavailable");
+        REQUIRE(live.at("reason") == reason);
+    }
     const std::string persistence_message =
         render(PaperTradingErrorCode::PersistenceUnavailable).at("message");
     REQUIRE(persistence_message.find("secret") == std::string::npos);

@@ -14,6 +14,13 @@ test('trades against the real server and restores the account after reload', asy
   await create.getByLabel('Account ID').fill(accountId);
   await create.getByRole('button', { name: 'Create paper account' }).click();
 
+  // The real server keeps the change stream open.
+  await expect(page.getByText(/^Streaming changes/)).toBeVisible();
+  // A paced replay waits in Ready until someone starts it.
+  const start = page.getByRole('region', { name: 'Market-data source' }).getByRole('button', { name: 'Start replay' });
+  if (await start.isVisible()) {
+    await start.click();
+  }
   const ticket = page.getByRole('region', { name: 'Order ticket' });
   await expect(ticket.getByText('Best bid')).toBeVisible();
   await ticket.getByLabel('Quantity (AAPL)').fill('1');

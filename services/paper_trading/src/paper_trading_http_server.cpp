@@ -7,10 +7,13 @@
 #include <atomic>
 #include <cstddef>
 #include <exception>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace chronos::paper_trading {
 namespace {
@@ -25,15 +28,67 @@ std::string raw_query(const httplib::Request& request) {
         : request.target.substr(question + 1);
 }
 
+HttpRequest transport_independent(const httplib::Request& request) {
+    return HttpRequest{
+        .method = request.method,
+        .path = request.path,
+        .query = raw_query(request),
+        .content_type = request.get_header_value("Content-Type"),
+        .body = request.body,
+    };
+}
+
+void set_common_headers(httplib::Response& response) {
+    response.set_header("Cache-Control", "no-store");
+    response.set_header("X-Content-Type-Options", "nosniff");
+    response.set_header("X-Chronos-Trading-Mode", "paper");
+}
+
 void write_response(const HttpResponse& source, httplib::Response& target) {
     target.status = source.status;
     for (const HttpHeader& header : source.headers) {
         target.set_header(header.name, header.value);
     }
-    target.set_header("Cache-Control", "no-store");
-    target.set_header("X-Content-Type-Options", "nosniff");
-    target.set_header("X-Chronos-Trading-Mode", "paper");
+    set_common_headers(target);
     target.set_content(source.body, "application/json");
+}
+
+// Streams change notices to one browser. The provider blocks in next() on a
+// reserved worker thread; a failed write means the browser left, and closing
+// the notifier ends the stream at shutdown.
+void stream_notices(
+    market_data::MarketDataSubscription subscription,
+    httplib::Response& response
+) {
+    struct Stream {
+        market_data::MarketDataSubscription subscription;
+        bool preamble_sent{false};
+    };
+    auto stream = std::make_shared<Stream>(Stream{
+        .subscription = std::move(subscription),
+        .preamble_sent = false,
+    });
+    response.status = 200;
+    set_common_headers(response);
+    response.set_chunked_content_provider(
+        "text/event-stream",
+        [stream](std::size_t, httplib::DataSink& sink) {
+            if (!stream->preamble_sent) {
+                stream->preamble_sent = true;
+                return sink.write(
+                    kEventStreamPreamble.data(),
+                    kEventStreamPreamble.size()
+                );
+            }
+            const std::optional<std::string> text =
+                event_stream_text(stream->subscription.next());
+            if (!text) {
+                sink.done();
+                return true;
+            }
+            return sink.write(text->data(), text->size());
+        }
+    );
 }
 
 // The HTTP library rejects some requests before routing, such as malformed
@@ -63,15 +118,17 @@ std::string_view transport_error_code(int status) {
 
 struct PaperTradingHttpServer::Impl {
     Impl(
-        PaperTradingHttpApi& api,
+        PaperTradingHttpApi& served_api,
         HttpServerOptions server_options,
         DiagnosticLog access_log
     )
-        : options(std::move(server_options)) {
+        : api(served_api),
+          options(std::move(server_options)) {
         if (options.worker_threads == 0) {
             throw std::invalid_argument("HTTP server needs a worker thread");
         }
-        const std::size_t worker_threads = options.worker_threads;
+        const std::size_t worker_threads =
+            options.worker_threads + api.event_stream_capacity();
         server.new_task_queue = [worker_threads] {
             return new httplib::ThreadPool(worker_threads);
         };
@@ -86,21 +143,27 @@ struct PaperTradingHttpServer::Impl {
         });
 
         // Every method and path reaches the transport-independent router,
-        // which owns 404 and 405 decisions.
+        // which owns 404 and 405 decisions; only a GET of the event-stream
+        // route is streamed instead.
         const httplib::Server::Handler dispatch =
-            [&api](
+            [this](
                 const httplib::Request& request,
                 httplib::Response& response
             ) {
-                write_response(
-                    api.handle(HttpRequest{
-                        .method = request.method,
-                        .path = request.path,
-                        .query = raw_query(request),
-                        .content_type =
-                            request.get_header_value("Content-Type"),
-                        .body = request.body,
-                    }),
+                const HttpRequest converted = transport_independent(request);
+                if (!PaperTradingHttpApi::is_event_stream_request(converted)) {
+                    write_response(api.handle(converted), response);
+                    return;
+                }
+                auto opened = api.open_event_stream(converted);
+                if (auto* rejected = std::get_if<HttpResponse>(&opened)) {
+                    write_response(*rejected, response);
+                    return;
+                }
+                stream_notices(
+                    std::get<market_data::MarketDataSubscription>(
+                        std::move(opened)
+                    ),
                     response
                 );
             };
@@ -154,6 +217,7 @@ struct PaperTradingHttpServer::Impl {
         );
     }
 
+    PaperTradingHttpApi& api;
     HttpServerOptions options;
     httplib::Server server;
     std::atomic<bool> stop_requested{false};
@@ -200,6 +264,8 @@ void PaperTradingHttpServer::listen() {
 
 void PaperTradingHttpServer::stop() {
     impl_->stop_requested = true;
+    // Open streams hold worker threads that the server joins when it stops.
+    impl_->api.close_event_streams();
     impl_->server.stop();
 }
 

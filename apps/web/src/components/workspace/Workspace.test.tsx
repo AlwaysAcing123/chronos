@@ -7,12 +7,20 @@ import {
   accountJson,
   errorJson,
   flatAccountJson,
-  healthJson,
+  marketDataJson,
   marketJson,
+  marketStreamJson,
   PERSISTENCE_UNAVAILABLE_MESSAGE,
   portfolioJson,
+  replaySourceJson,
 } from '../../test/fixtures';
-import { accountPath, rememberSelectedAccount, renderWithServices, serveAccount } from '../../test/renderWithServices';
+import {
+  accountPath,
+  rememberSelectedAccount,
+  renderWithServices,
+  serveAccount,
+  serveServer,
+} from '../../test/renderWithServices';
 
 async function openPortfolio(api = createFakeApi()) {
   rememberSelectedAccount();
@@ -142,18 +150,20 @@ describe('market state', () => {
   it('makes an interrupted stream unmistakable', async () => {
     const api = createFakeApi();
     serveAccount(api);
-    api.on('GET', '/health', {
-      status: 200,
-      body: healthJson({
-        market_data: {
-          stream_id: 'stream-a',
+    serveServer(
+      api,
+      marketDataJson({
+        source: replaySourceJson({
+          state: 'failed',
+          diagnostic: 'market state rejected an event: market replay rejected stream event: gap',
+        }),
+        stream: marketStreamJson({
           state: 'interrupted',
-          last_ingest_sequence: '41',
-          market_time: '2026-09-25T13:39:59.969574414Z',
           interruption: 'market data stream skipped an ingest sequence',
-        },
+        }),
+        available: false,
       }),
-    });
+    );
     api.on('GET', `${accountPath}/portfolio`, {
       status: 503,
       body: errorJson('market_data_unavailable', 'the market-data stream is interrupted', {
@@ -164,7 +174,8 @@ describe('market state', () => {
     renderWithServices(<App />, { api });
 
     expect(await screen.findByText('The market-data stream is interrupted')).toBeInTheDocument();
-    expect(screen.getByText('Market stream interrupted')).toBeInTheDocument();
+    expect(await screen.findByText('Market-data source failed')).toBeInTheDocument();
+    expect(screen.getByText(/market state rejected an event/)).toBeInTheDocument();
     const ticket = screen.getByRole('region', { name: 'Order ticket' });
     expect(await within(ticket).findByText('No usable quote right now')).toBeInTheDocument();
   });
@@ -184,7 +195,7 @@ describe('polling', () => {
     const api = createFakeApi();
     serveAccount(api, { account: accountJson() });
     rememberSelectedAccount();
-    renderWithServices(<App />, { api, refresh: { healthMs: false, accountMs: 25 } });
+    renderWithServices(<App />, { api, refresh: { healthMs: false, accountMs: 25, marketMs: 25, streamedMarketMs: false } });
     await screen.findByText('99994.58');
 
     await waitFor(() => {
@@ -205,7 +216,7 @@ describe('polling', () => {
     const api = createFakeApi();
     serveAccount(api);
     rememberSelectedAccount();
-    renderWithServices(<App />, { api, refresh: { healthMs: 5_000, accountMs: 2_000 } });
+    renderWithServices(<App />, { api, refresh: { healthMs: 5_000, accountMs: 2_000, marketMs: 2_000, streamedMarketMs: 15_000 } });
     const header = screen.getByRole('banner');
     expect(await within(header).findByText(/^Polling every 2 s · last refresh \d/)).toBeInTheDocument();
   });

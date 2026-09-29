@@ -7,6 +7,7 @@ import {
   errorJson,
   fillJson,
   healthJson,
+  marketDataJson,
   partialOrderJson,
   PERSISTENCE_UNAVAILABLE_MESSAGE,
 } from '../test/fixtures';
@@ -188,5 +189,18 @@ describe('ChronosClient', () => {
       instrument: 'AAPL',
       starting_cash: '100000.00',
     });
+  });
+
+  it('sends replay commands as empty objects and types their refusals', async () => {
+    const api = createFakeApi();
+    api.on('POST', '/api/v1/market-data/replay/start', { status: 200, body: { market_data: marketDataJson() } });
+    api.on('POST', '/api/v1/market-data/replay/pause', {
+      status: 409,
+      body: errorJson('replay_control_unavailable', 'the configured source is not a replay', { reason: 'live' }),
+    });
+    const started = await api.client.controlReplay('start');
+    expect(started.source.state).toBe('running');
+    expect(api.requestsTo('POST', '/api/v1/market-data/replay/start')[0]?.body).toEqual({});
+    expect(categoryOf(await failureOf(api.client.controlReplay('pause')))).toBe('replay_control_unavailable');
   });
 });

@@ -113,6 +113,8 @@ Massive provides broad consolidated US-equity trades, NBBO quotes, historical fl
 
 Alpaca provides an inexpensive and approachable stock API. Its free equity feed is limited to IEX, it does not provide the required full-depth equity book, and ordinary API access does not permit redistribution. Using Alpaca's paper broker would also outsource the execution and accounting components that Chronos is intended to demonstrate.
 
+Update (2026-09-29): Databento remains the primary research and historical provider. Alpaca's free IEX stream was later added as an inexpensive, secondary live Level-1 adapter for local paper trading, consuming market data only and labelled as IEX-only everywhere; see [ADR 0009](0009-alpaca-iex-live-adapter.md).
+
 ### Direct Nasdaq TotalView-ITCH
 
 A direct feed provides the most authentic raw protocol and remains a valuable future adapter exercise. It was not selected as the primary source because live licensing, distribution rules, connectivity, data volume, and operational work are disproportionate for the first version. Official sample ITCH data may be used later if its use and redistribution terms fit the test-fixture policy.

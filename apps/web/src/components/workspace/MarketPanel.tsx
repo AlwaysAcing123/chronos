@@ -1,9 +1,9 @@
 import type { UseQueryResult } from '@tanstack/react-query';
 
 import type { PortfolioReading } from '../../api/client';
-import type { Health, MarketObservation } from '../../api/schemas';
+import type { MarketObservation, MarketStream } from '../../api/schemas';
 import { QUALITY_FLAG } from '../../presentation/vocabulary';
-import { useHealth } from '../../state/queries';
+import { useMarketData } from '../../state/queries';
 import { Alert } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
 import { Facts } from '../ui/Facts';
@@ -14,8 +14,7 @@ import { ReasonText } from '../ui/ReasonText';
 import { Unavailable } from '../ui/DecimalText';
 import styles from './workspace.module.css';
 
-function StreamFacts({ health }: { readonly health: Health }) {
-  const market = health.market_data;
+function StreamFacts({ market }: { readonly market: MarketStream }) {
   return (
     <Facts
       facts={[
@@ -108,18 +107,7 @@ function QuoteSection({ portfolio }: { readonly portfolio: UseQueryResult<Portfo
       </Alert>
     );
   }
-  const market = reading.portfolio.market;
-  return (
-    <>
-      <QuoteFacts market={market} />
-      {market.quality_flags.includes('replay') && (
-        <p className={styles.note}>
-          Replayed data: the server replays its recording at startup and serves the final state, so this quote does
-          not move while the server runs.
-        </p>
-      )}
-    </>
-  );
+  return <QuoteFacts market={reading.portfolio.market} />;
 }
 
 export function MarketPanel({
@@ -133,7 +121,8 @@ export function MarketPanel({
   readonly instrument: string;
   readonly portfolio: UseQueryResult<PortfolioReading, unknown>;
 }) {
-  const health = useHealth();
+  const marketData = useMarketData();
+  const stream = marketData.status === 'success' ? marketData.data.stream : null;
   return (
     <Panel id={id} className={className} title={`Market · ${instrument}`} meta="Server-owned market state">
       <div className={styles.group}>
@@ -142,16 +131,20 @@ export function MarketPanel({
       </div>
       <div className={styles.group}>
         <h3 className={styles.groupTitle}>Stream</h3>
-        {health.status === 'success' ? (
-          <StreamFacts health={health.data} />
-        ) : health.status === 'error' ? (
-          <FailureNotice error={health.error} onRetry={() => void health.refetch()} retrying={health.isFetching} />
+        {stream !== null ? (
+          <StreamFacts market={stream} />
+        ) : marketData.status === 'error' ? (
+          <FailureNotice
+            error={marketData.error}
+            onRetry={() => void marketData.refetch()}
+            retrying={marketData.isFetching}
+          />
         ) : (
           <span className={styles.note}>Loading stream status…</span>
         )}
-        {health.status === 'success' && health.data.market_data.interruption !== null && (
+        {stream?.interruption != null && (
           <Alert tone="negative" title="The market-data stream is interrupted">
-            {health.data.market_data.interruption} Orders and valuation stay unavailable until the server restarts.
+            {stream.interruption} Orders and valuation stay unavailable until the server restarts.
           </Alert>
         )}
       </div>
