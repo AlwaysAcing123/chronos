@@ -60,35 +60,88 @@ SimulatedExecutionError lineage_error(SimulatedExecutionErrorCode code) {
     }
 }
 
+void validate_recovered_execution(
+    const InstrumentId& instrument,
+    const InstrumentExecutionState& state,
+    const std::optional<MarketDataStreamId>& stream
+) {
+    if (state.consumed_bid_quantity.raw() < 0 ||
+        state.consumed_ask_quantity.raw() < 0) {
+        throw std::invalid_argument(
+            "recovered consumed liquidity must not be negative"
+        );
+    }
+    auto validation = validate_market_event(MarketEvent(state.active_market));
+    if (std::holds_alternative<MarketEventValidationFailure>(validation)) {
+        throw std::invalid_argument(
+            "recovered active market failed validation"
+        );
+    }
+    if (state.active_market.header.instrument != instrument) {
+        throw std::invalid_argument(
+            "recovered active market instrument does not match"
+        );
+    }
+    if (state.active_market.header.stream != *stream) {
+        throw std::invalid_argument(
+            "recovered instruments must share one market stream"
+        );
+    }
+    const auto& bid = state.active_market.bid;
+    if ((!bid && state.consumed_bid_quantity.raw() != 0) ||
+        (bid && state.consumed_bid_quantity > bid->quantity)) {
+        throw std::invalid_argument(
+            "recovered consumed bid quantity exceeds the market"
+        );
+    }
+    const auto& ask = state.active_market.ask;
+    if ((!ask && state.consumed_ask_quantity.raw() != 0) ||
+        (ask && state.consumed_ask_quantity > ask->quantity)) {
+        throw std::invalid_argument(
+            "recovered consumed ask quantity exceeds the market"
+        );
+    }
+}
+
 }  // namespace
 
-std::optional<SimulatedExecutionErrorCode> market_lineage_violation(
-    const std::optional<TopOfBookEvent>& active_market,
-    const TopOfBookEvent& market
+std::optional<MarketDataStreamId> bound_market_stream(
+    const InstrumentExecutionStates& executions
 ) {
-    if (!active_market) {
+    if (executions.empty()) {
         return std::nullopt;
     }
-    const MarketEventHeader& active = active_market->header;
-    if (market.header.stream != active.stream) {
+    return executions.begin()->second.active_market.header.stream;
+}
+
+std::optional<SimulatedExecutionErrorCode> market_lineage_violation(
+    const InstrumentExecutionStates& executions,
+    const TopOfBookEvent& market
+) {
+    const auto stream = bound_market_stream(executions);
+    if (stream && market.header.stream != *stream) {
         return SimulatedExecutionErrorCode::MarketStreamMismatch;
     }
+    const auto found = executions.find(market.header.instrument);
+    if (found == executions.end()) {
+        return std::nullopt;
+    }
+    const TopOfBookEvent& active_market = found->second.active_market;
+    const MarketEventHeader& active = active_market.header;
     if (market.header.ingest_sequence < active.ingest_sequence) {
         return SimulatedExecutionErrorCode::StaleMarketApproval;
     }
     if (market.header.ingest_sequence == active.ingest_sequence &&
-        market != *active_market) {
+        market != active_market) {
         return SimulatedExecutionErrorCode::MarketSnapshotMismatch;
     }
     return std::nullopt;
 }
 
 TopOfBookExecutionSimulator::TopOfBookExecutionSimulator(
-    std::string account_id,
-    InstrumentId instrument
+    std::string account_id
 )
-    : account_id_(std::move(account_id)),
-      instrument_(std::move(instrument)) {
+    : account_id_(std::move(account_id)) {
     if (account_id_.empty()) {
         throw std::invalid_argument(
             "execution simulator account ID must not be empty"
@@ -108,10 +161,7 @@ TopOfBookExecutionSimulator::recovery_state() const {
     );
     return TopOfBookExecutionRecoveryState{
         .account_id = account_id_,
-        .instrument = instrument_,
-        .active_market = active_market_,
-        .consumed_bid_quantity = consumed_bid_quantity_,
-        .consumed_ask_quantity = consumed_ask_quantity_,
+        .instruments = instruments_,
         .processed_client_order_ids =
             std::move(processed_client_order_ids),
     };
@@ -120,59 +170,15 @@ TopOfBookExecutionSimulator::recovery_state() const {
 TopOfBookExecutionSimulator TopOfBookExecutionSimulator::restore(
     TopOfBookExecutionRecoveryState recovery_state
 ) {
-    if (recovery_state.consumed_bid_quantity.raw() < 0 ||
-        recovery_state.consumed_ask_quantity.raw() < 0) {
-        throw std::invalid_argument(
-            "recovered consumed liquidity must not be negative"
-        );
-    }
-    if (!recovery_state.active_market) {
-        if (recovery_state.consumed_bid_quantity.raw() != 0 ||
-            recovery_state.consumed_ask_quantity.raw() != 0) {
-            throw std::invalid_argument(
-                "recovered liquidity requires an active market"
-            );
-        }
-    } else {
-        auto validation = validate_market_event(
-            MarketEvent(*recovery_state.active_market)
-        );
-        if (std::holds_alternative<MarketEventValidationFailure>(validation)) {
-            throw std::invalid_argument(
-                "recovered active market failed validation"
-            );
-        }
-        if (recovery_state.active_market->header.instrument !=
-            recovery_state.instrument) {
-            throw std::invalid_argument(
-                "recovered active market instrument does not match"
-            );
-        }
-        const auto& bid = recovery_state.active_market->bid;
-        if ((!bid && recovery_state.consumed_bid_quantity.raw() != 0) ||
-            (bid && recovery_state.consumed_bid_quantity > bid->quantity)) {
-            throw std::invalid_argument(
-                "recovered consumed bid quantity exceeds the market"
-            );
-        }
-        const auto& ask = recovery_state.active_market->ask;
-        if ((!ask && recovery_state.consumed_ask_quantity.raw() != 0) ||
-            (ask && recovery_state.consumed_ask_quantity > ask->quantity)) {
-            throw std::invalid_argument(
-                "recovered consumed ask quantity exceeds the market"
-            );
-        }
+    const auto stream = bound_market_stream(recovery_state.instruments);
+    for (const auto& [instrument, state] : recovery_state.instruments) {
+        validate_recovered_execution(instrument, state, stream);
     }
 
     TopOfBookExecutionSimulator simulator(
-        std::move(recovery_state.account_id),
-        std::move(recovery_state.instrument)
+        std::move(recovery_state.account_id)
     );
-    simulator.active_market_ = std::move(recovery_state.active_market);
-    simulator.consumed_bid_quantity_ =
-        recovery_state.consumed_bid_quantity;
-    simulator.consumed_ask_quantity_ =
-        recovery_state.consumed_ask_quantity;
+    simulator.instruments_ = std::move(recovery_state.instruments);
     for (std::string& client_order_id :
          recovery_state.processed_client_order_ids) {
         if (client_order_id.empty()) {
@@ -204,13 +210,6 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
             "approved order account does not match the simulator"
         );
     }
-    if (intent.instrument != instrument_) {
-        return execution_error(
-            SimulatedExecutionErrorCode::InstrumentMismatch,
-            "instrument",
-            "approved order instrument does not match the simulator"
-        );
-    }
     if (processed_client_order_ids_.contains(intent.client_order_id)) {
         return execution_error(
             SimulatedExecutionErrorCode::DuplicateClientOrderId,
@@ -220,23 +219,33 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
     }
 
     if (const auto violation = market_lineage_violation(
-            active_market_,
+            instruments_,
             market
         )) {
         return lineage_error(*violation);
     }
 
-    const bool is_new_market = !active_market_ ||
-        market.header.ingest_sequence > active_market_->header.ingest_sequence;
-    if (is_new_market) {
-        active_market_ = market;
-        consumed_bid_quantity_ = Quantity{};
-        consumed_ask_quantity_ = Quantity{};
-    }
+    // Only this instrument's liquidity is consulted or consumed. A strictly
+    // newer observation of the instrument starts a fresh snapshot.
+    const auto existing = instruments_.find(intent.instrument);
+    InstrumentExecutionState state = existing != instruments_.end() &&
+            market.header.ingest_sequence ==
+                existing->second.active_market.header.ingest_sequence
+        ? existing->second
+        : InstrumentExecutionState{
+              .active_market = market,
+              .consumed_bid_quantity = Quantity{},
+              .consumed_ask_quantity = Quantity{},
+          };
+
+    const auto finish = [&](SimulatedExecutionReport report) {
+        processed_client_order_ids_.insert(intent.client_order_id);
+        instruments_.insert_or_assign(intent.instrument, std::move(state));
+        return report;
+    };
 
     if (!is_marketable(approved)) {
-        processed_client_order_ids_.insert(intent.client_order_id);
-        return SimulatedExecutionReport{
+        return finish(SimulatedExecutionReport{
             .intent = intent,
             .status = SimulatedExecutionStatus::Cancelled,
             .fill = std::nullopt,
@@ -244,20 +253,19 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
             .cancellation_reason =
                 SimulatedCancellationReason::LimitNotMarketable,
             .market_ingest_sequence = market.header.ingest_sequence,
-        };
+        });
     }
 
     const BookLevel& displayed_level = intent.side == Side::Buy
         ? *market.ask
         : *market.bid;
-    const Quantity consumed_quantity = intent.side == Side::Buy
-        ? consumed_ask_quantity_
-        : consumed_bid_quantity_;
+    Quantity& consumed_quantity = intent.side == Side::Buy
+        ? state.consumed_ask_quantity
+        : state.consumed_bid_quantity;
     const Quantity available_quantity =
         displayed_level.quantity - consumed_quantity;
     if (available_quantity.raw() == 0) {
-        processed_client_order_ids_.insert(intent.client_order_id);
-        return SimulatedExecutionReport{
+        return finish(SimulatedExecutionReport{
             .intent = intent,
             .status = SimulatedExecutionStatus::Cancelled,
             .fill = std::nullopt,
@@ -265,7 +273,7 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
             .cancellation_reason =
                 SimulatedCancellationReason::DisplayedLiquidityExhausted,
             .market_ingest_sequence = market.header.ingest_sequence,
-        };
+        });
     }
 
     const Quantity fill_quantity = std::min(
@@ -273,8 +281,7 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
         available_quantity
     );
     const Quantity unfilled_quantity = intent.quantity - fill_quantity;
-    const Quantity updated_consumed_quantity =
-        consumed_quantity + fill_quantity;
+    consumed_quantity = consumed_quantity + fill_quantity;
     const Fill fill{
         .fill_id = intent.client_order_id + ":fill:0",
         .instrument = intent.instrument,
@@ -285,7 +292,7 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
         .timestamp = intent.submitted_at,
     };
     const bool is_complete = unfilled_quantity.raw() == 0;
-    SimulatedExecutionReport report{
+    return finish(SimulatedExecutionReport{
         .intent = intent,
         .status = is_complete
             ? SimulatedExecutionStatus::Filled
@@ -298,15 +305,7 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
                   SimulatedCancellationReason::DisplayedLiquidityExhausted
               ),
         .market_ingest_sequence = market.header.ingest_sequence,
-    };
-
-    processed_client_order_ids_.insert(intent.client_order_id);
-    if (intent.side == Side::Buy) {
-        consumed_ask_quantity_ = updated_consumed_quantity;
-    } else {
-        consumed_bid_quantity_ = updated_consumed_quantity;
-    }
-    return report;
+    });
 }
 
 }  // namespace chronos

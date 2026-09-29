@@ -1,6 +1,7 @@
 #include "chronos/market_state.hpp"
 #include "test_support.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <optional>
@@ -25,6 +26,7 @@ using chronos::MarketDataStreamValidationErrorCode;
 using chronos::MarketEvent;
 using chronos::MarketEventHeader;
 using chronos::MarketEventValidationFailure;
+using chronos::MarketQuotes;
 using chronos::MarketReplayErrorCode;
 using chronos::MarketReplayStep;
 using chronos::MarketState;
@@ -323,6 +325,137 @@ void test_concurrent_readers_observe_consistent_snapshots() {
     REQUIRE(state.status().last_ingest_sequence == kUpdates);
 }
 
+const TopOfBookEvent& require_top_of_book(
+    const MarketQuotes& read,
+    std::string_view instrument
+) {
+    const auto& quote = read.quotes.at(InstrumentId(std::string(instrument)));
+    REQUIRE(std::holds_alternative<TopOfBookEvent>(quote));
+    return std::get<TopOfBookEvent>(quote);
+}
+
+void require_unavailable_quote(
+    const MarketQuotes& read,
+    std::string_view instrument,
+    MarketStateUnavailableCode code
+) {
+    const auto& quote = read.quotes.at(InstrumentId(std::string(instrument)));
+    REQUIRE(std::holds_alternative<MarketStateUnavailable>(quote));
+    REQUIRE(std::get<MarketStateUnavailable>(quote).code == code);
+    REQUIRE(!std::get<MarketStateUnavailable>(quote).message.empty());
+}
+
+void test_quotes_reads_several_instruments_together() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    const std::vector<InstrumentId> watched{
+        InstrumentId("SPY"),
+        InstrumentId("AAPL"),
+        InstrumentId("MSFT"),
+    };
+    const MarketQuotes empty = state.quotes(watched);
+    REQUIRE(empty.stream == MarketDataStreamId(std::string(kStream)));
+    REQUIRE(!empty.market_time.has_value());
+    REQUIRE(empty.quotes.size() == 3);
+    require_unavailable_quote(empty, "AAPL", MarketStateUnavailableCode::NoTopOfBook);
+    REQUIRE(state.quotes({}).quotes.empty());
+
+    const TopOfBookEvent aapl = top_of_book(0, 1'000, "AAPL");
+    const TopOfBookEvent spy = top_of_book(1, 1'500, "SPY");
+    require_step(state.apply(require_valid(aapl)));
+    require_step(state.apply(require_valid(spy)));
+    const MarketQuotes read = state.quotes(watched);
+    REQUIRE(read.market_time == Timestamp::from_nanoseconds(1'500));
+    REQUIRE(require_top_of_book(read, "AAPL") == aapl);
+    REQUIRE(require_top_of_book(read, "SPY") == spy);
+    // Only the requested instruments are read, each with its own reason.
+    require_unavailable_quote(read, "MSFT", MarketStateUnavailableCode::NoTopOfBook);
+    REQUIRE(state.quotes({InstrumentId("SPY")}).quotes.size() == 1);
+
+    state.suspend();
+    state.resume();
+    require_step(state.apply(require_valid(top_of_book(2, 1'600, "SPY"))));
+    const MarketQuotes resumed = state.quotes(watched);
+    require_unavailable_quote(resumed, "AAPL", MarketStateUnavailableCode::AwaitingFreshQuote);
+    REQUIRE(require_top_of_book(resumed, "SPY").header.ingest_sequence == 2U);
+    require_unavailable_quote(resumed, "MSFT", MarketStateUnavailableCode::NoTopOfBook);
+
+    state.suspend();
+    for (const auto& [instrument, quote] : state.quotes(watched).quotes) {
+        REQUIRE(std::get<MarketStateUnavailable>(quote).code ==
+            MarketStateUnavailableCode::SourceUnavailable);
+    }
+    state.resume();
+    require_update_error(
+        state.apply(require_valid(top_of_book(9, 1'700, "SPY"))),
+        MarketStateUpdateErrorCode::ReplayRejected
+    );
+    for (const auto& [instrument, quote] : state.quotes(watched).quotes) {
+        REQUIRE(std::get<MarketStateUnavailable>(quote).code ==
+            MarketStateUnavailableCode::StreamInterrupted);
+    }
+}
+
+// Every quote in one read, and the market time, come from the same instant:
+// with only quotes applied, market time is the newer quote's receive time.
+void test_concurrent_quote_reads_are_one_instant() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    require_step(state.apply(require_valid(top_of_book(0, 1'000, "AAPL"))));
+    require_step(state.apply(require_valid(top_of_book(1, 1'001, "SPY"))));
+    constexpr std::uint64_t kUpdates = 2'000;
+    const std::vector<InstrumentId> both{InstrumentId("AAPL"), InstrumentId("SPY")};
+
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> readers_consistent{true};
+    std::vector<std::thread> readers;
+    for (int reader = 0; reader < 3; ++reader) {
+        readers.emplace_back([&] {
+            while (!writer_done.load()) {
+                const MarketQuotes read = state.quotes(both);
+                const auto* aapl = std::get_if<TopOfBookEvent>(
+                    &read.quotes.at(InstrumentId("AAPL"))
+                );
+                const auto* spy = std::get_if<TopOfBookEvent>(
+                    &read.quotes.at(InstrumentId("SPY"))
+                );
+                if (aapl == nullptr || spy == nullptr || !read.market_time) {
+                    readers_consistent = false;
+                    return;
+                }
+                const auto newest = std::max(
+                    aapl->header.receive_timestamp,
+                    spy->header.receive_timestamp
+                );
+                const auto sequence_gap =
+                    aapl->header.ingest_sequence > spy->header.ingest_sequence
+                        ? aapl->header.ingest_sequence - spy->header.ingest_sequence
+                        : spy->header.ingest_sequence - aapl->header.ingest_sequence;
+                if (*read.market_time != newest || sequence_gap != 1) {
+                    readers_consistent = false;
+                    return;
+                }
+            }
+        });
+    }
+
+    bool writer_accepted_every_update = true;
+    for (std::uint64_t sequence = 2; sequence <= kUpdates; ++sequence) {
+        const auto result = state.apply(require_valid(top_of_book(
+            sequence,
+            static_cast<std::int64_t>(1'000 + sequence),
+            sequence % 2 == 0 ? "AAPL" : "SPY"
+        )));
+        writer_accepted_every_update = writer_accepted_every_update &&
+            std::holds_alternative<MarketReplayStep>(result);
+    }
+    writer_done = true;
+    for (auto& reader : readers) {
+        reader.join();
+    }
+
+    REQUIRE(writer_accepted_every_update);
+    REQUIRE(readers_consistent.load());
+}
+
 void test_suspension_makes_every_quote_unavailable() {
     MarketState state{MarketDataStreamId(std::string(kStream))};
     require_step(state.apply(require_valid(top_of_book(0, 1'000))));
@@ -482,6 +615,14 @@ int main() {
         {
             "concurrent readers observe consistent snapshots",
             test_concurrent_readers_observe_consistent_snapshots,
+        },
+        {
+            "quotes reads several instruments together",
+            test_quotes_reads_several_instruments_together,
+        },
+        {
+            "concurrent quote reads are one instant",
+            test_concurrent_quote_reads_are_one_instant,
         },
         {
             "suspension makes every quote unavailable",

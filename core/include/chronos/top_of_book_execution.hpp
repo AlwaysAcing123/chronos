@@ -3,6 +3,7 @@
 #include "chronos/pre_trade_risk.hpp"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -38,6 +39,8 @@ struct SimulatedExecutionReport {
 
 enum class SimulatedExecutionErrorCode {
     AccountMismatch,
+    // Retained so journaled history stays readable; accounts are no longer
+    // bound to one instrument, so it is not produced.
     InstrumentMismatch,
     DuplicateClientOrderId,
     MarketStreamMismatch,
@@ -61,32 +64,54 @@ using SimulatedExecutionResult = std::variant<
     SimulatedExecutionError
 >;
 
-struct TopOfBookExecutionRecoveryState {
-    std::string account_id;
-    InstrumentId instrument;
-    std::optional<TopOfBookEvent> active_market;
+// One account's simulated use of one instrument's displayed liquidity: the
+// observation of the instrument's latest execution and the bid and ask
+// quantity the account's orders have taken from it. Another account, or
+// another instrument, never shares these counters.
+struct InstrumentExecutionState {
+    TopOfBookEvent active_market;
     Quantity consumed_bid_quantity;
     Quantity consumed_ask_quantity;
+
+    friend bool operator==(
+        const InstrumentExecutionState&,
+        const InstrumentExecutionState&
+    ) = default;
+};
+
+// Every instrument an account has executed, ordered by instrument.
+using InstrumentExecutionStates =
+    std::map<InstrumentId, InstrumentExecutionState>;
+
+struct TopOfBookExecutionRecoveryState {
+    std::string account_id;
+    InstrumentExecutionStates instruments;
+    // Client order IDs are unique across the whole account.
     std::vector<std::string> processed_client_order_ids;
 };
 
-// An account's executions follow one market-data stream forward: the same
-// stream, a non-decreasing ingest sequence, and one state per sequence.
-// Returns the rule `market` breaks relative to the account's last execution
-// market, if any. Anything that uses a market observation on the account's
-// behalf, not only execution, must continue the same timeline.
+// An account's executions follow one market-data stream forward. The first
+// execution binds the account to its stream; every instrument must then
+// execute on that stream, and within one instrument the ingest sequence must
+// not decrease and one sequence identifies one state. Instruments may be
+// observed at different sequences: an instrument's current quote can be
+// older than another's. Returns the rule `market` breaks, if any. Anything
+// that uses a market observation on the account's behalf, not only
+// execution, must continue the same timeline.
 [[nodiscard]] std::optional<SimulatedExecutionErrorCode>
 market_lineage_violation(
-    const std::optional<TopOfBookEvent>& active_market,
+    const InstrumentExecutionStates& executions,
     const TopOfBookEvent& market
+);
+
+// The stream an account is bound to; absent before its first execution.
+[[nodiscard]] std::optional<MarketDataStreamId> bound_market_stream(
+    const InstrumentExecutionStates& executions
 );
 
 class TopOfBookExecutionSimulator final {
 public:
-    TopOfBookExecutionSimulator(
-        std::string account_id,
-        InstrumentId instrument
-    );
+    explicit TopOfBookExecutionSimulator(std::string account_id);
 
     TopOfBookExecutionSimulator(const TopOfBookExecutionSimulator&) = delete;
     TopOfBookExecutionSimulator& operator=(
@@ -103,14 +128,10 @@ public:
         return account_id_;
     }
 
-    [[nodiscard]] const InstrumentId& instrument() const noexcept {
-        return instrument_;
-    }
-
-    // The observation of the latest execution; absent before the first.
-    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+    // Per-instrument execution state; empty before the first execution.
+    [[nodiscard]] const InstrumentExecutionStates& instruments()
         const noexcept {
-        return active_market_;
+        return instruments_;
     }
 
     [[nodiscard]] TopOfBookExecutionRecoveryState recovery_state() const;
@@ -124,10 +145,7 @@ public:
 
 private:
     std::string account_id_;
-    InstrumentId instrument_;
-    std::optional<TopOfBookEvent> active_market_;
-    Quantity consumed_bid_quantity_;
-    Quantity consumed_ask_quantity_;
+    InstrumentExecutionStates instruments_;
     std::unordered_set<std::string> processed_client_order_ids_;
 };
 

@@ -91,7 +91,8 @@ export function recordedOutcomeLabel(code: string): string {
 // data, valuation, and request parsing. Unknown ones are shown verbatim.
 const REASON: Readonly<Record<string, string>> = {
   // Pre-trade risk
-  instrument_mismatch: "The order instrument differs from the account's",
+  // Recorded only before accounts could hold several instruments.
+  instrument_mismatch: "The order instrument differed from the account's single instrument",
   nonpositive_quantity: 'Quantity must be positive',
   nonpositive_limit_price: 'Limit price must be positive',
   missing_limit_price: 'A limit order needs a limit price',
@@ -128,6 +129,7 @@ const REASON: Readonly<Record<string, string>> = {
   market_instrument_mismatch: 'The quote is for another instrument',
   nonpositive_starting_cash: 'The account has no positive starting cash',
   accounting_identity_failed: 'The valuation did not reconcile',
+  position_mark_unavailable: 'A held position has no usable quote',
   // Request parsing
   invalid_identifier: 'Use 1–64 letters, digits, ".", "_" or "-", starting with a letter or digit',
   too_many_fractional_digits: 'Too many decimal places for this field',
@@ -179,7 +181,7 @@ export const FAILURE: Readonly<Record<FailureCategory, FailureDescription>> = {
   },
   market_data_unavailable: {
     title: 'Market data unavailable',
-    detail: 'The server has no usable quote for this account right now. Nothing was recorded.',
+    detail: 'The server has no usable quote for this right now. Nothing was recorded.',
   },
   valuation_failed: {
     title: 'The portfolio could not be valued exactly',

@@ -13,7 +13,8 @@ namespace {
 
 constexpr std::string_view kBase64UrlAlphabet =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-constexpr std::string_view kVersion = "v1";
+constexpr std::string_view kUnfilteredVersion = "v1";
+constexpr std::string_view kFilteredVersion = "v2";
 constexpr char kSeparator = '|';
 
 std::string_view kind_name(HistoryCursorKind kind) {
@@ -99,14 +100,19 @@ std::optional<std::string_view> take_field(std::string_view& remaining) {
 std::string encode_history_cursor(
     HistoryCursorKind kind,
     std::string_view account_id,
+    std::optional<std::string_view> instrument,
     std::int64_t before_record_id
 ) {
-    std::string payload(kVersion);
+    std::string payload(instrument ? kFilteredVersion : kUnfilteredVersion);
     payload += kSeparator;
     payload += kind_name(kind);
     payload += kSeparator;
     payload += account_id;
     payload += kSeparator;
+    if (instrument) {
+        payload += *instrument;
+        payload += kSeparator;
+    }
     payload += std::to_string(before_record_id);
     return base64url_encode(payload);
 }
@@ -114,7 +120,8 @@ std::string encode_history_cursor(
 std::optional<std::int64_t> decode_history_cursor(
     std::string_view cursor,
     HistoryCursorKind kind,
-    std::string_view account_id
+    std::string_view account_id,
+    std::optional<std::string_view> instrument
 ) {
     if (cursor.empty() || cursor.size() > kMaximumHistoryCursorLength) {
         return std::nullopt;
@@ -128,8 +135,11 @@ std::optional<std::int64_t> decode_history_cursor(
     const auto version = take_field(remaining);
     const auto encoded_kind = take_field(remaining);
     const auto encoded_account = take_field(remaining);
-    if (version != kVersion || encoded_kind != kind_name(kind) ||
-        encoded_account != account_id) {
+    if (version != (instrument ? kFilteredVersion : kUnfilteredVersion) ||
+        encoded_kind != kind_name(kind) || encoded_account != account_id) {
+        return std::nullopt;
+    }
+    if (instrument && take_field(remaining) != *instrument) {
         return std::nullopt;
     }
     return parse_record_id(remaining);

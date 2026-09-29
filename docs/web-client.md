@@ -12,8 +12,8 @@ The API contract it consumes is [paper-trading-api.md](paper-trading-api.md).
 
 ## What it does
 
-- Create a paper account (ID, one of the server's tradeable instruments,
-  starting cash) or open an existing one by ID.
+- Create a paper account (ID and starting cash; it trades every instrument
+  the server offers from that one cash balance) or open an existing one by ID.
 - Show the server's market-data source on every screen: whether it is a
   historical replay or live, its label, state, replay speed, market time,
   and exact event count, with Start, Pause, and Resume for a replay.
@@ -25,16 +25,36 @@ The API contract it consumes is [paper-trading-api.md](paper-trading-api.md).
   never sees or requests provider credentials.
 - Show API and database availability and the stream's state, latest ingest
   sequence, and market time.
-- Show the account's exact portfolio valuation at the best bid, with the
-  quote it was marked against: best bid and ask with size, observation
+- A watchlist of the server's configured instruments: each row's best bid
+  and ask with size, whether an order could execute now (or why not), and the
+  position held. One symbol is selected at a time, with a checked radio
+  button, a highlighted row, and a "Selected" tag; the watchlist, quote
+  detail, and ticket all follow it, and the browser remembers it across
+  reloads. The selected symbol's quote detail shows its observation
   sequence, event and receive times, venue, and quality flags.
-- Submit manual market or limit immediate-or-cancel paper orders, with an
-  inline review before the final submission.
+- Show the account's exact portfolio valuation: equity, total PnL, return,
+  market value, and unrealized PnL; a table of open positions with quantity,
+  average entry, cost basis, mark (best bid), market value, unrealized and
+  realized PnL, and fees; closed positions with what they realized and paid;
+  and the account ledger. Every value is the server's string.
+- Submit manual market or limit immediate-or-cancel paper orders for the
+  selected symbol, chosen in the ticket or the watchlist, with an inline
+  review before the final submission. Once an order is under review its
+  symbol, quote reference, and request are fixed, whatever is selected
+  afterwards.
 - Show each recorded outcome (filled, partially filled, cancelled, rejected,
   faulted) and handle submissions whose outcome is unknown (below).
-- List durable order and fill history with keyset "Load older" pages. Manual
-  and model orders are labelled by source and share one execution path.
-- Remember the selected account across reloads.
+- List durable order and fill history with keyset "Load older" pages, each
+  row showing its symbol, with a per-list symbol filter that asks the server
+  for that symbol's history. Manual and model orders are labelled by source
+  and share one execution path.
+- Remember the selected account and symbol across reloads.
+
+On a desktop the portfolio and market panels are stacked beside the order
+ticket, so the positions and watchlist tables have room for every column; the
+order and fill histories span the full width below. On a phone the panels form
+one column with section links, and every table becomes a card of labelled
+values.
 
 It has no charts, models, authentication, or account list, because the API
 does not provide them yet.
@@ -53,7 +73,8 @@ apps/web/src/
     queries.ts      TanStack Query hooks, keys, and polling intervals
     marketDataStream.tsx  the change stream that invalidates market reads
     orderTicket.ts  ticket lifecycle and uncertain-order reconciliation
-    accountSelection.ts  the only browser-persisted state
+    accountSelection.ts  the browser-persisted account selection
+    instrumentSelection.ts  the browser-persisted selected symbol
   presentation/ one exhaustive mapping from backend vocabulary to text
   components/   presentation only: shell, source, account, workspace, ticket,
                 history
@@ -117,10 +138,17 @@ A value the server cannot provide is shown as unavailable, never as zero.
 
 - When the portfolio cannot be valued (`market_data_unavailable` or
   `valuation_failed`), equity, PnL, market value, and return are shown as
-  unavailable with the server's reason, including a disconnected live feed
-  (`source_unavailable`) or one still waiting for a fresh quote
-  (`awaiting_fresh_quote`). The ledger values (cash, position,
-  cost basis, realized PnL, fees) then come from the account resource.
+  unavailable with the server's reason. When held positions have no usable
+  mark (`position_mark_unavailable`), every such symbol is listed with its
+  own reason, such as a disconnected live feed (`source_unavailable`) or one
+  still waiting for a fresh quote (`awaiting_fresh_quote`). The ledger values
+  (cash, each position's quantity, cost basis, realized PnL, and fees) then
+  come from the account resource, while each position's mark, market value,
+  and unrealized PnL read "Unavailable".
+- A watchlist symbol without a usable quote shows its reason instead of a
+  price. The ticket blocks review and resubmission while that latest market
+  resource explicitly says the symbol is unusable; the server still checks
+  the quote authoritatively when any enabled submission arrives.
 - A failed read shows the failure and a retry button instead of the previous
   values.
 - History tables keep rows already read when a refresh fails, because recorded
@@ -256,15 +284,15 @@ database, credentials, or market data; the live spec is skipped there.
 
 - A completed replay cannot be restarted from the page; restart the server
   and use a new account.
-- A live quote is shown only through the selected account's portfolio, so an
-  instrument without an account shows its availability but not its price.
+- The watchlist shows only the server's configured instruments; there is no
+  symbol search.
 - Change notices are coalesced to at most four per second, so the displayed
   quote can lag the market state by up to 250 ms plus a request.
 - No authentication, and no account list: accounts are opened by ID, and the
   browser remembers only IDs it opened.
-- When the portfolio is unavailable, the quote is too: the API's error does
-  not include the observation, so the ask is not shown when only the bid is
-  missing.
+- When the portfolio is unavailable, no position is marked, including those
+  whose quotes were usable: the valuation is all or nothing. The watchlist
+  still shows each symbol's current quote.
 - Manual orders use the fixed source ID `web-ticket`.
 - No resting orders, cancel/replace, price chart, valuation history, models,
   or experiments.

@@ -10,16 +10,12 @@ namespace chronos {
 
 PaperOrderProcessor::PaperOrderProcessor(
     std::string account_id,
-    InstrumentId instrument,
     Money starting_cash,
     PreTradeRiskLimits risk_limits
 )
     : risk_engine_(risk_limits),
-      account_(account_id, instrument, starting_cash),
-      execution_simulator_(
-          std::move(account_id),
-          std::move(instrument)
-      ) {}
+      account_(account_id, starting_cash),
+      execution_simulator_(std::move(account_id)) {}
 
 PaperOrderProcessorRecoveryState PaperOrderProcessor::recovery_state() const {
     return PaperOrderProcessorRecoveryState{
@@ -39,20 +35,22 @@ PaperOrderProcessor PaperOrderProcessor::restore(
             "recovered account and execution account IDs do not match"
         );
     }
-    if (recovery_state.account.instrument !=
-        recovery_state.execution.instrument) {
-        throw std::invalid_argument(
-            "recovered account and execution instruments do not match"
-        );
+    // A position exists only through a fill, and a fill only through an
+    // execution of the same instrument.
+    for (const auto& [instrument, position] :
+         recovery_state.account.state.positions) {
+        if (!recovery_state.execution.instruments.contains(instrument)) {
+            throw std::invalid_argument(
+                "a recovered position has no execution state"
+            );
+        }
     }
 
     const std::string account_id = recovery_state.account.account_id;
-    const InstrumentId instrument = recovery_state.account.instrument;
     const Money starting_cash =
         recovery_state.account.state.starting_cash;
     PaperOrderProcessor processor(
         account_id,
-        instrument,
         starting_cash,
         recovery_state.risk_limits
     );

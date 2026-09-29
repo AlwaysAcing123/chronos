@@ -53,8 +53,9 @@ parse_create_account_request(std::string_view body);
 [[nodiscard]] std::variant<PaperOrderRequest, MalformedRequest>
 parse_order_request(std::string account_id, std::string_view body);
 
-// Accepts only `limit` and `cursor`, each at most once. Range and cursor
-// validity are the service's rules, so they apply to every transport.
+// Accepts only `limit`, `cursor`, and `instrument`, each at most once. Range,
+// cursor, and identifier validity are the service's rules, so they apply to
+// every transport.
 [[nodiscard]] std::variant<HistoryPageRequest, MalformedRequest>
 parse_history_query(std::string_view query);
 

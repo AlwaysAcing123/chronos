@@ -126,19 +126,16 @@ OrderIntent order(
 
 PaperAccount account_with_position(
     std::string_view position,
-    std::string_view starting_cash = "10000"
+    std::string_view starting_cash = "10000",
+    std::string instrument = "AAPL"
 ) {
-    PaperAccount account(
-        "account-1",
-        InstrumentId("AAPL"),
-        money(starting_cash)
-    );
+    PaperAccount account("account-1", money(starting_cash));
     if (quantity(position).raw() == 0) {
         return account;
     }
     const auto result = account.apply_fill(Fill{
-        .fill_id = "seed-position",
-        .instrument = InstrumentId("AAPL"),
+        .fill_id = "seed-" + instrument,
+        .instrument = InstrumentId(instrument),
         .side = Side::Buy,
         .price = price("10"),
         .quantity = quantity(position),
@@ -147,6 +144,56 @@ PaperAccount account_with_position(
     });
     REQUIRE(std::holds_alternative<chronos::ApplyFillReceipt>(result));
     return account;
+}
+
+void seed(PaperAccount& account, std::string instrument, std::string_view position, std::int64_t time = 1) {
+    const auto result = account.apply_fill(Fill{
+        .fill_id = "seed-" + instrument + "-" + std::to_string(time),
+        .instrument = InstrumentId(std::move(instrument)),
+        .side = Side::Buy,
+        .price = price("10"),
+        .quantity = quantity(position),
+        .fee = Money{},
+        .timestamp = Timestamp::from_nanoseconds(time),
+    });
+    REQUIRE(std::holds_alternative<chronos::ApplyFillReceipt>(result));
+}
+
+OrderIntent instrument_order(
+    std::string id,
+    std::string instrument,
+    Side side = Side::Buy,
+    std::string_view order_quantity = "1",
+    std::int64_t submitted_at = 110
+) {
+    return order(
+        std::move(id),
+        side,
+        order_quantity,
+        OrderType::Market,
+        std::nullopt,
+        OrderSourceKind::Manual,
+        "user-1",
+        submitted_at,
+        "account-1",
+        std::move(instrument)
+    );
+}
+
+TopOfBookEvent instrument_market(
+    std::string instrument,
+    std::uint64_t sequence,
+    std::string stream = "market-stream",
+    std::string_view ask_quantity = "5"
+) {
+    return market(
+        sequence,
+        100,
+        std::move(stream),
+        std::move(instrument),
+        BookLevel{.price = price("99"), .quantity = quantity("5")},
+        BookLevel{.price = price("101"), .quantity = quantity(ask_quantity)}
+    );
 }
 
 ApprovedOrderIntent require_approval(PreTradeRiskDecision decision) {
@@ -205,7 +252,7 @@ void test_configuration_is_validated() {
     REQUIRE_THROWS_AS(PreTradeRiskEngine(limits), std::invalid_argument);
 
     REQUIRE_THROWS_AS(
-        TopOfBookExecutionSimulator("", InstrumentId("AAPL")),
+        TopOfBookExecutionSimulator(""),
         std::invalid_argument
     );
 }
@@ -233,14 +280,8 @@ void test_manual_and_model_orders_share_the_same_path() {
         quote
     ));
 
-    TopOfBookExecutionSimulator manual_simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
-    TopOfBookExecutionSimulator model_simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator manual_simulator("account-1");
+    TopOfBookExecutionSimulator model_simulator("account-1");
     const auto manual_report = require_report(
         manual_simulator.execute(manual)
     );
@@ -264,10 +305,7 @@ void test_limit_orders_obey_price_constraints() {
     const PreTradeRiskEngine risk(standard_limits());
     const TopOfBookEvent quote = market();
 
-    TopOfBookExecutionSimulator buy_simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator buy_simulator("account-1");
     const auto marketable_buy = require_report(buy_simulator.execute(
         require_approval(risk.evaluate(
             order(
@@ -303,10 +341,7 @@ void test_limit_orders_obey_price_constraints() {
         SimulatedCancellationReason::LimitNotMarketable
     );
 
-    TopOfBookExecutionSimulator sell_simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator sell_simulator("account-1");
     const auto marketable_sell = require_report(sell_simulator.execute(
         require_approval(risk.evaluate(
             order(
@@ -346,10 +381,7 @@ void test_displayed_liquidity_is_not_reused_before_a_new_quote() {
     PaperAccount account = account_with_position("0");
     const PreTradeRiskEngine risk(standard_limits());
     const TopOfBookEvent first_quote = market();
-    TopOfBookExecutionSimulator simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator simulator("account-1");
 
     const auto first = require_report(simulator.execute(require_approval(
         risk.evaluate(order("first", Side::Buy, "3"), account, first_quote)
@@ -391,10 +423,7 @@ void test_bid_and_ask_liquidity_are_consumed_independently() {
     const PaperAccount seller = account_with_position("5");
     const PreTradeRiskEngine risk(standard_limits());
     const TopOfBookEvent quote = market();
-    TopOfBookExecutionSimulator simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator simulator("account-1");
 
     const auto buy = require_report(simulator.execute(require_approval(
         risk.evaluate(order("buy", Side::Buy, "5"), buyer, quote)
@@ -418,10 +447,7 @@ void test_duplicate_orders_are_rejected_without_consuming_more_liquidity() {
         account,
         quote
     ));
-    TopOfBookExecutionSimulator simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator simulator("account-1");
 
     require_report(simulator.execute(approved));
     require_execution_error(
@@ -588,7 +614,8 @@ void test_account_and_market_boundaries_are_enforced() {
             account,
             quote
         ),
-        PreTradeRiskErrorCode::InstrumentMismatch
+        // An AAPL quote can never fill an SPY order.
+        PreTradeRiskErrorCode::MarketInstrumentMismatch
     );
     require_rejection(
         risk.evaluate(order("market-mismatch"), account, market(
@@ -755,10 +782,7 @@ void test_fee_zero_notional_and_overflow_rules() {
         .maximum_quote_age_nanoseconds = 1'000,
         .fee_per_fill = Money{},
     });
-    const PaperAccount maximum_account(
-        "account-1",
-        InstrumentId("AAPL"),
-        Money::from_raw(maximum)
+    const PaperAccount maximum_account("account-1", Money::from_raw(maximum)
     );
     const TopOfBookEvent huge_market = market(
         10,
@@ -785,27 +809,12 @@ void test_execution_rejects_wrong_account_instrument_and_market_lineage() {
         market(10)
     ));
 
-    TopOfBookExecutionSimulator wrong_account(
-        "other-account",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator wrong_account("other-account");
     require_execution_error(
         wrong_account.execute(first),
         SimulatedExecutionErrorCode::AccountMismatch
     );
-    TopOfBookExecutionSimulator wrong_instrument(
-        "account-1",
-        InstrumentId("SPY")
-    );
-    require_execution_error(
-        wrong_instrument.execute(first),
-        SimulatedExecutionErrorCode::InstrumentMismatch
-    );
-
-    TopOfBookExecutionSimulator simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator simulator("account-1");
     require_report(simulator.execute(first));
 
     const auto stale = require_approval(risk.evaluate(
@@ -854,10 +863,7 @@ void test_fill_identity_and_metadata_are_deterministic() {
         account,
         market(42)
     ));
-    TopOfBookExecutionSimulator simulator(
-        "account-1",
-        InstrumentId("AAPL")
-    );
+    TopOfBookExecutionSimulator simulator("account-1");
     const auto report = require_report(simulator.execute(approved));
 
     REQUIRE(report.intent.source.kind == OrderSourceKind::Manual);
@@ -867,6 +873,260 @@ void test_fill_identity_and_metadata_are_deterministic() {
     REQUIRE(report.fill->side == Side::Buy);
     REQUIRE(report.unfilled_quantity == Quantity{});
     REQUIRE(!report.cancellation_reason.has_value());
+}
+
+
+void test_each_instrument_has_its_own_displayed_liquidity() {
+    const PaperAccount account = account_with_position("0");
+    const PreTradeRiskEngine risk(standard_limits());
+    TopOfBookExecutionSimulator simulator("account-1");
+    // SPY's current quote may be older than AAPL's: instruments update
+    // independently on one stream.
+    const TopOfBookEvent aapl = instrument_market("AAPL", 10);
+    const TopOfBookEvent spy = instrument_market("SPY", 8);
+
+    const auto aapl_all = require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("aapl-all", "AAPL", Side::Buy, "5"), account, aapl)
+    )));
+    REQUIRE(aapl_all.status == SimulatedExecutionStatus::Filled);
+
+    // Taking every displayed AAPL share leaves SPY's liquidity untouched.
+    const auto spy_first = require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("spy-first", "SPY", Side::Buy, "3"), account, spy)
+    )));
+    REQUIRE(spy_first.status == SimulatedExecutionStatus::Filled);
+    REQUIRE(spy_first.fill->instrument == InstrumentId("SPY"));
+    REQUIRE(spy_first.fill->quantity == quantity("3"));
+
+    const auto aapl_exhausted = require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("aapl-exhausted", "AAPL"), account, aapl)
+    )));
+    REQUIRE(aapl_exhausted.status == SimulatedExecutionStatus::Cancelled);
+
+    // A fresh AAPL quote resets AAPL alone; SPY keeps what it consumed.
+    const TopOfBookEvent aapl_fresh = instrument_market("AAPL", 11);
+    const auto aapl_again = require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("aapl-again", "AAPL", Side::Buy, "5"), account, aapl_fresh)
+    )));
+    REQUIRE(aapl_again.status == SimulatedExecutionStatus::Filled);
+    const auto spy_rest = require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("spy-rest", "SPY", Side::Buy, "3"), account, spy)
+    )));
+    REQUIRE(spy_rest.status == SimulatedExecutionStatus::PartiallyFilledAndCancelled);
+    REQUIRE(spy_rest.fill->quantity == quantity("2"));
+
+    const auto& states = simulator.instruments();
+    REQUIRE(states.size() == 2);
+    REQUIRE(states.at(InstrumentId("AAPL")).active_market.header.ingest_sequence == 11);
+    REQUIRE(states.at(InstrumentId("AAPL")).consumed_ask_quantity == quantity("5"));
+    REQUIRE(states.at(InstrumentId("SPY")).active_market.header.ingest_sequence == 8);
+    REQUIRE(states.at(InstrumentId("SPY")).consumed_ask_quantity == quantity("5"));
+    REQUIRE(states.at(InstrumentId("SPY")).consumed_bid_quantity == Quantity{});
+}
+
+void test_accounts_have_independent_simulated_liquidity() {
+    const PaperAccount first_account = account_with_position("0");
+    PaperAccount second_account("account-2", money("10000"));
+    const PreTradeRiskEngine risk(standard_limits());
+    const TopOfBookEvent quote = instrument_market("AAPL", 10);
+    TopOfBookExecutionSimulator first("account-1");
+    TopOfBookExecutionSimulator second("account-2");
+
+    const auto first_fill = require_report(first.execute(require_approval(
+        risk.evaluate(instrument_order("all", "AAPL", Side::Buy, "5"), first_account, quote)
+    )));
+    OrderIntent second_order = instrument_order("all", "AAPL", Side::Buy, "5");
+    second_order.account_id = "account-2";
+    const auto second_fill = require_report(second.execute(require_approval(
+        risk.evaluate(second_order, second_account, quote)
+    )));
+    REQUIRE(first_fill.fill->quantity == quantity("5"));
+    REQUIRE(second_fill.fill->quantity == quantity("5"));
+}
+
+void test_an_account_executes_every_instrument_on_one_stream() {
+    const PaperAccount account = account_with_position("0");
+    const PreTradeRiskEngine risk(standard_limits());
+    TopOfBookExecutionSimulator simulator("account-1");
+    REQUIRE(!chronos::bound_market_stream(simulator.instruments()).has_value());
+
+    require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("aapl", "AAPL"), account, instrument_market("AAPL", 10))
+    )));
+    REQUIRE(chronos::bound_market_stream(simulator.instruments()) ==
+        MarketDataStreamId("market-stream"));
+
+    require_execution_error(
+        simulator.execute(require_approval(risk.evaluate(
+            instrument_order("spy-other-stream", "SPY"),
+            account,
+            instrument_market("SPY", 20, "other-stream")
+        ))),
+        SimulatedExecutionErrorCode::MarketStreamMismatch
+    );
+    // A first SPY execution at a lower sequence than AAPL's is valid ...
+    require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("spy", "SPY"), account, instrument_market("SPY", 7))
+    )));
+    // ... but SPY cannot then move back to an older SPY observation.
+    require_execution_error(
+        simulator.execute(require_approval(risk.evaluate(
+            instrument_order("spy-stale", "SPY"),
+            account,
+            instrument_market("SPY", 6)
+        ))),
+        SimulatedExecutionErrorCode::StaleMarketApproval
+    );
+    require_execution_error(
+        simulator.execute(require_approval(risk.evaluate(
+            instrument_order("spy-changed", "SPY"),
+            account,
+            instrument_market("SPY", 7, "market-stream", "6")
+        ))),
+        SimulatedExecutionErrorCode::MarketSnapshotMismatch
+    );
+
+    // Recovery requires one stream and matching instrument keys.
+    auto mixed = simulator.recovery_state();
+    mixed.instruments.at(InstrumentId("SPY")).active_market.header.stream =
+        MarketDataStreamId("other-stream");
+    REQUIRE_THROWS_AS(TopOfBookExecutionSimulator::restore(mixed), std::invalid_argument);
+    auto misfiled = simulator.recovery_state();
+    misfiled.instruments.emplace(
+        InstrumentId("QQQ"),
+        misfiled.instruments.at(InstrumentId("SPY"))
+    );
+    REQUIRE_THROWS_AS(TopOfBookExecutionSimulator::restore(misfiled), std::invalid_argument);
+    const auto restored = TopOfBookExecutionSimulator::restore(simulator.recovery_state());
+    REQUIRE(restored.instruments() == simulator.instruments());
+}
+
+void test_client_order_ids_are_unique_across_instruments() {
+    const PaperAccount account = account_with_position("0");
+    const PreTradeRiskEngine risk(standard_limits());
+    TopOfBookExecutionSimulator simulator("account-1");
+    require_report(simulator.execute(require_approval(
+        risk.evaluate(instrument_order("same-id", "AAPL"), account, instrument_market("AAPL", 10))
+    )));
+    require_execution_error(
+        simulator.execute(require_approval(risk.evaluate(
+            instrument_order("same-id", "SPY"),
+            account,
+            instrument_market("SPY", 10)
+        ))),
+        SimulatedExecutionErrorCode::DuplicateClientOrderId
+    );
+    // The rejected SPY attempt consumed no SPY liquidity.
+    REQUIRE(!simulator.instruments().contains(InstrumentId("SPY")));
+}
+
+void test_risk_uses_shared_cash_and_the_ordered_instruments_position() {
+    auto limits = standard_limits();
+    limits.maximum_position_quantity = quantity("10");
+    const PreTradeRiskEngine risk(limits);
+    PaperAccount account = account_with_position("10", "1000");
+    REQUIRE(account.state().cash == money("900"));
+
+    // AAPL is at its limit; SPY's limit is separate.
+    require_rejection(
+        risk.evaluate(instrument_order("aapl-over", "AAPL"), account, instrument_market("AAPL", 10)),
+        PreTradeRiskErrorCode::PositionLimitExceeded
+    );
+    require_approval(risk.evaluate(
+        instrument_order("spy-ok", "SPY", Side::Buy, "8"),
+        account,
+        instrument_market("SPY", 10)
+    ));
+    // Owning AAPL does not allow selling SPY.
+    require_rejection(
+        risk.evaluate(instrument_order("spy-sell", "SPY", Side::Sell), account, instrument_market("SPY", 10)),
+        PreTradeRiskErrorCode::InsufficientPosition
+    );
+    // Cash is shared: $900 remains after AAPL, so 9 SPY at $101 is too much.
+    require_rejection(
+        risk.evaluate(
+            instrument_order("spy-cash", "SPY", Side::Buy, "9"),
+            account,
+            instrument_market("SPY", 10, "market-stream", "10")
+        ),
+        PreTradeRiskErrorCode::InsufficientCash
+    );
+    seed(account, "SPY", "4", 50);
+    require_approval(risk.evaluate(
+        instrument_order("spy-sell-ok", "SPY", Side::Sell, "4"),
+        account,
+        instrument_market("SPY", 10)
+    ));
+}
+
+void test_the_account_timeline_is_ordered_across_instruments() {
+    const PreTradeRiskEngine risk(standard_limits());
+    PaperAccount account = account_with_position("0");
+    seed(account, "AAPL", "1", 200);
+
+    // Submission time is the market clock: an SPY order cannot be placed at
+    // a time before the account's latest AAPL fill.
+    const TopOfBookEvent spy = instrument_market("SPY", 5);
+    require_rejection(
+        risk.evaluate(instrument_order("spy-early", "SPY", Side::Buy, "1", 150), account, spy),
+        PreTradeRiskErrorCode::SubmissionTimestampMovedBackward
+    );
+    // Later market time is fine even though SPY's quote is older than the
+    // AAPL fill, as long as the quote is current.
+    auto quote = spy;
+    quote.header.receive_timestamp = Timestamp::from_nanoseconds(150);
+    quote.header.event_timestamp = Timestamp::from_nanoseconds(149);
+    require_approval(risk.evaluate(
+        instrument_order("spy-now", "SPY", Side::Buy, "1", 210),
+        account,
+        quote
+    ));
+}
+
+void test_risk_rejects_an_order_whose_fill_would_overflow_an_account_total() {
+    constexpr auto kMaximum = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kUnit = 100'000'000;
+    // AAPL's open cost already fills the fixed-point range, paid for by an
+    // equally large realized gain; $300 of the starting cash is unspent.
+    const PaperAccount account = PaperAccount::restore(chronos::PaperAccountRecoveryState{
+        .account_id = "account-1",
+        .state = chronos::AccountState{
+            .starting_cash = Money::from_raw(300 * kUnit),
+            .cash = Money::from_raw(300 * kUnit),
+            .positions = {{
+                InstrumentId("AAPL"),
+                chronos::PositionState{
+                    .quantity = Quantity::from_raw(kUnit),
+                    .open_cost_basis = Money::from_raw(kMaximum),
+                    .gross_realized_pnl = Money::from_raw(kMaximum),
+                    .fees_paid = Money{},
+                    .last_fill_timestamp = Timestamp::from_nanoseconds(1),
+                },
+            }},
+        },
+        .applied_fill_ids = {"seed"},
+    });
+    auto limits = standard_limits();
+    limits.fee_per_fill = Money{};
+    const PreTradeRiskEngine risk(limits);
+    // One SPY share at $101 fits SPY's ledger and the cash, but pushes the
+    // account's total open cost past the fixed-point range: a recorded
+    // rejection, not an accounting fault.
+    const auto decision = risk.evaluate(
+        instrument_order("spy-overflow", "SPY"),
+        account,
+        instrument_market("SPY", 10)
+    );
+    const auto& rejection = require_rejection(
+        decision,
+        PreTradeRiskErrorCode::ArithmeticOverflow
+    );
+    REQUIRE(rejection.field == "quantity");
+    require_approval(risk.evaluate(
+        instrument_order("aapl-sell", "AAPL", Side::Sell),
+        account,
+        instrument_market("AAPL", 10)
+    ));
 }
 
 }  // namespace
@@ -912,5 +1172,12 @@ int main() {
             "deterministic fill metadata",
             test_fill_identity_and_metadata_are_deterministic,
         },
+        {"each instrument has its own liquidity", test_each_instrument_has_its_own_displayed_liquidity},
+        {"accounts have independent liquidity", test_accounts_have_independent_simulated_liquidity},
+        {"one stream across instruments", test_an_account_executes_every_instrument_on_one_stream},
+        {"client order IDs unique across instruments", test_client_order_ids_are_unique_across_instruments},
+        {"shared cash and per-instrument positions", test_risk_uses_shared_cash_and_the_ordered_instruments_position},
+        {"account timeline ordered across instruments", test_the_account_timeline_is_ordered_across_instruments},
+        {"account-total overflow is a risk rejection", test_risk_rejects_an_order_whose_fill_would_overflow_an_account_total},
     });
 }

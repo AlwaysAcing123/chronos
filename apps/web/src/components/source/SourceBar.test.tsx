@@ -7,7 +7,14 @@ import { POLLING_REFRESH_POLICY } from '../../state/refreshPolicy';
 import { createFakeApi } from '../../test/fakeApi';
 import { fakeNoticeStreams } from '../../test/fakeNoticeStream';
 import type { Json } from '../../test/fixtures';
-import { errorJson, IEX_COVERAGE_NOTICE, liveSourceJson, marketDataJson, replaySourceJson } from '../../test/fixtures';
+import {
+  errorJson,
+  IEX_COVERAGE_NOTICE,
+  liveSourceJson,
+  marketDataJson,
+  replaySourceJson,
+  spyMarketJson,
+} from '../../test/fixtures';
 import {
   accountPath,
   rememberSelectedAccount,
@@ -231,7 +238,7 @@ describe('live source bar', () => {
       }),
     });
     renderWithServices(<App />, { api });
-    expect(await screen.findByText('No usable quote for this account')).toBeInTheDocument();
+    expect(await screen.findByText('No usable quote for AAPL')).toBeInTheDocument();
     expect(
       screen.getAllByText('The market-data source is unavailable, so no quote is current').length,
     ).toBeGreaterThan(0);
@@ -246,6 +253,43 @@ describe('change stream', () => {
   it('polls market data slowly only while the stream is open', () => {
     expect(marketInterval(POLLING_REFRESH_POLICY, true)).toBe(15_000);
     expect(marketInterval(POLLING_REFRESH_POLICY, false)).toBe(2_000);
+  });
+
+  it('updates the watchlist quote of the instrument that changed on a notice', async () => {
+    rememberSelectedAccount();
+    const api = createFakeApi();
+    serveAccount(api);
+    let spyAsk = '769.78';
+    api.on('GET', '/api/v1/market-data', () => ({
+      status: 200,
+      body: {
+        market_data: marketDataJson({
+          quotes: { SPY: spyMarketJson({ ingest_sequence: spyAsk === '769.78' ? '121302' : '121303', ask: { price: spyAsk, quantity: '340' } }) },
+        }),
+      },
+    }));
+    const notices = fakeNoticeStreams();
+    renderWithServices(<App />, { api, openNoticeStream: notices.open });
+    const watchlist = await screen.findByRole('region', { name: 'Watchlist' });
+    const spyRow = () => within(watchlist).getByRole('row', { name: /^SPY/ });
+    const aaplRow = () => within(watchlist).getByRole('row', { name: /^AAPL/ });
+    await waitFor(() => {
+      expect(spyRow()).toHaveTextContent('769.78 × 340');
+    });
+    act(() => {
+      notices.streams[0]?.open();
+    });
+    await screen.findByText(/^Streaming changes/);
+
+    spyAsk = '769.8';
+    act(() => {
+      notices.streams[0]?.notice('9');
+    });
+    await waitFor(() => {
+      expect(spyRow()).toHaveTextContent('769.8 × 340');
+    });
+    // AAPL's row is unchanged.
+    expect(aaplRow()).toHaveTextContent('337 × 4');
   });
 
   it('refreshes market-dependent reads on each notice, not durable history', async () => {

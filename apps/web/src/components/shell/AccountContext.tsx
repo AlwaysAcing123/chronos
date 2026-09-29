@@ -9,7 +9,15 @@ export function AccountContext({ accountId, onSwitch }: { readonly accountId: st
     <div className={styles.accountContext}>
       <span className={styles.accountLabel}>Paper account</span>
       <span className={styles.accountId}>{accountId}</span>
-      {account.status === 'success' && <span className={styles.instrument}>{account.data.instrument}</span>}
+      {account.status === 'success' && (
+        <span className={styles.positionCount}>
+          {account.data.positions.length === 0
+            ? 'No open positions'
+            : account.data.positions.length === 1
+              ? '1 open position'
+              : `${String(account.data.positions.length)} open positions`}
+        </span>
+      )}
       <Button variant="quiet" onClick={onSwitch}>
         Switch account
       </Button>

@@ -535,6 +535,8 @@ std::string_view valuation_reason(PortfolioValuationErrorCode code) {
             return "arithmetic_overflow";
         case PortfolioValuationErrorCode::AccountingIdentityFailed:
             return "accounting_identity_failed";
+        case PortfolioValuationErrorCode::PositionMarkUnavailable:
+            return "position_mark_unavailable";
     }
     throw std::logic_error("unknown portfolio valuation error");
 }
@@ -551,6 +553,21 @@ std::string_view market_state_reason(MarketStateUnavailableCode code) {
             return "awaiting_fresh_quote";
     }
     throw std::logic_error("unknown market-state unavailability");
+}
+
+// Why one position cannot be marked, in the same vocabulary as a whole
+// response's reason.
+std::string_view mark_failure_reason(const PositionMarkFailure& failure) {
+    return std::visit(
+        [](auto code) -> std::string_view {
+            if constexpr (std::is_same_v<decltype(code), MarketStateUnavailableCode>) {
+                return market_state_reason(code);
+            } else {
+                return valuation_reason(code);
+            }
+        },
+        failure.reason
+    );
 }
 
 ResponseJson nullable(std::optional<std::string> value) {
@@ -644,29 +661,76 @@ std::string_view account_status(const PaperAccountView& account) {
     return account.is_healthy ? "active" : "halted";
 }
 
-// Average entry price is undefined without a position.
-ResponseJson average_entry_price_json(const AccountState& state) {
-    return state.position.raw() == 0
-        ? ResponseJson(nullptr)
-        : ResponseJson(state.average_entry_price().to_string());
+ResponseJson market_stream_id_json(
+    const std::optional<MarketDataStreamId>& stream
+) {
+    return stream ? ResponseJson(stream->value()) : ResponseJson(nullptr);
 }
 
+// An open position's ledger. Average entry price is defined because the
+// position is open.
+ResponseJson open_position_json(
+    const InstrumentId& instrument,
+    const PositionState& position
+) {
+    ResponseJson json = ResponseJson::object();
+    json["instrument"] = instrument.value();
+    json["quantity"] = position.quantity.to_string();
+    json["open_cost_basis"] = position.open_cost_basis.to_string();
+    json["average_entry_price"] = position.average_entry_price().to_string();
+    json["gross_realized_pnl"] = position.gross_realized_pnl.to_string();
+    json["fees_paid"] = position.fees_paid.to_string();
+    json["last_fill_at"] = format_timestamp(position.last_fill_timestamp);
+    return json;
+}
+
+// A closed position keeps what it realized and paid; it has no quantity,
+// cost basis, entry price, or mark.
+ResponseJson closed_position_json(
+    const InstrumentId& instrument,
+    const PositionState& position
+) {
+    ResponseJson json = ResponseJson::object();
+    json["instrument"] = instrument.value();
+    json["gross_realized_pnl"] = position.gross_realized_pnl.to_string();
+    json["fees_paid"] = position.fees_paid.to_string();
+    json["last_fill_at"] = format_timestamp(position.last_fill_timestamp);
+    return json;
+}
+
+ResponseJson closed_positions_json(const AccountState& state) {
+    ResponseJson closed = ResponseJson::array();
+    for (const auto& [instrument, position] : state.positions) {
+        if (!position.is_open()) {
+            closed.push_back(closed_position_json(instrument, position));
+        }
+    }
+    return closed;
+}
+
+// Account totals are sums over every ledger, open or closed.
 ResponseJson account_json(const PaperAccountView& account) {
     const AccountState& state = account.state;
+    ResponseJson positions = ResponseJson::array();
+    for (const auto& [instrument, position] : state.positions) {
+        if (position.is_open()) {
+            positions.push_back(open_position_json(instrument, position));
+        }
+    }
     ResponseJson json = ResponseJson::object();
     json["trading_mode"] = "paper";
     json["account_id"] = account.account_id;
-    json["instrument"] = account.instrument.value();
     json["version"] = std::to_string(account.version);
     json["status"] = account_status(account);
+    json["market_stream_id"] = market_stream_id_json(account.market_stream);
     json["starting_cash"] = state.starting_cash.to_string();
     json["cash"] = state.cash.to_string();
-    json["position"] = state.position.to_string();
-    json["open_cost_basis"] = state.open_cost_basis.to_string();
-    json["average_entry_price"] = average_entry_price_json(state);
-    json["gross_realized_pnl"] = state.gross_realized_pnl.to_string();
-    json["fees_paid"] = state.fees_paid.to_string();
-    json["last_fill_at"] = optional_timestamp(state.last_fill_timestamp);
+    json["open_cost_basis"] = state.open_cost_basis().to_string();
+    json["gross_realized_pnl"] = state.gross_realized_pnl().to_string();
+    json["fees_paid"] = state.fees_paid().to_string();
+    json["last_fill_at"] = optional_timestamp(state.latest_fill_timestamp());
+    json["positions"] = std::move(positions);
+    json["closed_positions"] = closed_positions_json(state);
     json["risk_limits"] = risk_limits_json(account.risk_limits);
     return json;
 }
@@ -1002,35 +1066,47 @@ std::optional<std::string> market_unavailable_reason(
     return std::nullopt;
 }
 
-// Mark-to-market at the best bid; see docs/paper-trading-api.md.
+// Mark-to-market at the best bid; see docs/paper-trading-api.md. Every
+// value is computed by the server; the client displays them as given.
 ResponseJson portfolio_json(const PaperPortfolioView& portfolio) {
     const PaperAccountView& account = portfolio.account;
     const PortfolioValuation& valuation = portfolio.valuation;
     const AccountSnapshot& snapshot = valuation.snapshot;
     const AccountState& state = snapshot.state;
 
+    ResponseJson positions = ResponseJson::array();
+    for (const PositionSnapshot& position : snapshot.open_positions) {
+        ResponseJson item = open_position_json(
+            position.instrument,
+            position.position
+        );
+        item["mark_price"] = position.mark_price.to_string();
+        item["market"] = market_json(valuation.marks.at(position.instrument));
+        item["market_value"] = position.market_value.to_string();
+        item["unrealized_pnl"] = position.gross_unrealized_pnl.to_string();
+        positions.push_back(std::move(item));
+    }
+
     ResponseJson json = ResponseJson::object();
     json["trading_mode"] = "paper";
     json["account_id"] = account.account_id;
-    json["instrument"] = account.instrument.value();
     json["account_version"] = std::to_string(account.version);
     json["status"] = account_status(account);
-    json["valued_at"] = format_timestamp(valuation.valued_at);
+    json["market_stream_id"] = market_stream_id_json(account.market_stream);
+    json["valued_at"] = optional_timestamp(valuation.valued_at);
     json["mark_policy"] = "best_bid";
-    json["mark_price"] = snapshot.mark_price.to_string();
-    json["market"] = market_json(valuation.market);
     json["starting_cash"] = state.starting_cash.to_string();
     json["cash"] = state.cash.to_string();
-    json["position"] = state.position.to_string();
-    json["open_cost_basis"] = state.open_cost_basis.to_string();
-    json["average_entry_price"] = average_entry_price_json(state);
-    json["position_market_value"] = snapshot.market_value.to_string();
+    json["open_cost_basis"] = snapshot.open_cost_basis.to_string();
+    json["market_value"] = snapshot.market_value.to_string();
     json["unrealized_pnl"] = snapshot.gross_unrealized_pnl.to_string();
-    json["gross_realized_pnl"] = state.gross_realized_pnl.to_string();
-    json["fees_paid"] = state.fees_paid.to_string();
+    json["gross_realized_pnl"] = snapshot.gross_realized_pnl.to_string();
+    json["fees_paid"] = snapshot.fees_paid.to_string();
     json["total_pnl"] = snapshot.net_total_pnl.to_string();
     json["equity"] = snapshot.equity.to_string();
     json["return_percent"] = valuation.return_percent.to_string();
+    json["positions"] = std::move(positions);
+    json["closed_positions"] = closed_positions_json(state);
     return json;
 }
 
@@ -1086,6 +1162,8 @@ ResponseJson market_data_json(const MarketDataView& view) {
         item["unavailable_reason"] = instrument.unavailable
             ? ResponseJson(std::string(market_state_reason(*instrument.unavailable)))
             : ResponseJson(nullptr);
+        item["quote"] = instrument.quote ? market_json(*instrument.quote)
+                                         : ResponseJson(nullptr);
         instruments.push_back(std::move(item));
     }
     ResponseJson json = ResponseJson::object();
@@ -1158,14 +1236,30 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 failure.message,
                 nonempty(failure.field)
             );
-        case PaperTradingErrorCode::MarketDataUnavailable:
-            return error_response(
-                503,
+        case PaperTradingErrorCode::MarketDataUnavailable: {
+            ResponseJson body = ResponseJson::object();
+            body["error"] = error_json(
                 "market_data_unavailable",
                 failure.message,
                 std::nullopt,
                 market_unavailable_reason(failure)
             );
+            // Every open position that could not be marked, not only the
+            // first, so a client can say which symbols lack a usable quote.
+            if (failure.valuation ==
+                PortfolioValuationErrorCode::PositionMarkUnavailable) {
+                ResponseJson instruments = ResponseJson::array();
+                for (const PositionMarkFailure& mark : failure.instruments) {
+                    ResponseJson item = ResponseJson::object();
+                    item["instrument"] = mark.instrument.value();
+                    item["reason"] = mark_failure_reason(mark);
+                    item["message"] = mark.message;
+                    instruments.push_back(std::move(item));
+                }
+                body["error"]["instruments"] = std::move(instruments);
+            }
+            return json_response(503, body);
+        }
         case PaperTradingErrorCode::DuplicateClientOrderId:
             return error_response(
                 409,
@@ -1231,18 +1325,16 @@ parse_create_account_request(std::string_view body) {
     FieldReader fields(
         std::get<RequestJson>(document),
         "",
-        {"account_id", "instrument", "starting_cash"},
+        {"account_id", "starting_cash"},
         error
     );
     auto account_id = fields.string("account_id");
-    auto instrument = fields.string("instrument");
     const auto starting_cash = fields.decimal<Money>("starting_cash");
     if (error) {
         return *error;
     }
     return CreatePaperAccountRequest{
         .account_id = std::move(*account_id),
-        .instrument = std::move(*instrument),
         .starting_cash = *starting_cash,
     };
 }
@@ -1312,7 +1404,7 @@ std::variant<PaperOrderRequest, MalformedRequest> parse_order_request(
 std::variant<HistoryPageRequest, MalformedRequest> parse_history_query(
     std::string_view query
 ) {
-    auto parsed = parse_query(query, {"limit", "cursor"});
+    auto parsed = parse_query(query, {"limit", "cursor", "instrument"});
     if (auto* invalid = std::get_if<MalformedRequest>(&parsed)) {
         return std::move(*invalid);
     }
@@ -1321,6 +1413,10 @@ std::variant<HistoryPageRequest, MalformedRequest> parse_history_query(
          std::get<std::vector<QueryParameter>>(parsed)) {
         if (parameter.name == "cursor") {
             request.cursor = std::move(parameter.value);
+            continue;
+        }
+        if (parameter.name == "instrument") {
+            request.instrument = std::move(parameter.value);
             continue;
         }
         request.limit = parse_limit(parameter.value);

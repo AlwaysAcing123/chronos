@@ -1,5 +1,6 @@
 #pragma once
 
+#include "chronos/market_quotes.hpp"
 #include "chronos/market_replay.hpp"
 
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <set>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace chronos {
 
@@ -17,21 +19,6 @@ namespace chronos {
 struct ExecutionQuote {
     TopOfBookEvent top_of_book;
     Timestamp market_time;
-};
-
-enum class MarketStateUnavailableCode {
-    StreamInterrupted,
-    NoTopOfBook,
-    // The active source cannot establish that its last quote is current.
-    SourceUnavailable,
-    // A source resumed and has not yet delivered a quote for the instrument,
-    // so the last one describes the market before the gap.
-    AwaitingFreshQuote,
-};
-
-struct MarketStateUnavailable {
-    MarketStateUnavailableCode code;
-    std::string message;
 };
 
 using ExecutionQuoteResult = std::variant<
@@ -111,6 +98,12 @@ public:
 
     [[nodiscard]] MarketStateStatus status() const;
 
+    // The execution quote of each instrument and the market clock, all read
+    // under one lock, so valuing several positions uses one instant.
+    [[nodiscard]] MarketQuotes quotes(
+        const std::vector<InstrumentId>& instruments
+    ) const;
+
     // Advances market time without an event; it may stay equal but never
     // move backward. Only a live source calls this.
     [[nodiscard]] std::optional<MarketStateUpdateError> advance_time(
@@ -125,6 +118,9 @@ public:
     void resume();
 
 private:
+    [[nodiscard]] std::variant<TopOfBookEvent, MarketStateUnavailable>
+    quote_locked(const InstrumentId& instrument) const;
+
     mutable std::mutex mutex_;
     MarketReplay replay_;
     std::optional<MarketReplayError> interruption_;

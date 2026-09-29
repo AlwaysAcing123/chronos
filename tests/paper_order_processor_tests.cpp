@@ -118,16 +118,32 @@ OrderIntent order(
     };
 }
 
+TopOfBookEvent spy_market(
+    std::uint64_t sequence,
+    std::int64_t receive_timestamp,
+    std::string_view ask_quantity = "5"
+) {
+    TopOfBookEvent quote = market(sequence, receive_timestamp, "499", "5", "501", ask_quantity);
+    quote.header.instrument = InstrumentId("SPY");
+    return quote;
+}
+
+OrderIntent spy_order(
+    std::string client_order_id,
+    Side side,
+    std::string_view order_quantity,
+    std::int64_t submitted_at
+) {
+    OrderIntent intent = order(std::move(client_order_id), side, order_quantity, submitted_at);
+    intent.instrument = InstrumentId("SPY");
+    return intent;
+}
+
 PaperOrderProcessor processor(
     Money starting_cash = money("1000"),
     PreTradeRiskLimits limits = risk_limits()
 ) {
-    return PaperOrderProcessor(
-        "account-1",
-        InstrumentId("AAPL"),
-        starting_cash,
-        limits
-    );
+    return PaperOrderProcessor("account-1", starting_cash, limits);
 }
 
 PaperOrderReceipt require_receipt(PaperOrderResult result) {
@@ -173,11 +189,8 @@ const PaperOrderProcessingError& require_processing_error(
 void require_empty_account(const AccountState& state) {
     REQUIRE(state.starting_cash == money("1000"));
     REQUIRE(state.cash == money("1000"));
-    REQUIRE(state.position == Quantity{});
-    REQUIRE(state.open_cost_basis == Money{});
-    REQUIRE(state.gross_realized_pnl == Money{});
-    REQUIRE(state.fees_paid == Money{});
-    REQUIRE(!state.last_fill_timestamp.has_value());
+    REQUIRE(state.positions.empty());
+    REQUIRE(!state.latest_fill_timestamp().has_value());
 }
 
 void test_filled_buy_is_booked_and_reconciles() {
@@ -204,15 +217,15 @@ void test_filled_buy_is_booked_and_reconciles() {
     REQUIRE(receipt.accounting->fill == *receipt.execution.fill);
     REQUIRE(receipt.accounting->notional == money("303"));
     REQUIRE(receipt.account_after.cash == money("696.99"));
-    REQUIRE(receipt.account_after.position == quantity("3"));
-    REQUIRE(receipt.account_after.open_cost_basis == money("303"));
-    REQUIRE(receipt.account_after.fees_paid == money("0.01"));
+    REQUIRE(receipt.account_after.quantity(InstrumentId("AAPL")) == quantity("3"));
+    REQUIRE(receipt.account_after.open_cost_basis() == money("303"));
+    REQUIRE(receipt.account_after.fees_paid() == money("0.01"));
     REQUIRE(
-        receipt.account_after.last_fill_timestamp ==
+        receipt.account_after.latest_fill_timestamp() ==
         Timestamp::from_nanoseconds(110)
     );
 
-    const auto snapshot = engine.account().snapshot(price("100"));
+    const auto snapshot = engine.account().snapshot({{InstrumentId("AAPL"), price("100")}});
     REQUIRE(snapshot.market_value == money("300"));
     REQUIRE(snapshot.gross_unrealized_pnl == money("-3"));
     REQUIRE(snapshot.gross_total_pnl == money("-3"));
@@ -238,12 +251,12 @@ void test_buy_then_sell_updates_realized_and_unrealized_pnl() {
     REQUIRE(sale.execution.fill->price == price("103"));
     REQUIRE(sale.accounting->gross_realized_pnl_change == money("2"));
     REQUIRE(sale.account_after.cash == money("900.98"));
-    REQUIRE(sale.account_after.position == quantity("1"));
-    REQUIRE(sale.account_after.open_cost_basis == money("101"));
-    REQUIRE(sale.account_after.gross_realized_pnl == money("2"));
-    REQUIRE(sale.account_after.fees_paid == money("0.02"));
+    REQUIRE(sale.account_after.quantity(InstrumentId("AAPL")) == quantity("1"));
+    REQUIRE(sale.account_after.open_cost_basis() == money("101"));
+    REQUIRE(sale.account_after.gross_realized_pnl() == money("2"));
+    REQUIRE(sale.account_after.fees_paid() == money("0.02"));
 
-    const auto snapshot = engine.account().snapshot(price("102"));
+    const auto snapshot = engine.account().snapshot({{InstrumentId("AAPL"), price("102")}});
     REQUIRE(snapshot.market_value == money("102"));
     REQUIRE(snapshot.gross_unrealized_pnl == money("1"));
     REQUIRE(snapshot.gross_total_pnl == money("3"));
@@ -274,9 +287,9 @@ void test_partial_fill_books_only_the_executed_quantity() {
     );
     REQUIRE(receipt.accounting->notional == money("505"));
     REQUIRE(receipt.account_after.cash == money("494.99"));
-    REQUIRE(receipt.account_after.position == quantity("5"));
-    REQUIRE(receipt.account_after.open_cost_basis == money("505"));
-    REQUIRE(receipt.account_after.fees_paid == money("0.01"));
+    REQUIRE(receipt.account_after.quantity(InstrumentId("AAPL")) == quantity("5"));
+    REQUIRE(receipt.account_after.open_cost_basis() == money("505"));
+    REQUIRE(receipt.account_after.fees_paid() == money("0.01"));
 }
 
 void test_cancelled_order_does_not_change_the_account() {
@@ -322,7 +335,7 @@ void test_risk_rejection_reserves_nothing_and_can_be_retried() {
         market(11, 109)
     ));
     REQUIRE(accepted.execution.status == SimulatedExecutionStatus::Filled);
-    REQUIRE(accepted.account_after.position == quantity("1"));
+    REQUIRE(accepted.account_after.quantity(InstrumentId("AAPL")) == quantity("1"));
 }
 
 void test_submission_time_cannot_move_behind_account_time() {
@@ -337,16 +350,16 @@ void test_submission_time_cannot_move_behind_account_time() {
         engine.submit(retryable, market(11, 108)),
         PreTradeRiskErrorCode::SubmissionTimestampMovedBackward
     );
-    REQUIRE(engine.account().state().position == quantity("1"));
+    REQUIRE(engine.account().state().quantity(InstrumentId("AAPL")) == quantity("1"));
 
     retryable.submitted_at = Timestamp::from_nanoseconds(110);
     const auto accepted = require_receipt(engine.submit(
         retryable,
         market(11, 108)
     ));
-    REQUIRE(accepted.account_after.position == quantity("2"));
+    REQUIRE(accepted.account_after.quantity(InstrumentId("AAPL")) == quantity("2"));
     REQUIRE(
-        accepted.account_after.last_fill_timestamp ==
+        accepted.account_after.latest_fill_timestamp() ==
         Timestamp::from_nanoseconds(110)
     );
 }
@@ -355,19 +368,19 @@ void test_duplicate_filled_order_cannot_change_account_twice() {
     PaperOrderProcessor engine = processor();
     const OrderIntent intent = order("once", Side::Buy, "2", 110);
     const auto first = require_receipt(engine.submit(intent, market(10, 100)));
-    REQUIRE(first.account_after.position == quantity("2"));
+    REQUIRE(first.account_after.quantity(InstrumentId("AAPL")) == quantity("2"));
     const Money cash_after_first = first.account_after.cash;
 
     require_execution_error(
         engine.submit(intent, market(10, 100)),
         SimulatedExecutionErrorCode::DuplicateClientOrderId
     );
-    REQUIRE(engine.account().state().position == quantity("2"));
+    REQUIRE(engine.account().state().quantity(InstrumentId("AAPL")) == quantity("2"));
     REQUIRE(engine.account().state().cash == cash_after_first);
     REQUIRE(engine.is_healthy());
 }
 
-void test_accounting_invariant_failure_halts_the_processor() {
+void test_overflowing_sale_is_a_risk_rejection() {
     const auto maximum = std::numeric_limits<std::int64_t>::max();
     const PreTradeRiskLimits maximum_limits{
         .maximum_order_quantity = quantity("10"),
@@ -384,25 +397,52 @@ void test_accounting_invariant_failure_halts_the_processor() {
         order("buy-before-overflow", Side::Buy, "1", 110),
         market(10, 100, "0.9", "5", "1", "5")
     ));
+    const AccountState state_before = engine.account().state();
+
+    // The sale's proceeds would overflow cash. Risk previews the fill
+    // through accounting, so the order is rejected and the processor stays
+    // healthy instead of faulting.
+    require_risk_rejection(
+        engine.submit(
+            order("overflowing-sale", Side::Sell, "1", 130),
+            market(11, 120, "2", "5", "2.1", "5")
+        ),
+        PreTradeRiskErrorCode::ArithmeticOverflow
+    );
+    REQUIRE(engine.is_healthy());
+    REQUIRE(engine.account().state() == state_before);
+}
+
+void test_accounting_invariant_failure_halts_the_processor() {
+    PaperOrderProcessor seeded = processor();
+    require_receipt(seeded.submit(
+        order("seed", Side::Buy, "1", 110),
+        market(10, 100)
+    ));
+    // A recovered state in which accounting already applied the fill the
+    // next execution will produce: execution and accounting disagree, the
+    // defensive case the halt exists for.
+    auto state = seeded.recovery_state();
+    state.account.applied_fill_ids.push_back("conflict:fill:0");
+    PaperOrderProcessor engine = PaperOrderProcessor::restore(std::move(state));
     const AccountState state_before_failure = engine.account().state();
 
-    const PaperOrderResult failed_sale = engine.submit(
-        order("overflowing-sale", Side::Sell, "1", 130),
-        market(11, 120, "2", "5", "2.1", "5")
+    const PaperOrderResult failed = engine.submit(
+        order("conflict", Side::Buy, "1", 120),
+        market(11, 110)
     );
     const auto& invariant_error = require_processing_error(
-        failed_sale,
+        failed,
         PaperOrderProcessingErrorCode::AccountingInvariantViolation
     );
     REQUIRE(invariant_error.execution.has_value());
     REQUIRE(invariant_error.accounting_error.has_value());
     REQUIRE(
         invariant_error.accounting_error->code ==
-        ApplyFillErrorCode::ArithmeticOverflow
+        ApplyFillErrorCode::DuplicateFill
     );
     REQUIRE(!engine.is_healthy());
-    REQUIRE(engine.account().state().cash == state_before_failure.cash);
-    REQUIRE(engine.account().state().position == state_before_failure.position);
+    REQUIRE(engine.account().state() == state_before_failure);
 
     const PaperOrderResult halted_result = engine.submit(
         order("after-fault", Side::Buy, "1", 140),
@@ -424,7 +464,7 @@ void test_recovery_preserves_account_and_execution_state() {
     const auto saved_state = engine.recovery_state();
     REQUIRE(saved_state.account.applied_fill_ids.size() == 1);
     REQUIRE(saved_state.execution.processed_client_order_ids.size() == 1);
-    REQUIRE(saved_state.execution.consumed_ask_quantity == quantity("3"));
+    REQUIRE(saved_state.execution.instruments.at(InstrumentId("AAPL")).consumed_ask_quantity == quantity("3"));
     PaperOrderProcessor recovered = PaperOrderProcessor::restore(saved_state);
 
     require_execution_error(
@@ -441,10 +481,10 @@ void test_recovery_preserves_account_and_execution_state() {
     );
     REQUIRE(remainder.execution.fill->quantity == quantity("2"));
     REQUIRE(remainder.execution.unfilled_quantity == quantity("1"));
-    REQUIRE(remainder.account_after.position == quantity("5"));
+    REQUIRE(remainder.account_after.quantity(InstrumentId("AAPL")) == quantity("5"));
     REQUIRE(remainder.account_after.cash == money("494.98"));
-    REQUIRE(remainder.account_after.open_cost_basis == money("505"));
-    REQUIRE(remainder.account_after.fees_paid == money("0.02"));
+    REQUIRE(remainder.account_after.open_cost_basis() == money("505"));
+    REQUIRE(remainder.account_after.fees_paid() == money("0.02"));
 }
 
 void test_corrupt_recovery_state_is_rejected() {
@@ -462,7 +502,8 @@ void test_corrupt_recovery_state_is_rejected() {
     );
 
     state = engine.recovery_state();
-    state.account.state.open_cost_basis = money("100");
+    state.account.state.positions.at(InstrumentId("AAPL")).open_cost_basis =
+        money("100");
     REQUIRE_THROWS_AS(
         PaperOrderProcessor::restore(std::move(state)),
         std::invalid_argument
@@ -476,7 +517,8 @@ void test_corrupt_recovery_state_is_rejected() {
     );
 
     state = engine.recovery_state();
-    state.execution.consumed_ask_quantity = quantity("6");
+    state.execution.instruments.at(InstrumentId("AAPL")).consumed_ask_quantity =
+        quantity("6");
     REQUIRE_THROWS_AS(
         PaperOrderProcessor::restore(std::move(state)),
         std::invalid_argument
@@ -506,6 +548,60 @@ void test_corrupt_recovery_state_is_rejected() {
         PaperOrderProcessor::restore(std::move(state)),
         std::invalid_argument
     );
+}
+
+
+void test_orders_for_several_instruments_share_one_account() {
+    PaperOrderProcessor engine = processor(money("10000"));
+    const auto aapl = require_receipt(engine.submit(
+        order("aapl-buy", Side::Buy, "5", 110),
+        market(10, 100)
+    ));
+    REQUIRE(aapl.account_after.cash == money("9494.99"));
+    const auto spy = require_receipt(engine.submit(
+        spy_order("spy-buy", Side::Buy, "4", 120),
+        spy_market(8, 115)
+    ));
+    // Shared cash pays for SPY after AAPL.
+    REQUIRE(spy.accounting->before.cash == money("9494.99"));
+    REQUIRE(spy.account_after.cash == money("7490.98"));
+    REQUIRE(spy.account_after.quantity(InstrumentId("SPY")) == quantity("4"));
+    REQUIRE(spy.account_after.quantity(InstrumentId("AAPL")) == quantity("5"));
+
+    // Selling part of AAPL leaves SPY unchanged.
+    const auto sale = require_receipt(engine.submit(
+        order("aapl-sell", Side::Sell, "2", 130),
+        market(11, 125)
+    ));
+    REQUIRE(sale.account_after.quantity(InstrumentId("AAPL")) == quantity("3"));
+    REQUIRE(sale.account_after.positions.at(InstrumentId("SPY")) ==
+        spy.account_after.positions.at(InstrumentId("SPY")));
+
+    // An AAPL quote cannot fill an SPY order.
+    const AccountState before_mismatch = engine.account().state();
+    require_risk_rejection(
+        engine.submit(spy_order("spy-on-aapl", Side::Buy, "1", 140), market(12, 135)),
+        PreTradeRiskErrorCode::MarketInstrumentMismatch
+    );
+    REQUIRE(engine.account().state() == before_mismatch);
+    REQUIRE(engine.executions().at(InstrumentId("SPY")).consumed_ask_quantity ==
+        quantity("4"));
+
+    // Per-instrument consumption survives recovery; SPY's remaining
+    // displayed shares are still limited to one.
+    PaperOrderProcessor recovered = PaperOrderProcessor::restore(engine.recovery_state());
+    REQUIRE(recovered.account().state() == engine.account().state());
+    REQUIRE(recovered.executions() == engine.executions());
+    const auto spy_rest = require_receipt(recovered.submit(
+        spy_order("spy-rest", Side::Buy, "3", 150),
+        spy_market(8, 115)
+    ));
+    REQUIRE(spy_rest.execution.fill->quantity == quantity("1"));
+
+    // A recovered position needs its instrument's execution state.
+    auto orphaned = engine.recovery_state();
+    orphaned.execution.instruments.erase(InstrumentId("SPY"));
+    REQUIRE_THROWS_AS(PaperOrderProcessor::restore(std::move(orphaned)), std::invalid_argument);
 }
 
 }  // namespace
@@ -541,6 +637,10 @@ int main() {
             test_duplicate_filled_order_cannot_change_account_twice,
         },
         {
+            "overflowing sale is a risk rejection",
+            test_overflowing_sale_is_a_risk_rejection,
+        },
+        {
             "accounting invariant failure halts processor",
             test_accounting_invariant_failure_halts_the_processor,
         },
@@ -551,6 +651,10 @@ int main() {
         {
             "corrupt recovery state is rejected",
             test_corrupt_recovery_state_is_rejected,
+        },
+        {
+            "several instruments share one account",
+            test_orders_for_several_instruments_share_one_account,
         },
     });
 }

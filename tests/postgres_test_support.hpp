@@ -77,6 +77,19 @@ public:
         return rows;
     }
 
+    // Executes several statements without parameters, as psql runs a file.
+    void run_script(std::string_view sql) {
+        const std::string statements(sql);
+        PGresult* result = PQexec(connection_, statements.c_str());
+        const ExecStatusType status = PQresultStatus(result);
+        if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
+            const std::string message = PQresultErrorMessage(result);
+            PQclear(result);
+            throw TestFailure("test script failed: " + message);
+        }
+        PQclear(result);
+    }
+
     std::string scalar(
         std::string_view sql,
         std::initializer_list<std::string> parameters = {}
@@ -109,6 +122,27 @@ inline std::string with_application_name(
     return connection_string;
 }
 
+// Resolves unqualified names in `schema` only, so a test can build a database
+// of its own inside the shared one.
+inline std::string with_search_path(
+    std::string connection_string,
+    std::string_view schema
+) {
+    const bool is_uri = connection_string.starts_with("postgresql://") ||
+        connection_string.starts_with("postgres://");
+    if (is_uri) {
+        connection_string +=
+            connection_string.find('?') == std::string::npos ? '?' : '&';
+        connection_string += "options=-csearch_path%3D";
+        connection_string += schema;
+    } else {
+        connection_string += " options='-csearch_path=";
+        connection_string += schema;
+        connection_string += "'";
+    }
+    return connection_string;
+}
+
 inline std::string unique_test_id(std::string_view prefix) {
     static std::atomic<std::uint64_t> counter{0};
     const auto now = std::chrono::system_clock::now()
@@ -118,11 +152,29 @@ inline std::string unique_test_id(std::string_view prefix) {
         std::to_string(counter.fetch_add(1));
 }
 
+inline std::filesystem::path migrations_directory() {
+    return std::filesystem::path(CHRONOS_SOURCE_DIR) / "migrations";
+}
+
+inline std::string read_migration(const std::filesystem::path& file) {
+    std::ifstream input(file);
+    if (!input) {
+        throw TestFailure("could not open migration: " + file.string());
+    }
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
+
+// One migration file, such as "001_paper_trading.sql".
+inline std::string migration_sql(std::string_view file_name) {
+    return read_migration(migrations_directory() / file_name);
+}
+
 // Every migration in lexical file order, as a fresh Compose volume applies
 // them. Each file is idempotent and owns its transaction.
 inline std::string all_migrations_sql() {
-    const std::filesystem::path directory =
-        std::filesystem::path(CHRONOS_SOURCE_DIR) / "migrations";
+    const std::filesystem::path directory = migrations_directory();
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
         if (entry.path().extension() == ".sql") {
@@ -134,15 +186,12 @@ inline std::string all_migrations_sql() {
         throw TestFailure("no migrations found in " + directory.string());
     }
 
-    std::ostringstream contents;
+    std::string contents;
     for (const auto& file : files) {
-        std::ifstream input(file);
-        if (!input) {
-            throw TestFailure("could not open migration: " + file.string());
-        }
-        contents << input.rdbuf() << '\n';
+        contents += read_migration(file);
+        contents += '\n';
     }
-    return contents.str();
+    return contents;
 }
 
 template <typename Condition>

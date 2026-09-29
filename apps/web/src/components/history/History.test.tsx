@@ -126,6 +126,56 @@ describe('order blotter', () => {
   });
 });
 
+describe('symbol filter', () => {
+  it('asks the server for one symbol and labels every row with its symbol', async () => {
+    const api = createFakeApi();
+    const spyOrder = filledOrderJson({ client_order_id: 'spy-1', instrument: 'SPY' });
+    serveAccount(api, {
+      fills: [fillJson(), fillJson({ client_order_id: 'spy-1', fill_id: 'spy-1:fill:0', instrument: 'SPY' })],
+    });
+    api.on('GET', `${accountPath}/orders`, (request) => ({
+      status: 200,
+      body: {
+        orders: request.query.get('instrument') === 'SPY' ? [spyOrder] : [spyOrder, partialOrderJson()],
+        next_cursor: null,
+      },
+    }));
+    const { orders, fills, user } = await openHistory(api);
+    await within(orders).findByText('spy-1');
+    expect(rowsOf(orders).map((item) => within(item).getByText(/^(AAPL|SPY)$/).textContent)).toEqual(['SPY', 'AAPL']);
+    expect(rowsOf(fills).map((item) => within(item).getByText(/^(AAPL|SPY)$/).textContent)).toEqual(['AAPL', 'SPY']);
+
+    const filter = within(orders).getByRole('combobox', { name: 'Symbol' });
+    expect(within(filter).getAllByRole('option').map((option) => option.textContent)).toEqual([
+      'All symbols',
+      'AAPL',
+      'SPY',
+    ]);
+    await user.selectOptions(filter, 'SPY');
+    await within(orders).findByText('Oldest reached');
+    expect(rowsOf(orders)).toHaveLength(1);
+    expect(api.requestsTo('GET', `${accountPath}/orders`).at(-1)?.query.get('instrument')).toBe('SPY');
+    // Each history has its own filter.
+    expect(rowsOf(fills)).toHaveLength(2);
+    expect(api.requestsTo('GET', `${accountPath}/fills`).every((request) => !request.query.has('instrument'))).toBe(
+      true,
+    );
+  });
+
+  it('explains an empty history for one symbol', async () => {
+    const api = createFakeApi();
+    serveAccount(api);
+    api.on('GET', `${accountPath}/fills`, (request) => ({
+      status: 200,
+      body: { fills: request.query.has('instrument') ? [] : [fillJson()], next_cursor: null },
+    }));
+    const { fills, user } = await openHistory(api);
+    await within(fills).findByText('buy-1:fill:0');
+    await user.selectOptions(within(fills).getByRole('combobox', { name: 'Symbol' }), 'SPY');
+    expect(await within(fills).findByText('No SPY fills booked for this account.')).toBeInTheDocument();
+  });
+});
+
 describe('fill history', () => {
   it('lists booked fills with exact values and their source', async () => {
     const api = createFakeApi();

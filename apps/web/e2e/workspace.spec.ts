@@ -12,7 +12,7 @@ async function expectNoAccessibilityViolations(page: Page) {
 async function createAccount(page: Page, accountId: string) {
   await page.goto('/');
   const create = page.getByRole('region', { name: 'Create a paper account' });
-  await expect(create.getByRole('combobox', { name: 'Instrument' })).toHaveValue('AAPL');
+  await expect(create.getByText('Trades AAPL, SPY from one shared cash balance.')).toBeVisible();
   await create.getByLabel('Account ID').fill(accountId);
   await create.getByRole('button', { name: 'Create paper account' }).click();
   await expect(page.getByRole('region', { name: 'Order ticket' })).toBeVisible();
@@ -48,6 +48,50 @@ test('creates an account, trades with the keyboard, and restores the account aft
   await page.reload();
   await expect(page.getByRole('banner').getByText('e2e-desk-1')).toBeVisible();
   await expect(page.getByRole('region', { name: 'Portfolio' }).getByText('99994.93')).toBeVisible();
+});
+
+test('trades two symbols from one cash balance and filters history by symbol', async ({ page }) => {
+  await mockChronosApi(page);
+  await createAccount(page, 'e2e-multi-1');
+  const ticket = page.getByRole('region', { name: 'Order ticket' });
+  const market = page.getByRole('region', { name: 'Market' });
+  const portfolio = page.getByRole('region', { name: 'Portfolio' });
+
+  await ticket.getByLabel('Quantity (AAPL)').fill('10');
+  await ticket.getByRole('button', { name: 'Review order' }).click();
+  await ticket.getByRole('button', { name: 'Submit paper order' }).click();
+  await expect(ticket.getByText('Partially filled 4 of 10 at 337; 6 cancelled')).toBeVisible();
+  await ticket.getByRole('button', { name: 'New order' }).click();
+
+  // The watchlist selects the symbol for the quote and the ticket.
+  await market.getByRole('radio', { name: 'SPY' }).check();
+  await expect(market.getByRole('heading', { name: 'Quote · SPY' })).toBeVisible();
+  await expect(ticket.getByRole('combobox', { name: 'Symbol' })).toHaveValue('SPY');
+  await expect(ticket.getByRole('group', { name: 'Reference quote for SPY' })).toContainText('769.78');
+  await ticket.getByLabel('Quantity (SPY)').fill('2');
+  await ticket.getByRole('button', { name: 'Review order' }).click();
+  await ticket.getByRole('button', { name: 'Submit paper order' }).click();
+  await expect(ticket.getByText('Filled 2 at 769.78')).toBeVisible();
+
+  const positions = portfolio.getByRole('region', { name: 'Open positions' });
+  await expect(positions.getByRole('row')).toHaveCount(3);
+  await expect(positions.getByRole('row', { name: /^AAPL/ })).toContainText('1343.28');
+  await expect(positions.getByRole('row', { name: /^SPY/ })).toContainText('1539.4');
+  await expect(portfolio.getByText('99994.42')).toBeVisible();
+  await expect(portfolio.getByText('97111.74')).toBeVisible();
+
+  const orders = page.getByRole('region', { name: 'Orders' });
+  await orders.getByRole('combobox', { name: 'Symbol' }).selectOption('SPY');
+  await expect(orders.getByRole('table').getByRole('row')).toHaveCount(2);
+  await expect(orders.getByRole('cell', { name: 'Filled', exact: true })).toBeVisible();
+  await expectNoAccessibilityViolations(page);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(overflow).toBeLessThanOrEqual(0);
+
+  // The selected symbol survives a reload.
+  await page.reload();
+  await expect(page.getByRole('region', { name: 'Market' }).getByRole('radio', { name: 'SPY' })).toBeChecked();
+  await expect(page.getByRole('region', { name: 'Order ticket' }).getByLabel('Quantity (SPY)')).toBeVisible();
 });
 
 test('recovers the outcome of a submission whose response was lost', async ({ page }) => {

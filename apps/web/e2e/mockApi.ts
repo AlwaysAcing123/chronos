@@ -8,17 +8,23 @@ import {
   errorJson,
   fillJson,
   flatAccountJson,
+  flatPortfolioJson,
   healthJson,
   liveSourceJson,
   marketDataJson,
+  MARKET_TIME,
+  openPositionJson,
   partialOrderJson,
   portfolioJson,
   replaySourceJson,
+  spyMarketJson,
+  valuedPositionJson,
 } from '../src/test/fixtures';
 
 interface MockAccount {
-  account: Json;
-  portfolio: Json;
+  accountId: string;
+  // Which canned fills the account has booked.
+  holds: { aapl: boolean; spy: boolean };
   orders: Json[];
   fills: Json[];
 }
@@ -31,29 +37,80 @@ export interface MockOptions {
   readonly liveSource?: boolean;
 }
 
-// The account after the documented 10-share market buy filled 4 at 337 with
-// a 0.35 fee, marked at the 335.82 bid (values the real server returned).
-function afterPartialBuy(accountId: string): Pick<MockAccount, 'account' | 'portfolio'> {
-  const ledger = {
-    account_id: accountId,
-    cash: '98651.65',
-    position: '4',
-    open_cost_basis: '1348',
-    average_entry_price: '337',
-    gross_realized_pnl: '0',
-    fees_paid: '0.35',
-  };
+// Every AAPL submission is the documented 10-share market buy that filled 4
+// at 337 with a 0.35 fee, marked at the 335.82 bid; every SPY submission
+// fills 2 at the recording's final 769.78 ask with a 0.35 fee, marked at its
+// 769.7 bid. The totals below follow the server's accounting rules for those
+// fills, worked out by hand; the mock does no arithmetic.
+const AAPL_POSITION = { quantity: '4', open_cost_basis: '1348', average_entry_price: '337', gross_realized_pnl: '0', fees_paid: '0.35' };
+const AAPL_MARK = { mark_price: '335.82', market_value: '1343.28', unrealized_pnl: '-4.72' };
+const SPY_POSITION = { instrument: 'SPY', quantity: '2', open_cost_basis: '1539.56', average_entry_price: '769.78', gross_realized_pnl: '0', fees_paid: '0.35' };
+const SPY_MARK = { mark_price: '769.7', market: spyMarketJson(), market_value: '1539.4', unrealized_pnl: '-0.16' };
+
+const TOTALS: Readonly<Record<string, Json>> = {
+  aapl: { cash: '98651.65', open_cost_basis: '1348', fees_paid: '0.35', market_value: '1343.28', unrealized_pnl: '-4.72', total_pnl: '-5.07', equity: '99994.93', return_percent: '-0.00507' },
+  spy: { cash: '98460.09', open_cost_basis: '1539.56', fees_paid: '0.35', market_value: '1539.4', unrealized_pnl: '-0.16', total_pnl: '-0.51', equity: '99999.49', return_percent: '-0.00051' },
+  'aapl+spy': { cash: '97111.74', open_cost_basis: '2887.56', fees_paid: '0.7', market_value: '2882.68', unrealized_pnl: '-4.88', total_pnl: '-5.58', equity: '99994.42', return_percent: '-0.00558' },
+};
+
+function resources(state: MockAccount): { account: Json; portfolio: Json } {
+  const key = [state.holds.aapl && 'aapl', state.holds.spy && 'spy'].filter(Boolean).join('+');
+  const version = String(state.orders.length);
+  if (key === '') {
+    return {
+      account: flatAccountJson({ account_id: state.accountId }),
+      portfolio: flatPortfolioJson({ account_id: state.accountId }),
+    };
+  }
+  const totals = TOTALS[key] ?? {};
+  const { market_value, unrealized_pnl, total_pnl, equity, return_percent, ...ledger } = totals;
+  const open = [
+    ...(state.holds.aapl ? [openPositionJson(AAPL_POSITION)] : []),
+    ...(state.holds.spy ? [openPositionJson(SPY_POSITION)] : []),
+  ];
+  const valued = [
+    ...(state.holds.aapl ? [valuedPositionJson({ ...AAPL_POSITION, ...AAPL_MARK })] : []),
+    ...(state.holds.spy ? [valuedPositionJson({ ...SPY_POSITION, ...SPY_MARK })] : []),
+  ];
+  const common = { account_id: state.accountId, gross_realized_pnl: '0', last_fill_at: MARKET_TIME, ...ledger };
   return {
-    account: flatAccountJson({ ...ledger, version: '1', last_fill_at: '2026-09-25T13:39:59.969574414Z' }),
+    account: flatAccountJson({ ...common, version, market_stream_id: portfolioJson().market_stream_id, positions: open }),
     portfolio: portfolioJson({
-      ...ledger,
-      account_version: '1',
-      position_market_value: '1343.28',
-      unrealized_pnl: '-4.72',
-      total_pnl: '-5.07',
-      equity: '99994.93',
-      return_percent: '-0.00507',
+      ...common,
+      account_version: version,
+      market_value,
+      unrealized_pnl,
+      total_pnl,
+      equity,
+      return_percent,
+      positions: valued,
     }),
+  };
+}
+
+function recordedOrder(accountId: string, body: { client_order_id: string; source: Json; instrument: string }): Json {
+  const order = partialOrderJson({ client_order_id: body.client_order_id, source: body.source, account_id: accountId });
+  if (body.instrument !== 'SPY') {
+    return order;
+  }
+  return {
+    ...order,
+    instrument: 'SPY',
+    quantity: '2',
+    status: 'filled',
+    filled_quantity: '2',
+    unfilled_quantity: '0',
+    cancellation_reason: null,
+    fill: {
+      fill_id: `${body.client_order_id}:fill:0`,
+      side: 'buy',
+      price: '769.78',
+      quantity: '2',
+      notional: '1539.56',
+      fee: '0.35',
+      filled_at: MARKET_TIME,
+    },
+    market: spyMarketJson(),
   };
 }
 
@@ -132,36 +189,21 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
   });
   await page.route('**/api/v1/accounts**', async (route) => {
     const request = route.request();
-    const [accountId, resource, clientOrderId] = new URL(request.url()).pathname.split('/').slice(4);
+    const url = new URL(request.url());
+    const [accountId, resource, clientOrderId] = url.pathname.split('/').slice(4);
     const method = request.method();
+    // History filtered to one symbol, as the server filters it.
+    const symbol = url.searchParams.get('instrument');
+    const bySymbol = (items: Json[]) => (symbol === null ? items : items.filter((item) => item.instrument === symbol));
 
     if (accountId === undefined) {
       const body = request.postDataJSON() as { account_id: string; starting_cash: string };
       if (accounts.has(body.account_id)) {
         return reply(route, 409, errorJson('account_already_exists', 'paper account already exists'));
       }
-      const account = flatAccountJson({ account_id: body.account_id });
-      accounts.set(body.account_id, {
-        account,
-        portfolio: portfolioJson({
-          account_id: body.account_id,
-          account_version: '0',
-          cash: '100000',
-          position: '0',
-          open_cost_basis: '0',
-          average_entry_price: null,
-          gross_realized_pnl: '0',
-          fees_paid: '0',
-          position_market_value: '0',
-          unrealized_pnl: '0',
-          total_pnl: '0',
-          equity: '100000',
-          return_percent: '0',
-        }),
-        orders: [],
-        fills: [],
-      });
-      return reply(route, 201, { account });
+      const state: MockAccount = { accountId: body.account_id, holds: { aapl: false, spy: false }, orders: [], fills: [] };
+      accounts.set(body.account_id, state);
+      return reply(route, 201, { account: resources(state).account });
     }
 
     const state = accounts.get(accountId);
@@ -169,13 +211,13 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
       return reply(route, 404, notFound);
     }
     if (resource === undefined) {
-      return reply(route, 200, { account: state.account });
+      return reply(route, 200, { account: resources(state).account });
     }
     if (resource === 'portfolio') {
-      return reply(route, 200, { portfolio: state.portfolio });
+      return reply(route, 200, { portfolio: resources(state).portfolio });
     }
     if (resource === 'fills') {
-      return reply(route, 200, { fills: state.fills, next_cursor: null });
+      return reply(route, 200, { fills: bySymbol(state.fills), next_cursor: null });
     }
     if (method === 'GET' && clientOrderId !== undefined) {
       const order = state.orders.find((candidate) => candidate.client_order_id === clientOrderId);
@@ -184,22 +226,34 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
         : reply(route, 200, { order });
     }
     if (method === 'GET') {
-      return reply(route, 200, { orders: state.orders, next_cursor: null });
+      return reply(route, 200, { orders: bySymbol(state.orders), next_cursor: null });
     }
 
-    // Every submission is the documented partial fill of a 10-share market buy.
     submissions += 1;
-    const body = request.postDataJSON() as { client_order_id: string; source: Json };
-    const order = partialOrderJson({ client_order_id: body.client_order_id, source: body.source, account_id: accountId });
+    const body = request.postDataJSON() as { client_order_id: string; source: Json; instrument: string };
+    const order = recordedOrder(accountId, body);
+    const fill = order.fill as Json;
     state.orders.unshift(order);
     state.fills.unshift(
-      fillJson({ account_id: accountId, client_order_id: body.client_order_id, fill_id: `${body.client_order_id}:fill:0` }),
+      fillJson({
+        account_id: accountId,
+        client_order_id: body.client_order_id,
+        instrument: order.instrument,
+        fill_id: fill.fill_id,
+        price: fill.price,
+        quantity: fill.quantity,
+        notional: fill.notional,
+      }),
     );
-    Object.assign(state, afterPartialBuy(accountId));
+    if (body.instrument === 'SPY') {
+      state.holds.spy = true;
+    } else {
+      state.holds.aapl = true;
+    }
     if (options.loseFirstSubmissionResponse === true && submissions === 1) {
       return route.abort('failed');
     }
-    return reply(route, 201, { order, account: state.account });
+    return reply(route, 201, { order, account: resources(state).account });
   });
 
   return {

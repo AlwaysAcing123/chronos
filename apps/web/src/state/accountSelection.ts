@@ -1,5 +1,6 @@
-// The only browser-persisted state: which account is open and which IDs were
-// used recently. Balances and orders are always re-read from the server.
+// Browser-persisted conveniences: which account is open and which IDs were
+// used recently (and, in instrumentSelection.ts, the symbol on screen).
+// Balances, positions, and orders are always re-read from the server.
 import { useCallback, useEffect, useState } from 'react';
 
 import { isValidIdentifier } from '../api/identifiers';

@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { SubmitEvent } from 'react';
-import { useId, useState } from 'react';
+import { useState } from 'react';
 
 import { FRACTION_DIGITS, validatePositiveDecimal } from '../../api/decimal';
 import { ChronosApiError, categoryOf } from '../../api/errors';
@@ -14,11 +14,9 @@ import { decimalProblemMessage, IDENTIFIER_RULE } from '../form/messages';
 import { Alert } from '../ui/Alert';
 import { Button } from '../ui/Button';
 import { Panel } from '../ui/Panel';
-import styles from './account.module.css';
 
 interface FieldErrors {
   readonly account_id?: string;
-  readonly instrument?: string;
   readonly starting_cash?: string;
 }
 
@@ -33,16 +31,14 @@ function serverFieldErrors(error: unknown): FieldErrors {
     return {};
   }
   const { field, message } = error.failure.error;
-  return field === 'account_id' || field === 'instrument' || field === 'starting_cash' ? { [field]: message } : {};
+  return field === 'account_id' || field === 'starting_cash' ? { [field]: message } : {};
 }
 
 export function CreateAccountForm({ onOpen }: { readonly onOpen: (accountId: string) => void }) {
   const { client } = useChronosServices();
   const queryClient = useQueryClient();
   const health = useHealth();
-  const instrumentId = useId();
   const [accountId, setAccountId] = useState('');
-  const [instrument, setInstrument] = useState('');
   const [startingCash, setStartingCash] = useState('100000');
   const [errors, setErrors] = useState<FieldErrors>({});
 
@@ -58,19 +54,17 @@ export function CreateAccountForm({ onOpen }: { readonly onOpen: (accountId: str
   });
 
   const instruments = health.status === 'success' ? health.data.tradeable_instruments : [];
-  const selectedInstrument = instrument === '' ? (instruments[0] ?? '') : instrument;
 
   function submit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     const cash = validatePositiveDecimal(startingCash, 'money');
     const next: FieldErrors = {
       ...(isValidIdentifier(accountId) ? {} : { account_id: IDENTIFIER_RULE }),
-      ...(selectedInstrument === '' ? { instrument: 'Choose an instrument.' } : {}),
       ...(cash.ok ? {} : { starting_cash: decimalProblemMessage(cash.problem, FRACTION_DIGITS.money) }),
     };
     setErrors(next);
     if (Object.keys(next).length === 0) {
-      creation.mutate({ account_id: accountId, instrument: selectedInstrument, starting_cash: startingCash });
+      creation.mutate({ account_id: accountId, starting_cash: startingCash });
     }
   }
 
@@ -94,32 +88,14 @@ export function CreateAccountForm({ onOpen }: { readonly onOpen: (accountId: str
           error={errors.account_id}
           disabled={pending}
         />
-        <div className={formStyles.field}>
-          <label className={formStyles.label} htmlFor={instrumentId}>
-            Instrument
-          </label>
-          <select
-            id={instrumentId}
-            className={styles.select}
-            value={selectedInstrument}
-            onChange={(event) => {
-              setInstrument(event.target.value);
-            }}
-            disabled={pending || instruments.length === 0}
-            aria-invalid={errors.instrument ? true : undefined}
-          >
-            {instruments.length === 0 && (
-              <option value="">{health.status === 'error' ? 'Unavailable: API unreachable' : 'Loading…'}</option>
-            )}
-            {instruments.map((symbol) => (
-              <option key={symbol} value={symbol}>
-                {symbol}
-              </option>
-            ))}
-          </select>
-          <p className={formStyles.hint}>The instruments this server is configured to trade.</p>
-          {errors.instrument && <p className={formStyles.error}>{errors.instrument}</p>}
-        </div>
+        {/* Every account may trade every instrument the server offers from one cash balance. */}
+        <p className={formStyles.hint} aria-live="polite">
+          {instruments.length > 0
+            ? `Trades ${instruments.join(', ')} from one shared cash balance.`
+            : health.status === 'error'
+              ? 'The instruments this server trades are unavailable: the API is unreachable.'
+              : 'Loading the instruments this server trades…'}
+        </p>
         <TextField
           label="Starting cash (simulated)"
           name="starting_cash"
@@ -160,7 +136,7 @@ export function CreateAccountForm({ onOpen }: { readonly onOpen: (accountId: str
           </Alert>
         )}
         <div className={formStyles.actions}>
-          <Button type="submit" variant="primary" disabled={pending || instruments.length === 0}>
+          <Button type="submit" variant="primary" disabled={pending}>
             {pending ? 'Creating…' : 'Create paper account'}
           </Button>
         </div>

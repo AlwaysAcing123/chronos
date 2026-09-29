@@ -3,7 +3,9 @@
 #include "test_support.hpp"
 
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +31,8 @@ using chronos::MarketEventHeader;
 using chronos::MarketStatusEvent;
 using chronos::Money;
 using chronos::PaperAccount;
+using chronos::PaperAccountRecoveryState;
+using chronos::PositionState;
 using chronos::Price;
 using chronos::Quantity;
 using chronos::RoundingMode;
@@ -90,16 +94,6 @@ void require_error(
     REQUIRE(error(result).code == expected);
 }
 
-bool same_state(const AccountState& left, const AccountState& right) {
-    return left.starting_cash == right.starting_cash &&
-        left.cash == right.cash &&
-        left.position == right.position &&
-        left.open_cost_basis == right.open_cost_basis &&
-        left.gross_realized_pnl == right.gross_realized_pnl &&
-        left.fees_paid == right.fees_paid &&
-        left.last_fill_timestamp == right.last_fill_timestamp;
-}
-
 void require_unchanged_after_rejection(
     PaperAccount& account,
     const Fill& rejected_fill,
@@ -107,7 +101,60 @@ void require_unchanged_after_rejection(
 ) {
     const AccountState before = account.state();
     require_error(account.apply_fill(rejected_fill), expected);
-    REQUIRE(same_state(account.state(), before));
+    REQUIRE(account.state() == before);
+}
+
+const PositionState& ledger(const PaperAccount& account, std::string_view instrument) {
+    const PositionState* position =
+        account.state().position(InstrumentId(std::string(instrument)));
+    REQUIRE(position != nullptr);
+    return *position;
+}
+
+std::map<InstrumentId, Price> marks(
+    std::initializer_list<std::pair<std::string_view, std::string_view>> values
+) {
+    std::map<InstrumentId, Price> result;
+    for (const auto& [instrument, mark] : values) {
+        result.emplace(InstrumentId(std::string(instrument)), price(mark));
+    }
+    return result;
+}
+
+PositionState position_state(
+    std::int64_t quantity_raw,
+    std::int64_t cost_raw,
+    std::int64_t realized_raw,
+    std::int64_t fees_raw,
+    std::int64_t last_fill_ns
+) {
+    return PositionState{
+        .quantity = Quantity::from_raw(quantity_raw),
+        .open_cost_basis = Money::from_raw(cost_raw),
+        .gross_realized_pnl = Money::from_raw(realized_raw),
+        .fees_paid = Money::from_raw(fees_raw),
+        .last_fill_timestamp = Timestamp::from_nanoseconds(last_fill_ns),
+    };
+}
+
+PaperAccountRecoveryState recovery(
+    std::int64_t starting_cash_raw,
+    std::int64_t cash_raw,
+    std::map<InstrumentId, PositionState> positions
+) {
+    std::vector<std::string> fill_ids;
+    for (const auto& [instrument, position] : positions) {
+        fill_ids.push_back(instrument.value() + "-fill");
+    }
+    return PaperAccountRecoveryState{
+        .account_id = "acct",
+        .state = AccountState{
+            .starting_cash = Money::from_raw(starting_cash_raw),
+            .cash = Money::from_raw(cash_raw),
+            .positions = std::move(positions),
+        },
+        .applied_fill_ids = std::move(fill_ids),
+    };
 }
 
 void test_decimal_parsing_and_formatting() {
@@ -268,24 +315,26 @@ void test_price_notional_average_round_trip() {
 }
 
 void test_account_constructor_validation() {
-    REQUIRE_THROWS_AS(
-        PaperAccount("", InstrumentId("AAPL"), money("1")),
-        std::invalid_argument
-    );
+    REQUIRE_THROWS_AS(PaperAccount("", money("1")), std::invalid_argument);
     REQUIRE_THROWS_AS(InstrumentId(""), std::invalid_argument);
     REQUIRE_THROWS_AS(
-        PaperAccount("acct", InstrumentId("AAPL"), money("-0.00000001")),
+        PaperAccount("acct", money("-0.00000001")),
         std::invalid_argument
     );
 
-    const PaperAccount account("acct", InstrumentId("AAPL"), money("0"));
+    const PaperAccount account("acct", money("0"));
     REQUIRE(account.account_id() == "acct");
-    REQUIRE(account.instrument() == InstrumentId("AAPL"));
     REQUIRE(account.state().cash == money("0"));
+    REQUIRE(account.state().positions.empty());
+    REQUIRE(account.state().open_cost_basis() == money("0"));
+    REQUIRE(account.state().gross_realized_pnl() == money("0"));
+    REQUIRE(account.state().fees_paid() == money("0"));
+    REQUIRE(!account.state().latest_fill_timestamp().has_value());
+    REQUIRE(account.state().quantity(InstrumentId("AAPL")) == Quantity{});
 }
 
 void test_primary_buy_sell_and_snapshot_example() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("10000"));
+    PaperAccount account("acct", money("10000"));
 
     const auto buy_result = account.apply_fill(
         fill("buy-1", Side::Buy, "100.05", "10", "1", 100)
@@ -294,11 +343,12 @@ void test_primary_buy_sell_and_snapshot_example() {
     REQUIRE(buy.notional == money("1000.5"));
     REQUIRE(buy.gross_realized_pnl_change == money("0"));
     REQUIRE(buy.before.cash == money("10000"));
+    REQUIRE(buy.before.positions.empty());
     REQUIRE(buy.after.cash == money("8998.5"));
-    REQUIRE(account.state().position == quantity("10"));
-    REQUIRE(account.state().open_cost_basis == money("1000.5"));
-    REQUIRE(account.state().average_entry_price() == price("100.05"));
-    REQUIRE(account.state().fees_paid == money("1"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("10"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("1000.5"));
+    REQUIRE(ledger(account, "AAPL").average_entry_price() == price("100.05"));
+    REQUIRE(ledger(account, "AAPL").fees_paid == money("1"));
 
     const auto sell_result = account.apply_fill(
         fill("sell-1", Side::Sell, "102.90", "4", "0.5", 200)
@@ -307,12 +357,17 @@ void test_primary_buy_sell_and_snapshot_example() {
     REQUIRE(sell.notional == money("411.6"));
     REQUIRE(sell.gross_realized_pnl_change == money("11.4"));
     REQUIRE(account.state().cash == money("9409.6"));
-    REQUIRE(account.state().position == quantity("6"));
-    REQUIRE(account.state().open_cost_basis == money("600.3"));
-    REQUIRE(account.state().gross_realized_pnl == money("11.4"));
-    REQUIRE(account.state().fees_paid == money("1.5"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("6"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("600.3"));
+    REQUIRE(ledger(account, "AAPL").gross_realized_pnl == money("11.4"));
+    REQUIRE(ledger(account, "AAPL").fees_paid == money("1.5"));
+    REQUIRE(account.state().fees_paid() == money("1.5"));
 
-    const auto snapshot = account.snapshot(price("103"));
+    const auto snapshot = account.snapshot(marks({{"AAPL", "103"}}));
+    REQUIRE(snapshot.open_positions.size() == 1);
+    REQUIRE(snapshot.open_positions[0].mark_price == price("103"));
+    REQUIRE(snapshot.open_positions[0].market_value == money("618"));
+    REQUIRE(snapshot.open_positions[0].gross_unrealized_pnl == money("17.7"));
     REQUIRE(snapshot.market_value == money("618"));
     REQUIRE(snapshot.gross_unrealized_pnl == money("17.7"));
     REQUIRE(snapshot.gross_total_pnl == money("29.1"));
@@ -322,74 +377,208 @@ void test_primary_buy_sell_and_snapshot_example() {
 }
 
 void test_multiple_buys_partial_sale_and_complete_close() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("10000"));
+    PaperAccount account("acct", money("10000"));
     receipt(account.apply_fill(fill("b1", Side::Buy, "10", "2", "0", 1)));
     receipt(account.apply_fill(fill("b2", Side::Buy, "20", "1", "0", 2)));
 
-    REQUIRE(account.state().position == quantity("3"));
-    REQUIRE(account.state().open_cost_basis == money("40"));
-    REQUIRE(account.state().average_entry_price() == price("13.333333333"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("3"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("40"));
+    REQUIRE(ledger(account, "AAPL").average_entry_price() == price("13.333333333"));
 
     const auto partial = receipt(
         account.apply_fill(fill("s1", Side::Sell, "16", "1", "0", 3))
     );
     REQUIRE(partial.gross_realized_pnl_change == money("2.66666667"));
-    REQUIRE(account.state().position == quantity("2"));
-    REQUIRE(account.state().open_cost_basis == money("26.66666667"));
-    REQUIRE(account.state().average_entry_price() == price("13.333333335"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("2"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("26.66666667"));
+    REQUIRE(ledger(account, "AAPL").average_entry_price() == price("13.333333335"));
 
     const auto closing = receipt(
         account.apply_fill(fill("s2", Side::Sell, "15", "2", "0", 4))
     );
     REQUIRE(closing.gross_realized_pnl_change == money("3.33333333"));
-    REQUIRE(account.state().position == quantity("0"));
-    REQUIRE(account.state().open_cost_basis == money("0"));
-    REQUIRE(account.state().average_entry_price() == Price{});
-    REQUIRE(account.state().gross_realized_pnl == money("6"));
     REQUIRE(account.state().cash == money("10006"));
+
+    // A closed position keeps its ledger: quantity and cost basis are zero,
+    // and the realized result stays attributed to the instrument.
+    const PositionState& closed = ledger(account, "AAPL");
+    REQUIRE(!closed.is_open());
+    REQUIRE(closed.quantity == quantity("0"));
+    REQUIRE(closed.open_cost_basis == money("0"));
+    REQUIRE(closed.average_entry_price() == Price{});
+    REQUIRE(closed.gross_realized_pnl == money("6"));
+    REQUIRE(closed.last_fill_timestamp == Timestamp::from_nanoseconds(4));
+    REQUIRE(account.state().positions.size() == 1);
+
+    // Reopening the instrument continues the same ledger.
+    receipt(account.apply_fill(fill("b3", Side::Buy, "11", "1", "0", 5)));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("1"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("11"));
+    REQUIRE(ledger(account, "AAPL").gross_realized_pnl == money("6"));
+    REQUIRE(account.state().positions.size() == 1);
 }
 
 void test_realized_loss_and_fees() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("100"));
+    PaperAccount account("acct", money("100"));
     receipt(account.apply_fill(fill("b", Side::Buy, "10", "5", "1", 1)));
     const auto sale = receipt(
         account.apply_fill(fill("s", Side::Sell, "8", "5", "2", 2))
     );
 
     REQUIRE(sale.gross_realized_pnl_change == money("-10"));
-    REQUIRE(account.state().gross_realized_pnl == money("-10"));
-    REQUIRE(account.state().fees_paid == money("3"));
+    REQUIRE(ledger(account, "AAPL").gross_realized_pnl == money("-10"));
+    REQUIRE(ledger(account, "AAPL").fees_paid == money("3"));
     REQUIRE(account.state().cash == money("87"));
 
-    const auto snapshot = account.snapshot(price("8"));
+    // Only open positions need a mark; the closed AAPL ledger needs none.
+    const auto snapshot = account.snapshot({});
+    REQUIRE(snapshot.open_positions.empty());
     REQUIRE(snapshot.gross_total_pnl == money("-10"));
     REQUIRE(snapshot.net_total_pnl == money("-13"));
     REQUIRE(snapshot.equity == money("87"));
 }
 
 void test_empty_account_snapshot() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("100"));
-    const auto snapshot = account.snapshot(price("25"));
+    const PaperAccount account("acct", money("100"));
+    const auto snapshot = account.snapshot({});
+    REQUIRE(snapshot.open_positions.empty());
     REQUIRE(snapshot.market_value == money("0"));
     REQUIRE(snapshot.gross_unrealized_pnl == money("0"));
     REQUIRE(snapshot.net_total_pnl == money("0"));
     REQUIRE(snapshot.equity == money("100"));
-    REQUIRE_THROWS_AS(account.snapshot(price("0")), std::invalid_argument);
-    REQUIRE_THROWS_AS(account.snapshot(price("-1")), std::invalid_argument);
+    // Marks for instruments the account does not hold are ignored.
+    REQUIRE(account.snapshot(marks({{"AAPL", "25"}})).equity == money("100"));
+}
+
+void test_shared_cash_funds_positions_in_several_instruments() {
+    PaperAccount account("acct", money("10000"));
+    receipt(account.apply_fill(fill("aapl-1", Side::Buy, "200", "10", "1", 10)));
+    const auto spy = receipt(
+        account.apply_fill(fill("spy-1", Side::Buy, "500.5", "4", "1", 20, "SPY"))
+    );
+
+    // One cash balance pays for both instruments and both fees.
+    REQUIRE(spy.before.cash == money("7999"));
+    REQUIRE(account.state().cash == money("5996"));
+    REQUIRE(account.state().positions.size() == 2);
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("10"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("2000"));
+    REQUIRE(ledger(account, "AAPL").fees_paid == money("1"));
+    REQUIRE(ledger(account, "SPY").quantity == quantity("4"));
+    REQUIRE(ledger(account, "SPY").open_cost_basis == money("2002"));
+    REQUIRE(ledger(account, "SPY").average_entry_price() == price("500.5"));
+    REQUIRE(ledger(account, "SPY").fees_paid == money("1"));
+    REQUIRE(account.state().open_cost_basis() == money("4002"));
+    REQUIRE(account.state().fees_paid() == money("2"));
+    REQUIRE(account.state().latest_fill_timestamp() == Timestamp::from_nanoseconds(20));
+
+    // Ledgers iterate in instrument order regardless of fill order.
+    std::vector<std::string> order;
+    for (const auto& [instrument, position] : account.state().positions) {
+        order.push_back(instrument.value());
+    }
+    REQUIRE((order == std::vector<std::string>{"AAPL", "SPY"}));
+}
+
+void test_a_fill_changes_only_its_own_instrument() {
+    PaperAccount account("acct", money("10000"));
+    receipt(account.apply_fill(fill("aapl-1", Side::Buy, "200", "10", "0", 10)));
+    receipt(account.apply_fill(fill("spy-1", Side::Buy, "500", "4", "0", 20, "SPY")));
+    const PositionState spy_before = ledger(account, "SPY");
+
+    const auto sale = receipt(
+        account.apply_fill(fill("aapl-2", Side::Sell, "210", "4", "0.5", 30))
+    );
+    REQUIRE(sale.gross_realized_pnl_change == money("40"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("6"));
+    REQUIRE(ledger(account, "AAPL").open_cost_basis == money("1200"));
+    REQUIRE(ledger(account, "AAPL").gross_realized_pnl == money("40"));
+    REQUIRE(ledger(account, "AAPL").fees_paid == money("0.5"));
+    REQUIRE(ledger(account, "SPY") == spy_before);
+    REQUIRE(sale.before.positions.at(InstrumentId("SPY")) ==
+        sale.after.positions.at(InstrumentId("SPY")));
+
+    // Closing AAPL keeps SPY open and untouched.
+    receipt(account.apply_fill(fill("aapl-3", Side::Sell, "190", "6", "0", 40)));
+    REQUIRE(!ledger(account, "AAPL").is_open());
+    REQUIRE(ledger(account, "AAPL").gross_realized_pnl == money("-20"));
+    REQUIRE(ledger(account, "SPY") == spy_before);
+    REQUIRE(account.state().cash == money("10000") - money("2000") -
+        money("2000") + money("840") - money("0.5") + money("1140"));
+}
+
+void test_position_and_account_pnl_reconcile_exactly() {
+    PaperAccount account("acct", money("100000"));
+    receipt(account.apply_fill(fill("a1", Side::Buy, "100.01", "3", "0.35", 1)));
+    receipt(account.apply_fill(fill("a2", Side::Buy, "99.97", "2", "0.35", 2)));
+    receipt(account.apply_fill(fill("s1", Side::Buy, "500.123456789", "7", "0.35", 3, "SPY")));
+    receipt(account.apply_fill(fill("a3", Side::Sell, "101.5", "4", "0.35", 4)));
+    receipt(account.apply_fill(fill("s2", Side::Sell, "499", "2", "0.35", 5, "SPY")));
+
+    const PositionState& aapl = ledger(account, "AAPL");
+    const PositionState& spy = ledger(account, "SPY");
+    // Different entry prices keep exact per-instrument cost bases.
+    REQUIRE(aapl.quantity == quantity("1"));
+    REQUIRE(aapl.open_cost_basis == money("99.994"));
+    REQUIRE(aapl.gross_realized_pnl == money("6.024"));
+    REQUIRE(spy.quantity == quantity("5"));
+    REQUIRE(spy.open_cost_basis == money("2500.61728394"));
+    REQUIRE(spy.gross_realized_pnl == money("-2.24691358"));
+    REQUIRE(aapl.fees_paid == money("1.05"));
+    REQUIRE(spy.fees_paid == money("0.7"));
+
+    const auto snapshot = account.snapshot(marks({{"AAPL", "102"}, {"SPY", "501.25"}}));
+    REQUIRE(snapshot.open_positions.size() == 2);
+    const auto& aapl_mark = snapshot.open_positions[0];
+    const auto& spy_mark = snapshot.open_positions[1];
+    REQUIRE(aapl_mark.instrument == InstrumentId("AAPL"));
+    REQUIRE(aapl_mark.market_value == money("102"));
+    REQUIRE(aapl_mark.gross_unrealized_pnl == money("2.006"));
+    REQUIRE(spy_mark.instrument == InstrumentId("SPY"));
+    REQUIRE(spy_mark.market_value == money("2506.25"));
+    REQUIRE(spy_mark.gross_unrealized_pnl == money("5.63271606"));
+
+    REQUIRE(snapshot.market_value == money("2608.25"));
+    REQUIRE(snapshot.open_cost_basis == money("2600.61128394"));
+    REQUIRE(snapshot.gross_unrealized_pnl == money("7.63871606"));
+    REQUIRE(snapshot.gross_realized_pnl == money("3.77708642"));
+    REQUIRE(snapshot.fees_paid == money("1.75"));
+    REQUIRE(snapshot.gross_total_pnl == money("11.41580248"));
+    REQUIRE(snapshot.net_total_pnl == money("9.66580248"));
+    REQUIRE(account.state().cash == money("97401.41580248"));
+    REQUIRE(snapshot.equity == account.state().cash + money("2608.25"));
+    REQUIRE(snapshot.equity - snapshot.state.starting_cash == snapshot.net_total_pnl);
+}
+
+void test_snapshot_requires_a_mark_for_every_open_position() {
+    PaperAccount account("acct", money("10000"));
+    receipt(account.apply_fill(fill("a", Side::Buy, "10", "1", "0", 1)));
+    receipt(account.apply_fill(fill("s", Side::Buy, "10", "1", "0", 1, "SPY")));
+    receipt(account.apply_fill(fill("q", Side::Buy, "10", "1", "0", 1, "QQQ")));
+    receipt(account.apply_fill(fill("q2", Side::Sell, "10", "1", "0", 2, "QQQ")));
+
+    REQUIRE_THROWS_AS(account.snapshot(marks({{"AAPL", "10"}})), std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        account.snapshot(marks({{"AAPL", "10"}, {"SPY", "0"}})),
+        std::invalid_argument
+    );
+    REQUIRE_THROWS_AS(
+        account.snapshot(marks({{"AAPL", "10"}, {"SPY", "-1"}})),
+        std::invalid_argument
+    );
+    // The closed QQQ ledger needs no mark.
+    const auto snapshot = account.snapshot(marks({{"AAPL", "11"}, {"SPY", "9"}}));
+    REQUIRE(snapshot.open_positions.size() == 2);
+    REQUIRE(snapshot.equity == money("10000"));
 }
 
 void test_fill_field_validation_is_atomic() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("100"));
+    PaperAccount account("acct", money("100"));
 
     require_unchanged_after_rejection(
         account,
         fill("", Side::Buy, "1", "1", "0", 1),
         ApplyFillErrorCode::MissingFillId
-    );
-    require_unchanged_after_rejection(
-        account,
-        fill("wrong-instrument", Side::Buy, "1", "1", "0", 1, "MSFT"),
-        ApplyFillErrorCode::InstrumentMismatch
     );
     require_unchanged_after_rejection(
         account,
@@ -427,7 +616,7 @@ void test_fill_field_validation_is_atomic() {
 }
 
 void test_insufficient_cash_and_position_are_atomic() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("10"));
+    PaperAccount account("acct", money("10"));
     require_unchanged_after_rejection(
         account,
         fill("too-expensive", Side::Buy, "10", "1", "0.01", 1),
@@ -452,14 +641,50 @@ void test_insufficient_cash_and_position_are_atomic() {
     );
 }
 
+void test_shared_cash_and_positions_limit_each_instrument() {
+    PaperAccount account("acct", money("1000"));
+    receipt(account.apply_fill(fill("aapl", Side::Buy, "100", "6", "0", 1)));
+
+    // The cash AAPL spent is not available to SPY.
+    require_unchanged_after_rejection(
+        account,
+        fill("spy-too-large", Side::Buy, "100", "4.00000001", "0", 2, "SPY"),
+        ApplyFillErrorCode::InsufficientCash
+    );
+    receipt(account.apply_fill(fill("spy", Side::Buy, "100", "4", "0", 2, "SPY")));
+    REQUIRE(account.state().cash == money("0"));
+
+    // Owning AAPL does not allow selling more SPY than is held.
+    require_unchanged_after_rejection(
+        account,
+        fill("spy-oversell", Side::Sell, "100", "5", "0", 3, "SPY"),
+        ApplyFillErrorCode::InsufficientPosition
+    );
+    require_unchanged_after_rejection(
+        account,
+        fill("unheld-sell", Side::Sell, "100", "1", "0", 3, "QQQ"),
+        ApplyFillErrorCode::InsufficientPosition
+    );
+    REQUIRE(account.state().position(InstrumentId("QQQ")) == nullptr);
+}
+
 void test_duplicate_fill_and_timestamp_rules() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("100"));
+    PaperAccount account("acct", money("100"));
     const Fill first = fill("same-id", Side::Buy, "10", "1", "0", 100);
     receipt(account.apply_fill(first));
 
     require_unchanged_after_rejection(
         account,
         first,
+        ApplyFillErrorCode::DuplicateFill
+    );
+    // A fill ID identifies one fill for the whole account, whatever its
+    // instrument.
+    Fill same_id_other_instrument = first;
+    same_id_other_instrument.instrument = InstrumentId("SPY");
+    require_unchanged_after_rejection(
+        account,
+        same_id_other_instrument,
         ApplyFillErrorCode::DuplicateFill
     );
     receipt(account.apply_fill(fill("equal-time", Side::Buy, "10", "1", "0", 100)));
@@ -470,18 +695,52 @@ void test_duplicate_fill_and_timestamp_rules() {
     );
 }
 
+void test_fill_times_are_ordered_per_instrument() {
+    PaperAccount account("acct", money("1000"));
+    receipt(account.apply_fill(fill("aapl-1", Side::Buy, "10", "1", "0", 100)));
+
+    // An earlier SPY fill is valid: time is ordered within an instrument.
+    receipt(account.apply_fill(fill("spy-1", Side::Buy, "10", "1", "0", 50, "SPY")));
+    receipt(account.apply_fill(fill("spy-2", Side::Buy, "10", "1", "0", 75, "SPY")));
+    REQUIRE(ledger(account, "SPY").last_fill_timestamp == Timestamp::from_nanoseconds(75));
+    REQUIRE(account.state().latest_fill_timestamp() == Timestamp::from_nanoseconds(100));
+
+    require_unchanged_after_rejection(
+        account,
+        fill("spy-late", Side::Buy, "10", "1", "0", 74, "SPY"),
+        ApplyFillErrorCode::TimestampMovedBackward
+    );
+    require_unchanged_after_rejection(
+        account,
+        fill("aapl-late", Side::Sell, "10", "1", "0", 99),
+        ApplyFillErrorCode::TimestampMovedBackward
+    );
+}
+
 void test_rejected_fill_id_is_not_consumed() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("10"));
+    PaperAccount account("acct", money("10"));
     require_error(
         account.apply_fill(fill("retry", Side::Buy, "11", "1", "0", 1)),
         ApplyFillErrorCode::InsufficientCash
     );
     receipt(account.apply_fill(fill("retry", Side::Buy, "10", "1", "0", 1)));
-    REQUIRE(account.state().position == quantity("1"));
+    REQUIRE(ledger(account, "AAPL").quantity == quantity("1"));
+}
+
+void test_preview_does_not_change_the_account() {
+    PaperAccount account("acct", money("100"));
+    const Fill buy = fill("preview", Side::Buy, "10", "2", "1", 1);
+    const auto preview = receipt(account.preview_fill(buy));
+    REQUIRE(preview.after.cash == money("79"));
+    REQUIRE(account.state().cash == money("100"));
+    REQUIRE(account.state().positions.empty());
+    // The previewed fill ID is still unused.
+    const auto applied = receipt(account.apply_fill(buy));
+    REQUIRE(applied.after == preview.after);
 }
 
 void test_notional_that_rounds_to_zero_is_rejected() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("1"));
+    PaperAccount account("acct", money("1"));
     const Fill tiny{
         .fill_id = "tiny",
         .instrument = InstrumentId("AAPL"),
@@ -499,7 +758,7 @@ void test_notional_that_rounds_to_zero_is_rejected() {
 }
 
 void test_fill_arithmetic_overflow_is_atomic() {
-    PaperAccount account("acct", InstrumentId("AAPL"), money("1000"));
+    PaperAccount account("acct", money("1000"));
     const auto maximum = std::numeric_limits<std::int64_t>::max();
 
     const Fill nearly_maximum_position{
@@ -526,6 +785,144 @@ void test_fill_arithmetic_overflow_is_atomic() {
         account,
         overflowing_position,
         ApplyFillErrorCode::ArithmeticOverflow
+    );
+}
+
+void test_account_totals_must_stay_representable() {
+    constexpr auto kMaximum = std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t kOneDollar = 100'000'000;
+    // AAPL's cost basis alone is almost the whole fixed-point range, earned
+    // back through a realized gain, and $2 of cash remains.
+    PaperAccount account = PaperAccount::restore(recovery(
+        kOneDollar,
+        2 * kOneDollar,
+        {{InstrumentId("AAPL"), position_state(kOneDollar, kMaximum - kOneDollar, kMaximum, 0, 1)}}
+    ));
+
+    // A $1 SPY buy brings total open cost to exactly the maximum.
+    const auto fits = receipt(account.preview_fill(
+        fill("spy-fits", Side::Buy, "1", "1", "0", 2, "SPY")
+    ));
+    REQUIRE(fits.after.open_cost_basis().raw() == kMaximum);
+    // A $1.50 buy fits in SPY's own ledger but not in the account total.
+    require_unchanged_after_rejection(
+        account,
+        fill("spy-overflow", Side::Buy, "1.5", "1", "0", 2, "SPY"),
+        ApplyFillErrorCode::ArithmeticOverflow
+    );
+    require_unchanged_after_rejection(
+        account,
+        fill("fee-too-large", Side::Buy, "1", "1", "1.00000001", 2, "SPY"),
+        ApplyFillErrorCode::InsufficientCash
+    );
+}
+
+void test_snapshot_overflow_at_every_total() {
+    constexpr std::int64_t kUnit = 100'000'000;
+    // Two 10-share positions, each worth 60% of the fixed-point range at a
+    // $5.5 billion mark: each position value fits, their sum does not.
+    const PaperAccount pair = PaperAccount::restore(recovery(
+        1'000 * kUnit,
+        998 * kUnit,
+        {
+            {InstrumentId("AAPL"), position_state(10 * kUnit, kUnit, 0, 0, 1)},
+            {InstrumentId("SPY"), position_state(10 * kUnit, kUnit, 0, 0, 1)},
+        }
+    ));
+    REQUIRE(pair.snapshot(marks({{"AAPL", "5500000000"}, {"SPY", "1"}})).market_value ==
+        money("55000000010"));
+    REQUIRE_THROWS_AS(
+        pair.snapshot(marks({{"AAPL", "5500000000"}, {"SPY", "5500000000"}})),
+        std::overflow_error
+    );
+
+    // One large position overflows its own market value.
+    const PaperAccount large = PaperAccount::restore(recovery(
+        1'000 * kUnit,
+        999 * kUnit,
+        {{InstrumentId("AAPL"), position_state(100 * kUnit, kUnit, 0, 0, 1)}}
+    ));
+    REQUIRE_THROWS_AS(
+        large.snapshot(marks({{"AAPL", "1000000000"}})),
+        std::overflow_error
+    );
+
+    // Cash plus market value can overflow equity.
+    constexpr std::int64_t kStartingCash = 9'000'000'000'000'000'000;
+    const PaperAccount rich = PaperAccount::restore(recovery(
+        kStartingCash,
+        kStartingCash - kUnit,
+        {{InstrumentId("AAPL"), position_state(kUnit, kUnit, 0, 0, 1)}}
+    ));
+    REQUIRE(rich.snapshot(marks({{"AAPL", "1"}})).equity.raw() == kStartingCash);
+    REQUIRE_THROWS_AS(
+        rich.snapshot(marks({{"AAPL", "3000000000"}})),
+        std::overflow_error
+    );
+}
+
+void test_recovery_round_trips_and_validates_positions() {
+    PaperAccount account("acct", money("1000"));
+    receipt(account.apply_fill(fill("a", Side::Buy, "10", "3", "0.5", 5)));
+    receipt(account.apply_fill(fill("s", Side::Buy, "20", "2", "0.5", 6, "SPY")));
+    receipt(account.apply_fill(fill("a2", Side::Sell, "12", "3", "0.5", 7)));
+
+    const PaperAccountRecoveryState saved = account.recovery_state();
+    REQUIRE((saved.applied_fill_ids == std::vector<std::string>{"a", "a2", "s"}));
+    PaperAccount restored = PaperAccount::restore(saved);
+    REQUIRE(restored.state() == account.state());
+    require_error(
+        restored.apply_fill(fill("s", Side::Buy, "20", "1", "0", 8, "SPY")),
+        ApplyFillErrorCode::DuplicateFill
+    );
+
+    const auto rejects = [&saved](auto mutate) {
+        PaperAccountRecoveryState broken = saved;
+        mutate(broken);
+        REQUIRE_THROWS_AS(PaperAccount::restore(broken), std::invalid_argument);
+    };
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.cash = state.state.cash + Money::from_raw(1);
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.positions.at(InstrumentId("SPY")).quantity = Quantity::from_raw(-1);
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.positions.at(InstrumentId("AAPL")).open_cost_basis = Money::from_raw(1);
+        state.state.cash = state.state.cash - Money::from_raw(1);
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.positions.at(InstrumentId("SPY")).fees_paid = Money::from_raw(-1);
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.positions.at(InstrumentId("SPY")).last_fill_timestamp =
+            Timestamp::from_nanoseconds(-1);
+    });
+    rejects([](PaperAccountRecoveryState& state) { state.applied_fill_ids.clear(); });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.applied_fill_ids.push_back("a");
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.applied_fill_ids.push_back("");
+    });
+    rejects([](PaperAccountRecoveryState& state) {
+        state.state.positions.clear();
+        state.state.cash = state.state.starting_cash;
+    });
+
+    constexpr auto kMaximum = std::numeric_limits<std::int64_t>::max();
+    // Totals beyond the fixed-point range cannot be recovered even when each
+    // ledger fits.
+    REQUIRE_THROWS_AS(
+        PaperAccount::restore(recovery(
+            0,
+            0,
+            {
+                {InstrumentId("AAPL"), position_state(0, 0, kMaximum, kMaximum, 1)},
+                {InstrumentId("SPY"), position_state(0, 0, kMaximum, kMaximum, 1)},
+            }
+        )),
+        std::invalid_argument
     );
 }
 
@@ -635,12 +1032,22 @@ int main() {
         {"multiple buys and complete close", test_multiple_buys_partial_sale_and_complete_close},
         {"realized loss and fees", test_realized_loss_and_fees},
         {"empty account snapshot", test_empty_account_snapshot},
+        {"shared cash funds several instruments", test_shared_cash_funds_positions_in_several_instruments},
+        {"a fill changes only its own instrument", test_a_fill_changes_only_its_own_instrument},
+        {"position and account PnL reconcile exactly", test_position_and_account_pnl_reconcile_exactly},
+        {"snapshot requires a mark per open position", test_snapshot_requires_a_mark_for_every_open_position},
         {"fill field validation is atomic", test_fill_field_validation_is_atomic},
         {"cash and position rejection is atomic", test_insufficient_cash_and_position_are_atomic},
+        {"shared cash and positions limit each instrument", test_shared_cash_and_positions_limit_each_instrument},
         {"duplicate fill and timestamp rules", test_duplicate_fill_and_timestamp_rules},
+        {"fill times are ordered per instrument", test_fill_times_are_ordered_per_instrument},
         {"rejected fill ID is reusable", test_rejected_fill_id_is_not_consumed},
+        {"preview does not change the account", test_preview_does_not_change_the_account},
         {"zero rounded notional is rejected", test_notional_that_rounds_to_zero_is_rejected},
         {"fill arithmetic overflow is atomic", test_fill_arithmetic_overflow_is_atomic},
+        {"account totals must stay representable", test_account_totals_must_stay_representable},
+        {"snapshot overflow at every total", test_snapshot_overflow_at_every_total},
+        {"recovery round trips and validates positions", test_recovery_round_trips_and_validates_positions},
         {"market identifiers are strong and nonempty", test_market_identifiers_are_strong_and_nonempty},
         {"market quality flags are composable", test_market_data_quality_flags_are_composable},
         {"market events preserve semantics", test_provider_independent_market_events_preserve_semantics},

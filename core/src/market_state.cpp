@@ -77,10 +77,8 @@ void MarketState::resume() {
     fresh_since_resume_.emplace();
 }
 
-ExecutionQuoteResult MarketState::execution_quote(
-    const InstrumentId& instrument
-) const {
-    const std::lock_guard lock(mutex_);
+std::variant<TopOfBookEvent, MarketStateUnavailable>
+MarketState::quote_locked(const InstrumentId& instrument) const {
     if (interruption_) {
         return MarketStateUnavailable{
             .code = MarketStateUnavailableCode::StreamInterrupted,
@@ -93,8 +91,8 @@ ExecutionQuoteResult MarketState::execution_quote(
         return MarketStateUnavailable{
             .code = MarketStateUnavailableCode::SourceUnavailable,
             .message =
-                "the market-data source is unavailable, so no quote is "
-                "current",
+                "the live market-data source is not connected and "
+                "subscribed, so no quote is current",
         };
     }
 
@@ -110,15 +108,41 @@ ExecutionQuoteResult MarketState::execution_quote(
         return MarketStateUnavailable{
             .code = MarketStateUnavailableCode::AwaitingFreshQuote,
             .message =
-                "no quote for the instrument has arrived since the "
-                "market-data source resumed",
+                "no quote for the instrument has arrived since the live "
+                "source reconnected",
         };
+    }
+    return *view->top_of_book;
+}
+
+ExecutionQuoteResult MarketState::execution_quote(
+    const InstrumentId& instrument
+) const {
+    const std::lock_guard lock(mutex_);
+    auto quote = quote_locked(instrument);
+    if (auto* unavailable = std::get_if<MarketStateUnavailable>(&quote)) {
+        return std::move(*unavailable);
     }
     // An accepted top of book always advanced the replay clock.
     return ExecutionQuote{
-        .top_of_book = *view->top_of_book,
+        .top_of_book = std::get<TopOfBookEvent>(std::move(quote)),
         .market_time = replay_.clock().current_time().value(),
     };
+}
+
+MarketQuotes MarketState::quotes(
+    const std::vector<InstrumentId>& instruments
+) const {
+    const std::lock_guard lock(mutex_);
+    MarketQuotes read{
+        .stream = replay_.stream(),
+        .market_time = replay_.clock().current_time(),
+        .quotes = {},
+    };
+    for (const InstrumentId& instrument : instruments) {
+        read.quotes.insert_or_assign(instrument, quote_locked(instrument));
+    }
+    return read;
 }
 
 MarketStateStatus MarketState::status() const {

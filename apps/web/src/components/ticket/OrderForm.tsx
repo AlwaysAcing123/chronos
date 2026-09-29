@@ -10,20 +10,25 @@ import styles from './ticket.module.css';
 
 export function OrderForm({
   account,
+  instrument,
   draft,
   errors,
   disabled,
+  reviewDisabled,
   onChange,
   onReview,
 }: {
   readonly account: Account;
+  readonly instrument: string;
   readonly draft: OrderDraft;
   readonly errors: DraftErrors;
   readonly disabled: boolean;
+  readonly reviewDisabled: boolean;
   readonly onChange: (draft: OrderDraft) => void;
   readonly onReview: () => void;
 }) {
   const limits = account.risk_limits;
+  const held = account.positions.find((position) => position.instrument === instrument);
   function submit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     onReview();
@@ -57,7 +62,7 @@ export function OrderForm({
         disabled={disabled}
       />
       <TextField
-        label={`Quantity (${account.instrument})`}
+        label={`Quantity (${instrument})`}
         name="quantity"
         value={draft.quantity}
         onChange={(event) => {
@@ -90,8 +95,13 @@ export function OrderForm({
         <span>Time in force</span>
         <span>Immediate or cancel (IOC)</span>
       </div>
-      {/* Risk limits are fixed when the account is created, so they can never be stale. */}
-      <div className={styles.context} role="group" aria-label="Account limits">
+      {/* Risk limits are fixed when the account is created, so they can never be stale. The position limit
+          applies to each symbol separately; cash is shared by all of them. */}
+      <div className={styles.context} role="group" aria-label="Position and account limits">
+        <div className={styles.contextItem}>
+          <span className={styles.contextLabel}>Held ({instrument})</span>
+          <span className={styles.contextValue}>{held?.quantity ?? 'None'}</span>
+        </div>
         <div className={styles.contextItem}>
           <span className={styles.contextLabel}>Fee per fill</span>
           <span className={styles.contextValue}>{limits.fee_per_fill}</span>
@@ -101,7 +111,7 @@ export function OrderForm({
           <span className={styles.contextValue}>{limits.maximum_order_notional}</span>
         </div>
         <div className={styles.contextItem}>
-          <span className={styles.contextLabel}>Max position</span>
+          <span className={styles.contextLabel}>Max position per symbol</span>
           <span className={styles.contextValue}>{limits.maximum_position_quantity}</span>
         </div>
         <div className={styles.contextItem}>
@@ -110,7 +120,7 @@ export function OrderForm({
         </div>
       </div>
       <div className={formStyles.actions}>
-        <Button type="submit" variant="primary" disabled={disabled}>
+        <Button type="submit" variant="primary" disabled={disabled || reviewDisabled}>
           Review order
         </Button>
       </div>

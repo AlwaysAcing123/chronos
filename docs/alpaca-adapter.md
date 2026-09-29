@@ -342,8 +342,9 @@ No test uses credentials, the network, or real time:
 - Trade corrections and cancels are received but not applied, so the last
   trade view can show a trade Alpaca later corrected. Execution and
   valuation use quotes only.
-- Accounts still trade one instrument each; AAPL and SPY are both streamed
-  and displayed.
+- An account binds to one stream for all its instruments, so it can trade
+  both AAPL and SPY within one live session, but each session needs new
+  accounts.
 - No hot swap between sources; restart the server, with a new stream ID and
   accounts, to switch.
 - Alpaca's market-data terms govern display and redistribution; the local,

@@ -3,6 +3,13 @@
 - Status: Proposed
 - Date: 2026-09-28
 
+> **Amended by [ADR 0010](0010-multi-instrument-accounts.md).** Accounts now
+> hold several instruments. Each open position is marked at its own
+> instrument's best bid, and only open positions need a mark, so a flat
+> account is valued at its cash without a quote; the "valuing a flat account
+> without a quote" alternative below is now the rule. Every other decision
+> here stands, applied per position and then summed.
+
 ## Context
 
 A client needs a trustworthy current portfolio snapshot: market value,

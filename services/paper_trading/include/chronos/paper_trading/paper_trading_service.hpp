@@ -24,15 +24,18 @@ inline constexpr std::size_t kMaximumIdentifierLength = 64;
 [[nodiscard]] bool is_valid_identifier(std::string_view value) noexcept;
 
 struct PaperTradingServiceConfig {
+    // Every account may trade any of these, on the server's one market
+    // stream.
     std::vector<InstrumentId> tradeable_instruments;
     // Applied to every new account and persisted with it. Changing the
     // configuration later does not alter existing accounts.
     PreTradeRiskLimits account_risk_limits;
 };
 
+// An account holds cash and a position per instrument it has traded, so it
+// is not created for any one instrument.
 struct CreatePaperAccountRequest {
     std::string account_id;
-    std::string instrument;
     Money starting_cash;
 };
 
@@ -81,12 +84,18 @@ struct PaperTradingError {
     // The valuation rule that failed, for MarketDataUnavailable raised by
     // valuation and for ValuationFailed.
     std::optional<PortfolioValuationErrorCode> valuation{};
+    // For PositionMarkUnavailable: every open position that cannot be
+    // marked, in instrument order, and why.
+    std::vector<PositionMarkFailure> instruments{};
 };
 
 struct PaperAccountView {
     std::string account_id;
-    InstrumentId instrument;
+    // Cash and every instrument ledger, in instrument order. A closed
+    // position keeps its ledger at zero quantity.
     AccountState state;
+    // The stream the account executes on, fixed by its first executed order.
+    std::optional<MarketDataStreamId> market_stream;
     PreTradeRiskLimits risk_limits;
     bool is_healthy;
     std::int64_t version;
@@ -108,9 +117,10 @@ using PaperOrderSubmissionResult = std::variant<
     PaperTradingError
 >;
 
-// A read-only valuation of a durable account against the current server
-// quote. Financial fields come from `valuation`, whose snapshot holds the
-// same account state as `account`.
+// A read-only valuation of a durable account against one consistent read of
+// the server's quotes for the instruments it holds. Financial fields come
+// from `valuation`, whose snapshot holds the same account state as
+// `account`.
 struct PaperPortfolioView {
     PaperAccountView account;
     PortfolioValuation valuation;
@@ -129,8 +139,12 @@ struct HistoryPageRequest {
     // Absent means kDefaultHistoryPageLimit.
     std::optional<std::size_t> limit;
     // Absent means the newest page; otherwise the next_cursor of a previous
-    // page of the same account and kind.
+    // page of the same account, kind, and instrument filter.
     std::optional<std::string> cursor;
+    // Absent means every instrument; otherwise only the records for this
+    // one. Any valid identifier is accepted, so the history of a symbol no
+    // longer configured stays readable.
+    std::optional<std::string> instrument;
 };
 
 struct PaperOrderHistoryPage {
@@ -158,11 +172,15 @@ using PaperFillHistoryResult = std::variant<
     PaperTradingError
 >;
 
-// Whether an order for one tradeable instrument could execute now.
+// Whether an order for one tradeable instrument could execute now, and
+// against which quote. The quote is a reference for clients: an order
+// executes against the server's quote when it is submitted.
 struct InstrumentAvailability {
     InstrumentId instrument;
     // Why no execution quote is available, or nullopt when one is.
     std::optional<MarketStateUnavailableCode> unavailable;
+    // The current execution quote, exactly when one is available.
+    std::optional<TopOfBookEvent> quote;
 };
 
 struct MarketAvailability {
@@ -226,7 +244,9 @@ public:
         const HistoryPageRequest& request
     );
 
-    // Marks the durable account at the server's current best bid. Reads only:
+    // Marks every open position at the server's current best bid, read
+    // together with the market clock. Only held instruments need a quote;
+    // any that cannot be marked fails the whole valuation. Reads only:
     // nothing is journaled, and no liquidity or client order ID is consumed.
     [[nodiscard]] PaperPortfolioResult get_portfolio(
         std::string_view account_id
