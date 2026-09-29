@@ -1,6 +1,8 @@
 import { isAccountNotFound } from '../../api/errors';
 import { FAILURE } from '../../presentation/vocabulary';
-import { useAccount, usePortfolio } from '../../state/queries';
+import type { Account } from '../../api/schemas';
+import { useSelectedInstrument } from '../../state/instrumentSelection';
+import { useAccount, useHealth, useMarketData, usePortfolio } from '../../state/queries';
 import accountStyles from '../account/account.module.css';
 import { FillHistory } from '../history/FillHistory';
 import { OrderBlotter } from '../history/OrderBlotter';
@@ -57,6 +59,13 @@ function AccountNotFound({
   );
 }
 
+// Every symbol the account could have history in: the configured ones, then
+// any it traded that the server no longer offers.
+function historySymbols(tradeable: readonly string[], account: Account): string[] {
+  const traded = [...account.positions, ...account.closed_positions].map((position) => position.instrument);
+  return [...tradeable, ...traded.filter((symbol) => !tradeable.includes(symbol)).sort()];
+}
+
 export function Workspace({
   accountId,
   onClose,
@@ -68,6 +77,12 @@ export function Workspace({
 }) {
   const account = useAccount(accountId);
   const portfolio = usePortfolio(accountId);
+  const health = useHealth();
+  const marketData = useMarketData();
+  // Configuration order, from whichever resource has loaded.
+  const tradeable =
+    marketData.data?.instruments.map((item) => item.instrument) ?? health.data?.tradeable_instruments ?? [];
+  const { selected, select } = useSelectedInstrument(tradeable);
 
   if (isAccountNotFound(account.error) || isAccountNotFound(portfolio.error)) {
     return <AccountNotFound accountId={accountId} onClose={onClose} onForget={onForget} />;
@@ -99,16 +114,35 @@ export function Workspace({
       </nav>
       <div className={styles.grid}>
         <PortfolioPanel id="portfolio" className={styles.portfolio} portfolio={portfolio} account={account} />
-        <MarketPanel id="market" className={styles.market} instrument={account.data.instrument} portfolio={portfolio} />
+        <MarketPanel
+          id="market"
+          className={styles.market}
+          selected={selected}
+          onSelect={select}
+          positions={account.data.positions}
+        />
         <div className={styles.ticket}>
           <OrderTicket
             id="ticket"
             account={account.data}
-            reading={portfolio.status === 'success' ? portfolio.data : null}
+            symbols={tradeable}
+            selected={selected}
+            onSelect={select}
+            quotes={marketData.status === 'success' ? marketData.data.instruments : null}
           />
         </div>
-        <OrderBlotter id="orders" className={styles.orders} accountId={accountId} />
-        <FillHistory id="fills" className={styles.fills} accountId={accountId} />
+        <OrderBlotter
+          id="orders"
+          className={styles.orders}
+          accountId={accountId}
+          symbols={historySymbols(tradeable, account.data)}
+        />
+        <FillHistory
+          id="fills"
+          className={styles.fills}
+          accountId={accountId}
+          symbols={historySymbols(tradeable, account.data)}
+        />
       </div>
     </div>
   );

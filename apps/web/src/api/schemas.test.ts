@@ -3,17 +3,25 @@ import { describe, expect, it } from 'vitest';
 import {
   accountJson,
   cancelledOrderJson,
+  closedPositionJson,
+  errorJson,
   fillJson,
+  flatPortfolioJson,
   healthJson,
   marketDataJson,
+  marketJson,
+  openPositionJson,
   partialOrderJson,
   portfolioJson,
   rejectedOrderJson,
   liveSourceJson,
   replaySourceJson,
+  unmarkableJson,
+  valuedPositionJson,
 } from '../test/fixtures';
 import {
   AccountSchema,
+  ErrorEnvelopeSchema,
   FillPageSchema,
   HealthSchema,
   MarketDataSchema,
@@ -27,11 +35,50 @@ describe('response decoders', () => {
     expect(portfolio.equity).toBe('99994.58');
     expect(portfolio.unrealized_pnl).toBe('-2.95');
     expect(portfolio.return_percent).toBe('-0.00542');
-    expect(portfolio.market.bid).toEqual({ price: '335.82', quantity: '80' });
-    expect(portfolio.market.ingest_sequence).toBe('121297');
-    for (const value of [portfolio.equity, portfolio.cash, portfolio.mark_price, portfolio.position]) {
+    const [aapl] = portfolio.positions;
+    expect(aapl?.market.bid).toEqual({ price: '335.82', quantity: '80' });
+    expect(aapl?.market.ingest_sequence).toBe('121297');
+    for (const value of [portfolio.equity, portfolio.cash, aapl?.mark_price, aapl?.quantity]) {
       expect(typeof value).toBe('string');
     }
+  });
+
+  it('decode every position and closed ledger, sorted as the server sent them', () => {
+    const account = AccountSchema.parse(
+      accountJson({
+        positions: [openPositionJson(), openPositionJson({ instrument: 'SPY', quantity: '1' })],
+        closed_positions: [closedPositionJson({ instrument: 'MSFT' })],
+      }),
+    );
+    expect(account.positions.map((position) => position.instrument)).toEqual(['AAPL', 'SPY']);
+    expect(account.closed_positions[0]?.gross_realized_pnl).toBe('2.5');
+    // An open position always has an entry price; a closed one has none.
+    expect(
+      AccountSchema.safeParse(accountJson({ positions: [openPositionJson({ average_entry_price: null })] })).success,
+    ).toBe(false);
+    // The obsolete single-instrument fields are no longer part of the contract.
+    expect(AccountSchema.safeParse({ ...accountJson(), positions: undefined }).success).toBe(false);
+  });
+
+  it('allow a flat valuation before the first market event but never a missing mark', () => {
+    expect(PortfolioSchema.safeParse(flatPortfolioJson({ valued_at: null })).success).toBe(true);
+    expect(
+      PortfolioSchema.safeParse(portfolioJson({ positions: [valuedPositionJson({ mark_price: null })] })).success,
+    ).toBe(false);
+    expect(
+      PortfolioSchema.safeParse(portfolioJson({ positions: [valuedPositionJson({ market_value: undefined })] })).success,
+    ).toBe(false);
+  });
+
+  it('decode every held position the server could not mark', () => {
+    const body = ErrorEnvelopeSchema.parse(unmarkableJson({ AAPL: 'stale_market_state', SPY: 'no_top_of_book' }));
+    expect(body.error.reason).toBe('position_mark_unavailable');
+    expect(body.error.instruments?.map((item) => [item.instrument, item.reason])).toEqual([
+      ['AAPL', 'stale_market_state'],
+      ['SPY', 'no_top_of_book'],
+    ]);
+    // Other errors carry no list.
+    expect(ErrorEnvelopeSchema.parse(errorJson('account_not_found', 'x')).error.instruments).toBeUndefined();
   });
 
   it('preserve values beyond double precision', () => {
@@ -51,7 +98,10 @@ describe('response decoders', () => {
   it('reject non-canonical decimals and malformed timestamps', () => {
     expect(PortfolioSchema.safeParse(portfolioJson({ cash: '99155.030' })).success).toBe(false);
     expect(PortfolioSchema.safeParse(portfolioJson({ valued_at: '2026-09-25T13:39:59Z' })).success).toBe(false);
-    expect(PortfolioSchema.safeParse(portfolioJson({ mark_price: '335.8200000001' })).success).toBe(false);
+    expect(
+      PortfolioSchema.safeParse(portfolioJson({ positions: [valuedPositionJson({ mark_price: '335.8200000001' })] }))
+        .success,
+    ).toBe(false);
   });
 
   it('refuse any resource that is not paper trading', () => {
@@ -106,9 +156,25 @@ describe('response decoders', () => {
     expect(
       MarketDataSchema.safeParse({
         ...marketDataJson(),
-        instruments: [{ instrument: 'AAPL', execution_quote_available: false, unavailable_reason: null }],
+        instruments: [{ instrument: 'AAPL', execution_quote_available: false, unavailable_reason: null, quote: null }],
       }).success,
     ).toBe(false);
+    // Exactly an available instrument carries its quote.
+    expect(
+      MarketDataSchema.safeParse({
+        ...marketDataJson(),
+        instruments: [{ instrument: 'AAPL', execution_quote_available: true, unavailable_reason: null, quote: null }],
+      }).success,
+    ).toBe(false);
+    expect(
+      MarketDataSchema.safeParse({
+        ...marketDataJson(),
+        instruments: [
+          { instrument: 'AAPL', execution_quote_available: false, unavailable_reason: 'no_top_of_book', quote: marketJson() },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(decoded.instruments.map((item) => item.quote?.ask?.price)).toEqual(['337', '769.78']);
     expect(
       MarketDataSchema.safeParse(marketDataJson({ source: replaySourceJson({ events_applied: 5 }) })).success,
     ).toBe(false);

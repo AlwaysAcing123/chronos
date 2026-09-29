@@ -149,7 +149,6 @@ OrderIntent intent(
 PaperOrderProcessor processor() {
     return PaperOrderProcessor(
         "account-1",
-        InstrumentId("AAPL"),
         Money::parse("1000"),
         paper_risk_limits()
     );
@@ -158,8 +157,8 @@ PaperOrderProcessor processor() {
 PaperAccountView view_of(const PaperOrderProcessor& source, std::int64_t version) {
     return PaperAccountView{
         .account_id = source.account().account_id(),
-        .instrument = source.account().instrument(),
         .state = source.account().state(),
+        .market_stream = chronos::bound_market_stream(source.executions()),
         .risk_limits = source.risk_limits(),
         .is_healthy = source.is_healthy(),
         .version = version,
@@ -199,17 +198,28 @@ Json require_error_body(
 
 void test_create_account_request_parses_exact_values() {
     auto parsed = chronos::paper_trading::parse_create_account_request(
-        R"({"account_id":"acct-1","instrument":"AAPL",)"
-        R"("starting_cash":"25000.12345678"})"
+        R"({"account_id":"acct-1","starting_cash":"25000.12345678"})"
     );
     REQUIRE(std::holds_alternative<CreatePaperAccountRequest>(parsed));
     const auto& request = std::get<CreatePaperAccountRequest>(parsed);
     REQUIRE(request.account_id == "acct-1");
-    REQUIRE(request.instrument == "AAPL");
     REQUIRE(request.starting_cash.raw() == 2'500'012'345'678);
 
+    // An account trades every configured instrument, so naming one is a
+    // mistake the client must hear about rather than a hint it may think
+    // was honored.
+    auto with_instrument = chronos::paper_trading::parse_create_account_request(
+        R"({"account_id":"a","instrument":"AAPL","starting_cash":"1"})"
+    );
+    REQUIRE(std::holds_alternative<MalformedRequest>(with_instrument));
+    REQUIRE(
+        std::get<MalformedRequest>(with_instrument).reason ==
+        MalformedRequestReason::UnexpectedField
+    );
+    REQUIRE(std::get<MalformedRequest>(with_instrument).field == "instrument");
+
     auto extra = chronos::paper_trading::parse_create_account_request(
-        R"({"account_id":"a","instrument":"AAPL","starting_cash":"1",)"
+        R"({"account_id":"a","starting_cash":"1",)"
         R"("risk_limits":{}})"
     );
     REQUIRE(std::holds_alternative<MalformedRequest>(extra));
@@ -334,8 +344,7 @@ void test_decimal_precision_and_range_are_enforced_per_type() {
     );
 
     auto rich = chronos::paper_trading::parse_create_account_request(
-        R"({"account_id":"a","instrument":"AAPL",)"
-        R"("starting_cash":"92233720368.54775808"})"
+        R"({"account_id":"a","starting_cash":"92233720368.54775808"})"
     );
     REQUIRE(std::holds_alternative<MalformedRequest>(rich));
     REQUIRE(
@@ -563,15 +572,25 @@ void test_executed_orders_render_exact_strings_and_status_201() {
     }));
 
     const Json& account = body.at("account");
+    REQUIRE(!account.contains("instrument"));
     REQUIRE(account.at("version") == "1");
     REQUIRE(account.at("status") == "active");
+    REQUIRE(account.at("market_stream_id") == chronos::test::kTestStream);
     REQUIRE(account.at("cash") == "747.49");
-    REQUIRE(account.at("position") == "2.5");
     REQUIRE(account.at("open_cost_basis") == "252.5");
-    REQUIRE(account.at("average_entry_price") == "101");
     REQUIRE(account.at("gross_realized_pnl") == "0");
     REQUIRE(account.at("fees_paid") == "0.01");
     REQUIRE(account.at("last_fill_at") == "2026-09-25T13:30:00.000000000Z");
+    REQUIRE(account.at("positions") == Json::array({Json({
+        {"instrument", "AAPL"},
+        {"quantity", "2.5"},
+        {"open_cost_basis", "252.5"},
+        {"average_entry_price", "101"},
+        {"gross_realized_pnl", "0"},
+        {"fees_paid", "0.01"},
+        {"last_fill_at", "2026-09-25T13:30:00.000000000Z"},
+    })}));
+    REQUIRE(account.at("closed_positions") == Json::array());
     REQUIRE(account.at("risk_limits").at("maximum_quote_age_ns") == "1000000000");
 
     const Json partial = response_json(
@@ -774,7 +793,11 @@ void test_account_and_health_render_without_numbers() {
         view_of(engine, 0),
         201
     )).at("account");
-    REQUIRE(flat.at("average_entry_price").is_null());
+    require_no_json_numbers(flat);
+    REQUIRE(flat.at("positions") == Json::array());
+    REQUIRE(flat.at("closed_positions") == Json::array());
+    REQUIRE(flat.at("market_stream_id").is_null());
+    REQUIRE(flat.at("open_cost_basis") == "0");
     REQUIRE(flat.at("last_fill_at").is_null());
     REQUIRE(flat.at("version") == "0");
     REQUIRE(flat.at("starting_cash") == "1000");
@@ -888,6 +911,24 @@ void test_history_queries_parse_limit_and_cursor_strictly() {
     REQUIRE(both.limit == 25U);
     REQUIRE(both.cursor == "djF8b3JkZXJzfGFjY3QtMXw0Mg");
     REQUIRE(require_history_query("cursor=abc&limit=1").limit == 1U);
+    REQUIRE(!empty.instrument.has_value());
+    const HistoryPageRequest filtered = require_history_query(
+        "instrument=SPY&limit=2"
+    );
+    REQUIRE(filtered.instrument == "SPY");
+    REQUIRE(filtered.limit == 2U);
+    // Identifier validity is the service's rule.
+    REQUIRE(require_history_query("instrument=").instrument == "");
+    require_bad_history_query(
+        "instrument=SPY&instrument=AAPL",
+        MalformedRequestReason::DuplicateField,
+        "instrument"
+    );
+    require_bad_history_query(
+        "symbol=SPY",
+        MalformedRequestReason::UnexpectedField,
+        "symbol"
+    );
     REQUIRE(require_history_query("%6Cimit=7").limit == 7U);
     REQUIRE(require_history_query("cursor=a%2Db").cursor == "a-b");
     // Range is the service's rule; syntax alone admits zero and large values.
@@ -1211,12 +1252,32 @@ void test_undeclared_journal_values_fail_closed_when_rendered() {
 // ---------------------------------------------------------------------------
 // Portfolio
 
-PaperPortfolioView portfolio_of(const PaperOrderProcessor& source, std::int64_t version) {
+chronos::MarketQuotes quotes_at(
+    std::initializer_list<TopOfBookEvent> quotes,
+    std::int64_t offset_nanoseconds = 0
+) {
+    chronos::MarketQuotes read{
+        .stream = MarketDataStreamId(std::string(chronos::test::kTestStream)),
+        .market_time = Timestamp::from_nanoseconds(
+            kMarketOpenNanoseconds + offset_nanoseconds
+        ),
+        .quotes = {},
+    };
+    for (const TopOfBookEvent& quote : quotes) {
+        read.quotes.insert_or_assign(quote.header.instrument, quote);
+    }
+    return read;
+}
+
+PaperPortfolioView portfolio_of(
+    const PaperOrderProcessor& source,
+    std::int64_t version,
+    const chronos::MarketQuotes& market = quotes_at({quote(0, 0)})
+) {
     auto valuation = chronos::value_portfolio(
         source.account(),
-        source.active_market(),
-        quote(0, 0),
-        Timestamp::from_nanoseconds(kMarketOpenNanoseconds),
+        source.executions(),
+        market,
         chronos::test::kMaximumQuoteAgeNanoseconds
     );
     REQUIRE(std::holds_alternative<PortfolioValuation>(valuation));
@@ -1239,49 +1300,138 @@ void test_portfolio_renders_every_field_as_an_exact_string() {
         {"portfolio", {
             {"trading_mode", "paper"},
             {"account_id", "account-1"},
-            {"instrument", "AAPL"},
             {"account_version", "1"},
             {"status", "active"},
+            {"market_stream_id", chronos::test::kTestStream},
             {"valued_at", "2026-09-25T13:30:00.000000000Z"},
             {"mark_policy", "best_bid"},
-            {"mark_price", "99"},
-            {"market", {
-                {"stream_id", chronos::test::kTestStream},
-                {"ingest_sequence", "0"},
-                {"venue", nullptr},
-                {"event_timestamp", "2026-09-25T13:29:59.999999750Z"},
-                {"receive_timestamp", "2026-09-25T13:30:00.000000000Z"},
-                {"quality_flags", {"replay"}},
-                {"bid", {{"price", "99"}, {"quantity", "5"}}},
-                {"ask", {{"price", "101"}, {"quantity", "5"}}},
-            }},
             {"starting_cash", "1000"},
             {"cash", "797.99"},
-            {"position", "2"},
             {"open_cost_basis", "202"},
-            {"average_entry_price", "101"},
-            {"position_market_value", "198"},
+            {"market_value", "198"},
             {"unrealized_pnl", "-4"},
             {"gross_realized_pnl", "0"},
             {"fees_paid", "0.01"},
             {"total_pnl", "-4.01"},
             {"equity", "995.99"},
             {"return_percent", "-0.401"},
+            {"positions", Json::array({Json({
+                {"instrument", "AAPL"},
+                {"quantity", "2"},
+                {"open_cost_basis", "202"},
+                {"average_entry_price", "101"},
+                {"gross_realized_pnl", "0"},
+                {"fees_paid", "0.01"},
+                {"last_fill_at", "2026-09-25T13:30:00.000000000Z"},
+                {"mark_price", "99"},
+                {"market", {
+                    {"stream_id", chronos::test::kTestStream},
+                    {"ingest_sequence", "0"},
+                    {"venue", nullptr},
+                    {"event_timestamp", "2026-09-25T13:29:59.999999750Z"},
+                    {"receive_timestamp", "2026-09-25T13:30:00.000000000Z"},
+                    {"quality_flags", {"replay"}},
+                    {"bid", {{"price", "99"}, {"quantity", "5"}}},
+                    {"ask", {{"price", "101"}, {"quantity", "5"}}},
+                }},
+                {"market_value", "198"},
+                {"unrealized_pnl", "-4"},
+            })})},
+            {"closed_positions", Json::array()},
         }},
     }));
 }
 
-void test_flat_portfolio_has_no_average_entry_price() {
+void test_flat_portfolio_has_no_positions_or_marks() {
     const Json portfolio = response_json(
         chronos::paper_trading::render_portfolio(portfolio_of(processor(), 0))
     ).at("portfolio");
-    REQUIRE(portfolio.at("average_entry_price").is_null());
-    REQUIRE(portfolio.at("position") == "0");
-    REQUIRE(portfolio.at("position_market_value") == "0");
+    require_no_json_numbers(portfolio);
+    REQUIRE(portfolio.at("positions") == Json::array());
+    REQUIRE(portfolio.at("closed_positions") == Json::array());
+    REQUIRE(portfolio.at("market_value") == "0");
     REQUIRE(portfolio.at("total_pnl") == "0");
     REQUIRE(portfolio.at("equity") == "1000");
     REQUIRE(portfolio.at("return_percent") == "0");
-    REQUIRE(portfolio.at("mark_price") == "99");
+    REQUIRE(portfolio.at("market_stream_id").is_null());
+    REQUIRE(!portfolio.contains("mark_price"));
+
+    // Before the stream's first event there is no market time.
+    chronos::MarketQuotes empty = quotes_at({});
+    empty.market_time = std::nullopt;
+    REQUIRE(response_json(chronos::paper_trading::render_portfolio(
+        portfolio_of(processor(), 0, empty)
+    )).at("portfolio").at("valued_at").is_null());
+}
+
+// Two held positions in instrument order and a closed one, with every
+// total the server's: AAPL 2 @ 101 marked at 99; SPY 3 @ 501 marked at a
+// later bid of 505; MSFT bought 1 @ 101 and sold @ 99 for -2 realized.
+void test_portfolio_renders_several_positions_and_closed_ledgers() {
+    PaperOrderProcessor engine(
+        "account-1",
+        Money::parse("5000"),
+        paper_risk_limits()
+    );
+    const TopOfBookEvent spy = quote(1, 1, "SPY", chronos::test::QuoteLevels{
+        .bid_price = "499",
+        .ask_price = "501",
+    });
+    const TopOfBookEvent spy_mark = quote(3, 3, "SPY", chronos::test::QuoteLevels{
+        .bid_price = "505",
+        .ask_price = "507",
+    });
+    const TopOfBookEvent msft = quote(2, 2, "MSFT");
+    OrderIntent buy_spy = intent("spy", Side::Buy, "3", 2);
+    buy_spy.instrument = InstrumentId("SPY");
+    OrderIntent buy_msft = intent("msft-buy", Side::Buy, "1", 2);
+    buy_msft.instrument = InstrumentId("MSFT");
+    OrderIntent sell_msft = intent("msft-sell", Side::Sell, "1", 2);
+    sell_msft.instrument = InstrumentId("MSFT");
+    static_cast<void>(record(engine, intent("aapl", Side::Buy, "2", 2), quote(0, 0), 1));
+    static_cast<void>(record(engine, buy_spy, spy, 2));
+    static_cast<void>(record(engine, buy_msft, msft, 3));
+    static_cast<void>(record(engine, sell_msft, msft, 4));
+
+    const Json portfolio = response_json(chronos::paper_trading::render_portfolio(
+        portfolio_of(engine, 4, quotes_at({quote(0, 0), spy_mark}, 3))
+    )).at("portfolio");
+    require_no_json_numbers(portfolio);
+    REQUIRE(portfolio.at("positions").size() == 2);
+    REQUIRE(portfolio.at("positions")[0].at("instrument") == "AAPL");
+    REQUIRE(portfolio.at("positions")[0].at("market_value") == "198");
+    REQUIRE(portfolio.at("positions")[1].at("instrument") == "SPY");
+    REQUIRE(portfolio.at("positions")[1].at("mark_price") == "505");
+    REQUIRE(portfolio.at("positions")[1].at("market_value") == "1515");
+    REQUIRE(portfolio.at("positions")[1].at("unrealized_pnl") == "12");
+    REQUIRE(portfolio.at("positions")[1].at("market").at("ingest_sequence") == "3");
+    REQUIRE(portfolio.at("closed_positions") == Json::array({Json({
+        {"instrument", "MSFT"},
+        {"gross_realized_pnl", "-2"},
+        {"fees_paid", "0.02"},
+        {"last_fill_at", "2026-09-25T13:30:00.000000002Z"},
+    })}));
+    // 5000 - 202.01 - 1503.01 - 101.01 + 98.99 = 3292.96.
+    REQUIRE(portfolio.at("cash") == "3292.96");
+    REQUIRE(portfolio.at("open_cost_basis") == "1705");
+    REQUIRE(portfolio.at("market_value") == "1713");
+    REQUIRE(portfolio.at("unrealized_pnl") == "8");
+    REQUIRE(portfolio.at("gross_realized_pnl") == "-2");
+    REQUIRE(portfolio.at("fees_paid") == "0.04");
+    REQUIRE(portfolio.at("total_pnl") == "5.96");
+    REQUIRE(portfolio.at("equity") == "5005.96");
+    REQUIRE(portfolio.at("return_percent") == "0.1192");
+
+    // The account resource lists the same ledgers without marks.
+    const Json account = response_json(chronos::paper_trading::render_account(
+        view_of(engine, 4),
+        200
+    )).at("account");
+    REQUIRE(account.at("positions").size() == 2);
+    REQUIRE(!account.at("positions")[1].contains("mark_price"));
+    REQUIRE(account.at("closed_positions") == portfolio.at("closed_positions"));
+    REQUIRE(account.at("gross_realized_pnl") == "-2");
+    REQUIRE(account.at("last_fill_at") == "2026-09-25T13:30:00.000000002Z");
 }
 
 // A faulted processor keeps its last reconciled account, which is still
@@ -1349,6 +1499,54 @@ void test_portfolio_errors_map_to_stable_codes_and_reasons() {
         REQUIRE(failed.at("error").at("reason") == reason);
         REQUIRE(!failed.contains("portfolio"));
     }
+    // Only a position-mark failure lists instruments.
+    REQUIRE(!require_error_body(
+        render(
+            PaperTradingErrorCode::MarketDataUnavailable,
+            PortfolioValuationErrorCode::StaleMarketState
+        ),
+        503,
+        "market_data_unavailable"
+    ).at("error").contains("instruments"));
+    PaperTradingError unmarkable{
+        .code = PaperTradingErrorCode::MarketDataUnavailable,
+        .field = "",
+        .message = "2 open positions cannot be marked",
+        .market_state = std::nullopt,
+        .valuation = PortfolioValuationErrorCode::PositionMarkUnavailable,
+        .instruments = {
+            chronos::PositionMarkFailure{
+                .instrument = InstrumentId("AAPL"),
+                .reason = chronos::MarketStateUnavailableCode::AwaitingFreshQuote,
+                .message = "no quote since reconnect",
+            },
+            chronos::PositionMarkFailure{
+                .instrument = InstrumentId("SPY"),
+                .reason = PortfolioValuationErrorCode::StaleMarketState,
+                .message = "quote is stale",
+            },
+        },
+    };
+    const Json unmarkable_body = require_error_body(
+        chronos::paper_trading::render_portfolio(unmarkable),
+        503,
+        "market_data_unavailable"
+    );
+    require_no_json_numbers(unmarkable_body);
+    REQUIRE(unmarkable_body.at("error").at("reason") == "position_mark_unavailable");
+    REQUIRE(unmarkable_body.at("error").at("instruments") == Json::array({
+        Json({
+            {"instrument", "AAPL"},
+            {"reason", "awaiting_fresh_quote"},
+            {"message", "no quote since reconnect"},
+        }),
+        Json({
+            {"instrument", "SPY"},
+            {"reason", "stale_market_state"},
+            {"message", "quote is stale"},
+        }),
+    }));
+
     const Json outage = require_error_body(
         render(PaperTradingErrorCode::PersistenceUnavailable, std::nullopt),
         503,
@@ -1452,8 +1650,12 @@ int main() {
             test_portfolio_renders_every_field_as_an_exact_string,
         },
         {
-            "flat portfolio has no average entry price",
-            test_flat_portfolio_has_no_average_entry_price,
+            "flat portfolio has no positions or marks",
+            test_flat_portfolio_has_no_positions_or_marks,
+        },
+        {
+            "portfolio renders several positions and closed ledgers",
+            test_portfolio_renders_several_positions_and_closed_ledgers,
         },
         {
             "halted portfolio is valued and reports its status",

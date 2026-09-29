@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -330,73 +331,98 @@ std::string outcome_text(Enum value, std::string_view description) {
     );
 }
 
-void add_account_state_parameters(
+// The paper_accounts columns after account_id, in insert order.
+void add_account_parameters(
     PostgresParameters& parameters,
     const PaperOrderProcessorRecoveryState& state
 ) {
-    parameters.add(state.account.instrument.value());
     parameters.add(state.account.state.starting_cash.raw());
     parameters.add(state.account.state.cash.raw());
-    parameters.add(state.account.state.position.raw());
-    parameters.add(state.account.state.open_cost_basis.raw());
-    parameters.add(state.account.state.gross_realized_pnl.raw());
-    parameters.add(state.account.state.fees_paid.raw());
-    parameters.add_optional(
-        state.account.state.last_fill_timestamp
-            ? std::optional<std::int64_t>(
-                  state.account.state.last_fill_timestamp->nanoseconds()
-              )
-            : std::nullopt
-    );
     parameters.add(state.risk_limits.maximum_order_quantity.raw());
     parameters.add(state.risk_limits.maximum_order_notional.raw());
     parameters.add(state.risk_limits.maximum_position_quantity.raw());
     parameters.add(state.risk_limits.maximum_quote_age_nanoseconds);
     parameters.add(state.risk_limits.fee_per_fill.raw());
     parameters.add(state.is_healthy);
+    const auto stream = bound_market_stream(state.execution.instruments);
+    parameters.add(
+        stream ? std::optional<std::string>(stream->value()) : std::nullopt
+    );
+}
 
-    if (!state.execution.active_market) {
-        for (int index = 0; index < 11; ++index) {
-            parameters.add(std::optional<std::string>{});
+// The eleven `<prefix>stream_id` through `<prefix>ask_quantity_raw` columns
+// shared by execution states and the order journal.
+void add_top_of_book_parameters(
+    PostgresParameters& parameters,
+    const TopOfBookEvent& market
+) {
+    parameters.add(market.header.stream.value());
+    parameters.add(
+        market.header.venue
+            ? std::optional<std::string>(market.header.venue->value())
+            : std::nullopt
+    );
+    parameters.add(market.header.event_timestamp.nanoseconds());
+    parameters.add(market.header.receive_timestamp.nanoseconds());
+    parameters.add(market.header.ingest_sequence);
+    parameters.add_optional(market.header.venue_sequence);
+    parameters.add(market.header.quality.raw());
+    parameters.add_optional(
+        market.bid
+            ? std::optional<std::int64_t>(market.bid->price.raw())
+            : std::nullopt
+    );
+    parameters.add_optional(
+        market.bid
+            ? std::optional<std::int64_t>(market.bid->quantity.raw())
+            : std::nullopt
+    );
+    parameters.add_optional(
+        market.ask
+            ? std::optional<std::int64_t>(market.ask->price.raw())
+            : std::nullopt
+    );
+    parameters.add_optional(
+        market.ask
+            ? std::optional<std::int64_t>(market.ask->quantity.raw())
+            : std::nullopt
+    );
+}
+
+// A position or execution row an order creates or changes.
+template <typename Row>
+struct RowChange {
+    const InstrumentId* instrument;
+    const Row* row;
+    bool is_new;
+};
+
+// Rows keyed by instrument are created and changed, never removed: a closed
+// position keeps its ledger and an execution state is replaced in place.
+template <typename Row>
+std::vector<RowChange<Row>> changed_rows(
+    const std::map<InstrumentId, Row>& before,
+    const std::map<InstrumentId, Row>& after,
+    std::string_view description
+) {
+    for (const auto& entry : before) {
+        if (!after.contains(entry.first)) {
+            throw std::invalid_argument(
+                "a persisted " + std::string(description) +
+                " cannot be removed"
+            );
         }
-    } else {
-        const auto& market = *state.execution.active_market;
-        parameters.add(market.header.stream.value());
-        parameters.add(
-            market.header.venue
-                ? std::optional<std::string>(
-                      market.header.venue->value()
-                  )
-                : std::nullopt
-        );
-        parameters.add(market.header.event_timestamp.nanoseconds());
-        parameters.add(market.header.receive_timestamp.nanoseconds());
-        parameters.add(market.header.ingest_sequence);
-        parameters.add_optional(market.header.venue_sequence);
-        parameters.add(market.header.quality.raw());
-        parameters.add_optional(
-            market.bid
-                ? std::optional<std::int64_t>(market.bid->price.raw())
-                : std::nullopt
-        );
-        parameters.add_optional(
-            market.bid
-                ? std::optional<std::int64_t>(market.bid->quantity.raw())
-                : std::nullopt
-        );
-        parameters.add_optional(
-            market.ask
-                ? std::optional<std::int64_t>(market.ask->price.raw())
-                : std::nullopt
-        );
-        parameters.add_optional(
-            market.ask
-                ? std::optional<std::int64_t>(market.ask->quantity.raw())
-                : std::nullopt
-        );
     }
-    parameters.add(state.execution.consumed_bid_quantity.raw());
-    parameters.add(state.execution.consumed_ask_quantity.raw());
+    std::vector<RowChange<Row>> changes;
+    for (const auto& [instrument, row] : after) {
+        const auto found = before.find(instrument);
+        if (found == before.end()) {
+            changes.push_back({&instrument, &row, true});
+        } else if (found->second != row) {
+            changes.push_back({&instrument, &row, false});
+        }
+    }
+    return changes;
 }
 
 struct PersistedOutcomeFields {
@@ -497,37 +523,7 @@ void add_order_record_parameters(
     parameters.add(intent_text(intent.time_in_force));
     parameters.add(intent.submitted_at.nanoseconds());
     parameters.add(market.header.instrument.value());
-    parameters.add(market.header.stream.value());
-    parameters.add(
-        market.header.venue
-            ? std::optional<std::string>(market.header.venue->value())
-            : std::nullopt
-    );
-    parameters.add(market.header.event_timestamp.nanoseconds());
-    parameters.add(market.header.receive_timestamp.nanoseconds());
-    parameters.add(market.header.ingest_sequence);
-    parameters.add_optional(market.header.venue_sequence);
-    parameters.add(market.header.quality.raw());
-    parameters.add_optional(
-        market.bid
-            ? std::optional<std::int64_t>(market.bid->price.raw())
-            : std::nullopt
-    );
-    parameters.add_optional(
-        market.bid
-            ? std::optional<std::int64_t>(market.bid->quantity.raw())
-            : std::nullopt
-    );
-    parameters.add_optional(
-        market.ask
-            ? std::optional<std::int64_t>(market.ask->price.raw())
-            : std::nullopt
-    );
-    parameters.add_optional(
-        market.ask
-            ? std::optional<std::int64_t>(market.ask->quantity.raw())
-            : std::nullopt
-    );
+    add_top_of_book_parameters(parameters, market);
     parameters.add(outcome.kind);
     parameters.add(outcome.code);
     parameters.add(outcome.field);
@@ -579,15 +575,24 @@ void add_order_record_parameters(
         ? std::optional<std::int64_t>(fill->timestamp.nanoseconds())
         : std::nullopt);
 
+    // An audit snapshot of the account's cash and the order instrument's
+    // ledger after the order; an instrument never filled has an empty one.
+    // Recovery reads the position tables, never these columns.
     const AccountState& account = state_after.account.state;
+    const PositionState* position = account.position(intent.instrument);
     parameters.add(account.cash.raw());
-    parameters.add(account.position.raw());
-    parameters.add(account.open_cost_basis.raw());
-    parameters.add(account.gross_realized_pnl.raw());
-    parameters.add(account.fees_paid.raw());
-    parameters.add_optional(account.last_fill_timestamp
+    parameters.add(intent.instrument.value());
+    parameters.add(position ? position->quantity.raw() : std::int64_t{0});
+    parameters.add(
+        position ? position->open_cost_basis.raw() : std::int64_t{0}
+    );
+    parameters.add(
+        position ? position->gross_realized_pnl.raw() : std::int64_t{0}
+    );
+    parameters.add(position ? position->fees_paid.raw() : std::int64_t{0});
+    parameters.add_optional(position
         ? std::optional<std::int64_t>(
-              account.last_fill_timestamp->nanoseconds()
+              position->last_fill_timestamp.nanoseconds()
           )
         : std::nullopt);
     parameters.add(outcome.processed_by_execution);
@@ -635,8 +640,8 @@ std::uint64_t persisted_uint64(
 }
 
 // Reads a top-of-book observation from the `<prefix>stream_id`,
-// `<prefix>bid_price_raw`, and related columns. The account snapshot
-// (`active_`) and the order journal (`market_`) share this shape.
+// `<prefix>bid_price_raw`, and related columns. Execution states and the
+// order journal share this shape with the `market_` prefix.
 TopOfBookEvent persisted_top_of_book(
     const PostgresResult& result,
     int row,
@@ -1071,6 +1076,11 @@ void add_page_parameters(
     parameters.add(account_id);
     parameters.add_optional(request.before_record_id);
     parameters.add(static_cast<std::int64_t>(request.limit + 1));
+    parameters.add(
+        request.instrument
+            ? std::optional<std::string>(request.instrument->value())
+            : std::nullopt
+    );
 }
 
 // The query fetched at most limit + 1 rows, newest first; the extra row only
@@ -1165,47 +1175,32 @@ CreatePaperAccountResult PostgresPaperOrderRepository::create_account(
     const PaperOrderProcessorRecoveryState& state
 ) {
     static_cast<void>(PaperOrderProcessor::restore(state));
+    // A new account has traded nothing, so it is only its account row.
+    if (!state.account.state.positions.empty() ||
+        !state.execution.instruments.empty() ||
+        !state.account.applied_fill_ids.empty() ||
+        !state.execution.processed_client_order_ids.empty()) {
+        throw std::invalid_argument("a new paper account must not have traded");
+    }
     PostgresParameters parameters;
     parameters.add(state.account.account_id);
-    add_account_state_parameters(parameters, state);
+    add_account_parameters(parameters, state);
     impl_->ensure_connected();
     const auto result = execute(
         impl_->connection,
         R"SQL(
             INSERT INTO paper_accounts (
                 account_id,
-                instrument,
                 starting_cash_raw,
                 cash_raw,
-                position_raw,
-                open_cost_basis_raw,
-                gross_realized_pnl_raw,
-                fees_paid_raw,
-                last_fill_timestamp_ns,
                 maximum_order_quantity_raw,
                 maximum_order_notional_raw,
                 maximum_position_quantity_raw,
                 maximum_quote_age_ns,
                 fee_per_fill_raw,
                 is_healthy,
-                active_stream_id,
-                active_venue,
-                active_event_timestamp_ns,
-                active_receive_timestamp_ns,
-                active_ingest_sequence,
-                active_venue_sequence,
-                active_quality_flags,
-                active_bid_price_raw,
-                active_bid_quantity_raw,
-                active_ask_price_raw,
-                active_ask_quantity_raw,
-                consumed_bid_quantity_raw,
-                consumed_ask_quantity_raw
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28
-            )
+                market_stream_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (account_id) DO NOTHING
             RETURNING version
         )SQL",
@@ -1238,7 +1233,11 @@ PostgresPaperOrderRepository::load_account(std::string_view account_id) {
     const auto result = execute(
         impl_->connection,
         R"SQL(
-            SELECT *
+            SELECT
+                account_id, starting_cash_raw, cash_raw,
+                maximum_order_quantity_raw, maximum_order_notional_raw,
+                maximum_position_quantity_raw, maximum_quote_age_ns,
+                fee_per_fill_raw, is_healthy, market_stream_id, version
             FROM paper_accounts
             WHERE account_id = $1
         )SQL",
@@ -1256,17 +1255,6 @@ PostgresPaperOrderRepository::load_account(std::string_view account_id) {
             field
         );
     };
-    const auto last_fill_timestamp_ns = optional_int64(
-        result,
-        0,
-        "last_fill_timestamp_ns"
-    );
-    const std::optional<Timestamp> last_fill_timestamp =
-        last_fill_timestamp_ns
-            ? std::optional<Timestamp>(Timestamp::from_nanoseconds(
-                  *last_fill_timestamp_ns
-              ))
-            : std::nullopt;
     PaperOrderProcessorRecoveryState state{
         .risk_limits = PreTradeRiskLimits{
             .maximum_order_quantity = Quantity::from_raw(
@@ -1286,38 +1274,18 @@ PostgresPaperOrderRepository::load_account(std::string_view account_id) {
         },
         .account = PaperAccountRecoveryState{
             .account_id = result.value(0, "account_id"),
-            .instrument = InstrumentId(result.value(0, "instrument")),
             .state = AccountState{
                 .starting_cash = Money::from_raw(
                     required_int64("starting_cash_raw")
                 ),
                 .cash = Money::from_raw(required_int64("cash_raw")),
-                .position = Quantity::from_raw(
-                    required_int64("position_raw")
-                ),
-                .open_cost_basis = Money::from_raw(
-                    required_int64("open_cost_basis_raw")
-                ),
-                .gross_realized_pnl = Money::from_raw(
-                    required_int64("gross_realized_pnl_raw")
-                ),
-                .fees_paid = Money::from_raw(
-                    required_int64("fees_paid_raw")
-                ),
-                .last_fill_timestamp = last_fill_timestamp,
+                .positions = {},
             },
             .applied_fill_ids = {},
         },
         .execution = TopOfBookExecutionRecoveryState{
             .account_id = result.value(0, "account_id"),
-            .instrument = InstrumentId(result.value(0, "instrument")),
-            .active_market = std::nullopt,
-            .consumed_bid_quantity = Quantity::from_raw(
-                required_int64("consumed_bid_quantity_raw")
-            ),
-            .consumed_ask_quantity = Quantity::from_raw(
-                required_int64("consumed_ask_quantity_raw")
-            ),
+            .instruments = {},
             .processed_client_order_ids = {},
         },
         .is_healthy = parse_boolean(
@@ -1325,13 +1293,98 @@ PostgresPaperOrderRepository::load_account(std::string_view account_id) {
             "is_healthy"
         ),
     };
+    const auto market_stream = result.optional_value(0, "market_stream_id");
 
-    if (!result.is_null(0, "active_stream_id")) {
-        state.execution.active_market = persisted_top_of_book(
-            result,
-            0,
-            "active_",
-            state.account.instrument
+    PostgresParameters position_parameters;
+    position_parameters.add(account_id);
+    const auto positions = execute(
+        impl_->connection,
+        R"SQL(
+            SELECT
+                instrument, quantity_raw, open_cost_basis_raw,
+                gross_realized_pnl_raw, fees_paid_raw, last_fill_timestamp_ns
+            FROM paper_positions
+            WHERE account_id = $1
+        )SQL",
+        position_parameters
+    );
+    require_status(positions, PGRES_TUPLES_OK, "load paper positions");
+    for (int row = 0; row < positions.row_count(); ++row) {
+        state.account.state.positions.emplace(
+            InstrumentId(positions.value(row, "instrument")),
+            PositionState{
+                .quantity = Quantity::from_raw(
+                    persisted_int64(positions, row, "quantity_raw")
+                ),
+                .open_cost_basis = Money::from_raw(
+                    persisted_int64(positions, row, "open_cost_basis_raw")
+                ),
+                .gross_realized_pnl = Money::from_raw(
+                    persisted_int64(positions, row, "gross_realized_pnl_raw")
+                ),
+                .fees_paid = Money::from_raw(
+                    persisted_int64(positions, row, "fees_paid_raw")
+                ),
+                .last_fill_timestamp = Timestamp::from_nanoseconds(
+                    persisted_int64(positions, row, "last_fill_timestamp_ns")
+                ),
+            }
+        );
+    }
+
+    PostgresParameters execution_parameters;
+    execution_parameters.add(account_id);
+    const auto executions = execute(
+        impl_->connection,
+        R"SQL(
+            SELECT
+                instrument, market_stream_id, market_venue,
+                market_event_timestamp_ns, market_receive_timestamp_ns,
+                market_ingest_sequence, market_venue_sequence,
+                market_quality_flags, market_bid_price_raw,
+                market_bid_quantity_raw, market_ask_price_raw,
+                market_ask_quantity_raw, consumed_bid_quantity_raw,
+                consumed_ask_quantity_raw
+            FROM paper_execution_states
+            WHERE account_id = $1
+        )SQL",
+        execution_parameters
+    );
+    require_status(executions, PGRES_TUPLES_OK, "load execution states");
+    for (int row = 0; row < executions.row_count(); ++row) {
+        InstrumentId instrument(executions.value(row, "instrument"));
+        if (!market_stream ||
+            executions.value(row, "market_stream_id") != *market_stream) {
+            throw std::runtime_error(
+                "persisted execution state is not on the account's stream"
+            );
+        }
+        TopOfBookEvent active_market = persisted_top_of_book(
+            executions,
+            row,
+            "market_",
+            instrument
+        );
+        state.execution.instruments.emplace(
+            std::move(instrument),
+            InstrumentExecutionState{
+                .active_market = std::move(active_market),
+                .consumed_bid_quantity = Quantity::from_raw(persisted_int64(
+                    executions,
+                    row,
+                    "consumed_bid_quantity_raw"
+                )),
+                .consumed_ask_quantity = Quantity::from_raw(persisted_int64(
+                    executions,
+                    row,
+                    "consumed_ask_quantity_raw"
+                )),
+            }
+        );
+    }
+    if (market_stream && state.execution.instruments.empty()) {
+        throw std::runtime_error(
+            "persisted account is bound to a stream without executing"
         );
     }
 
@@ -1395,18 +1448,31 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
     const OrderIntent& intent,
     const TopOfBookEvent& market,
     const PaperOrderResult& result,
+    const PaperOrderProcessorRecoveryState& state_before,
     const PaperOrderProcessorRecoveryState& state_after
 ) {
     if (expected_version < 0) {
         throw std::invalid_argument("expected version must not be negative");
     }
-    if (state_after.account.account_id != account_id ||
+    if (state_before.account.account_id != account_id ||
+        state_before.execution.account_id != account_id ||
+        state_after.account.account_id != account_id ||
         state_after.execution.account_id != account_id) {
         throw std::invalid_argument(
             "persisted state does not belong to the requested account"
         );
     }
     static_cast<void>(PaperOrderProcessor::restore(state_after));
+    const auto execution_changes = changed_rows(
+        state_before.execution.instruments,
+        state_after.execution.instruments,
+        "execution state"
+    );
+    const auto position_changes = changed_rows(
+        state_before.account.state.positions,
+        state_after.account.state.positions,
+        "position"
+    );
     if (const auto* receipt = std::get_if<PaperOrderReceipt>(&result)) {
         if (receipt->execution.intent != intent ||
             receipt->execution.market_ingest_sequence !=
@@ -1423,42 +1489,24 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
     PostgresTransaction transaction(impl_->connection);
     PostgresParameters update_parameters;
     update_parameters.add(account_id);
-    add_account_state_parameters(update_parameters, state_after);
+    add_account_parameters(update_parameters, state_after);
     update_parameters.add(expected_version);
     const auto update = execute(
         impl_->connection,
         R"SQL(
             UPDATE paper_accounts SET
-                instrument = $2,
-                starting_cash_raw = $3,
-                cash_raw = $4,
-                position_raw = $5,
-                open_cost_basis_raw = $6,
-                gross_realized_pnl_raw = $7,
-                fees_paid_raw = $8,
-                last_fill_timestamp_ns = $9,
-                maximum_order_quantity_raw = $10,
-                maximum_order_notional_raw = $11,
-                maximum_position_quantity_raw = $12,
-                maximum_quote_age_ns = $13,
-                fee_per_fill_raw = $14,
-                is_healthy = $15,
-                active_stream_id = $16,
-                active_venue = $17,
-                active_event_timestamp_ns = $18,
-                active_receive_timestamp_ns = $19,
-                active_ingest_sequence = $20,
-                active_venue_sequence = $21,
-                active_quality_flags = $22,
-                active_bid_price_raw = $23,
-                active_bid_quantity_raw = $24,
-                active_ask_price_raw = $25,
-                active_ask_quantity_raw = $26,
-                consumed_bid_quantity_raw = $27,
-                consumed_ask_quantity_raw = $28,
+                starting_cash_raw = $2,
+                cash_raw = $3,
+                maximum_order_quantity_raw = $4,
+                maximum_order_notional_raw = $5,
+                maximum_position_quantity_raw = $6,
+                maximum_quote_age_ns = $7,
+                fee_per_fill_raw = $8,
+                is_healthy = $9,
+                market_stream_id = $10,
                 version = version + 1,
                 updated_at = clock_timestamp()
-            WHERE account_id = $1 AND version = $29
+            WHERE account_id = $1 AND version = $11
             RETURNING version
         )SQL",
         update_parameters
@@ -1488,6 +1536,105 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
         "version"
     );
 
+    // The version matched, so the stored rows are exactly state_before. A
+    // position references its execution state, so executions go first.
+    for (const auto& change : execution_changes) {
+        PostgresParameters execution_parameters;
+        execution_parameters.add(account_id);
+        execution_parameters.add(change.instrument->value());
+        add_top_of_book_parameters(
+            execution_parameters,
+            change.row->active_market
+        );
+        execution_parameters.add(change.row->consumed_bid_quantity.raw());
+        execution_parameters.add(change.row->consumed_ask_quantity.raw());
+        const auto written = execute(
+            impl_->connection,
+            change.is_new
+                ? R"SQL(
+                    INSERT INTO paper_execution_states (
+                        account_id, instrument, market_stream_id,
+                        market_venue, market_event_timestamp_ns,
+                        market_receive_timestamp_ns, market_ingest_sequence,
+                        market_venue_sequence, market_quality_flags,
+                        market_bid_price_raw, market_bid_quantity_raw,
+                        market_ask_price_raw, market_ask_quantity_raw,
+                        consumed_bid_quantity_raw, consumed_ask_quantity_raw
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                        $11, $12, $13, $14, $15
+                    )
+                    RETURNING instrument
+                )SQL"
+                : R"SQL(
+                    UPDATE paper_execution_states SET
+                        market_stream_id = $3,
+                        market_venue = $4,
+                        market_event_timestamp_ns = $5,
+                        market_receive_timestamp_ns = $6,
+                        market_ingest_sequence = $7,
+                        market_venue_sequence = $8,
+                        market_quality_flags = $9,
+                        market_bid_price_raw = $10,
+                        market_bid_quantity_raw = $11,
+                        market_ask_price_raw = $12,
+                        market_ask_quantity_raw = $13,
+                        consumed_bid_quantity_raw = $14,
+                        consumed_ask_quantity_raw = $15
+                    WHERE account_id = $1 AND instrument = $2
+                    RETURNING instrument
+                )SQL",
+            execution_parameters
+        );
+        require_status(written, PGRES_TUPLES_OK, "write execution state");
+        if (written.row_count() != 1) {
+            throw std::runtime_error(
+                "stored execution states differ from the recovered state"
+            );
+        }
+    }
+    for (const auto& change : position_changes) {
+        PostgresParameters position_parameters;
+        position_parameters.add(account_id);
+        position_parameters.add(change.instrument->value());
+        position_parameters.add(change.row->quantity.raw());
+        position_parameters.add(change.row->open_cost_basis.raw());
+        position_parameters.add(change.row->gross_realized_pnl.raw());
+        position_parameters.add(change.row->fees_paid.raw());
+        position_parameters.add(
+            change.row->last_fill_timestamp.nanoseconds()
+        );
+        const auto written = execute(
+            impl_->connection,
+            change.is_new
+                ? R"SQL(
+                    INSERT INTO paper_positions (
+                        account_id, instrument, quantity_raw,
+                        open_cost_basis_raw, gross_realized_pnl_raw,
+                        fees_paid_raw, last_fill_timestamp_ns
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING instrument
+                )SQL"
+                : R"SQL(
+                    UPDATE paper_positions SET
+                        quantity_raw = $3,
+                        open_cost_basis_raw = $4,
+                        gross_realized_pnl_raw = $5,
+                        fees_paid_raw = $6,
+                        last_fill_timestamp_ns = $7
+                    WHERE account_id = $1 AND instrument = $2
+                    RETURNING instrument
+                )SQL",
+            position_parameters
+        );
+        require_status(written, PGRES_TUPLES_OK, "write paper position");
+        if (written.row_count() != 1) {
+            throw std::runtime_error(
+                "stored positions differ from the recovered state"
+            );
+        }
+    }
+
     PostgresParameters order_parameters;
     add_order_record_parameters(
         order_parameters,
@@ -1515,18 +1662,18 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
                 cancellation_reason, execution_market_ingest_sequence,
                 fill_id, fill_side, fill_price_raw, fill_quantity_raw,
                 fill_fee_raw, fill_timestamp_ns, account_cash_after_raw,
-                account_position_after_raw,
-                account_open_cost_basis_after_raw,
-                account_gross_realized_pnl_after_raw,
-                account_fees_paid_after_raw,
-                account_last_fill_timestamp_after_ns,
+                position_after_instrument, position_quantity_after_raw,
+                position_open_cost_basis_after_raw,
+                position_gross_realized_pnl_after_raw,
+                position_fees_paid_after_raw,
+                position_last_fill_timestamp_after_ns,
                 processed_by_execution
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                 $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
                 $31, $32, $33, $34, $35, $36, $37, $38, $39, $40,
-                $41, $42, $43, $44, $45
+                $41, $42, $43, $44, $45, $46
             )
             RETURNING order_record_id
         )SQL",
@@ -1648,6 +1795,7 @@ PaperOrderPageResult PostgresPaperOrderRepository::list_orders(
             FROM paper_order_records
             WHERE account_id = $1
               AND ($2::bigint IS NULL OR order_record_id < $2)
+              AND ($4::text IS NULL OR instrument = $4)
             ORDER BY order_record_id DESC
             LIMIT $3
         )SQL",
@@ -1692,6 +1840,7 @@ PaperFillPageResult PostgresPaperOrderRepository::list_fills(
               AND outcome_kind = 'receipt'
               AND fill_id IS NOT NULL
               AND ($2::bigint IS NULL OR order_record_id < $2)
+              AND ($4::text IS NULL OR instrument = $4)
             ORDER BY order_record_id DESC
             LIMIT $3
         )SQL",
@@ -1775,13 +1924,11 @@ std::variant<PersistentPaperOrderSession, PaperPersistenceConflict>
 PersistentPaperOrderSession::create(
     PostgresPaperOrderRepository& repository,
     std::string account_id,
-    InstrumentId instrument,
     Money starting_cash,
     PreTradeRiskLimits risk_limits
 ) {
     PaperOrderProcessor processor(
         std::move(account_id),
-        std::move(instrument),
         starting_cash,
         risk_limits
     );
@@ -1828,6 +1975,7 @@ PersistentPaperOrderResult PersistentPaperOrderSession::submit(
             intent,
             market,
             result,
+            state_before,
             processor_.recovery_state()
         );
         if (std::holds_alternative<PaperPersistenceConflict>(commit)) {

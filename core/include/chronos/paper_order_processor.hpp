@@ -44,7 +44,6 @@ class PaperOrderProcessor final {
 public:
     PaperOrderProcessor(
         std::string account_id,
-        InstrumentId instrument,
         Money starting_cash,
         PreTradeRiskLimits risk_limits
     );
@@ -64,11 +63,11 @@ public:
 
     [[nodiscard]] bool is_healthy() const noexcept { return is_healthy_; }
 
-    // The market observation of the latest execution, which fixes the
-    // account's market timeline; absent before the first execution.
-    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+    // Each executed instrument's latest execution observation and consumed
+    // liquidity. Together they fix the account's market timeline.
+    [[nodiscard]] const InstrumentExecutionStates& executions()
         const noexcept {
-        return execution_simulator_.active_market();
+        return execution_simulator_.instruments();
     }
 
     [[nodiscard]] PaperOrderProcessorRecoveryState recovery_state() const;

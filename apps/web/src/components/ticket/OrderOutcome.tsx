@@ -23,6 +23,7 @@ type OutcomeState = Exclude<TicketState, { step: 'editing' } | { step: 'reviewin
 
 interface OutcomeActions {
   readonly onSubmitAgain: () => void;
+  readonly submitDisabled: boolean;
   readonly onCheckAgain: () => void;
   readonly onEdit: () => void;
   readonly onStartOver: () => void;
@@ -153,7 +154,7 @@ function OutcomeBody({ state, actions }: { readonly state: OutcomeState; readonl
             actions={
               <>
                 {state.transient && (
-                  <Button variant="primary" onClick={actions.onSubmitAgain}>
+                  <Button variant="primary" onClick={actions.onSubmitAgain} disabled={actions.submitDisabled}>
                     Send again with the same ID
                   </Button>
                 )}
@@ -214,7 +215,7 @@ function OutcomeBody({ state, actions }: { readonly state: OutcomeState; readonl
             live
             actions={
               <>
-                <Button variant="primary" onClick={actions.onSubmitAgain}>
+                <Button variant="primary" onClick={actions.onSubmitAgain} disabled={actions.submitDisabled}>
                   Send again with the same ID
                 </Button>
                 <Button onClick={actions.onStartOver}>Discard order</Button>

@@ -8,9 +8,11 @@ same `PreTradeRiskEngine`, and enter the same
 `TopOfBookExecutionSimulator`. The output is a simulated execution report or
 a structured error.
 
-This is an in-memory, single-account, single-instrument, long-only paper
-simulation. It cannot send an order to a broker, exchange, or real-money
-account.
+This is an in-memory, single-account, long-only paper simulation. One account
+trades any number of instruments from one cash balance; every order names
+exactly one of them. It cannot send an order to a broker, exchange, or
+real-money account. The multi-instrument rules are recorded in
+[decisions/0010-multi-instrument-accounts.md](decisions/0010-multi-instrument-accounts.md).
 
 ## Flow
 
@@ -46,8 +48,9 @@ Risk and execution rejections also leave accounting state unchanged.
 
 Every order contains:
 
-- A caller-supplied client order ID used for idempotency
-- The target paper account and instrument
+- A caller-supplied client order ID used for idempotency, unique across the
+  whole account whatever the instrument
+- The target paper account and the one instrument it trades
 - Side, quantity, order type, optional limit price, and time in force
 - A submission timestamp
 - Explicit source attribution consisting of a source kind and source ID
@@ -62,21 +65,32 @@ cancel requests require an order state machine and are intentionally deferred.
 ## Pre-trade validation and risk
 
 The risk engine rejects malformed intents before examining account exposure.
-It then enforces:
+Which instruments are tradeable is the application's rule: the paper-trading
+service refuses an unconfigured instrument before anything is recorded. The
+engine then enforces:
 
-- Exact account and instrument identity
-- A structurally valid top-of-book event for the order's instrument
+- Exact account identity
+- A structurally valid top-of-book event for the order's instrument; a quote
+  for another instrument is a `market_instrument_mismatch` rejection, so an
+  AAPL quote can never fill an SPY order
 - No potentially invalid book or questionable receive timestamp
 - No market observation received after order submission
 - A configurable maximum quote age
 - Displayed liquidity on the opposite side of the book
-- Maximum order quantity and notional
-- Maximum long position after a buy
-- Sufficient cash for a buy and its flat fill fee
-- Sufficient owned position for a sell
+- Maximum order quantity and notional, per order
+- Maximum long position after a buy, per instrument: the order instrument's
+  position only
+- Sufficient shared cash for a buy and its flat fill fee
+- Sufficient owned position in the order's instrument for a sell
 - Sufficient cash to pay the fee for a possible partial sell fill
-- Checked fixed-point arithmetic with structured overflow rejection
-- An order timestamp that does not precede the account's latest fill
+- Checked fixed-point arithmetic with structured overflow rejection,
+  including the account totals: risk previews the complete fill against the
+  account, so a fill that would make total cost basis, realized PnL, or fees
+  unrepresentable is rejected before execution rather than faulting the
+  processor
+- An order timestamp that does not precede the account's latest fill in any
+  instrument, because the server's market clock is shared by every
+  instrument
 
 Notional and buying power are checked conservatively using the complete
 requested quantity at the current opposite best price, even if displayed
@@ -102,24 +116,33 @@ The simulator fills at most the remaining displayed quantity:
 - No liquidity: the complete order is cancelled.
 - Non-marketable limit: the complete order is cancelled.
 
-Displayed bid and ask liquidity are tracked independently. Multiple orders
-against the same market observation cannot reuse quantity that an earlier
-simulated order consumed. A strictly newer ingest sequence establishes a new
-snapshot and resets those counters.
+Displayed bid and ask liquidity are tracked independently, per account and
+per instrument. Multiple orders against the same market observation cannot
+reuse quantity that an earlier simulated order consumed. A strictly newer
+ingest sequence for an instrument establishes a new snapshot for that
+instrument and resets its counters. Consuming AAPL liquidity never reduces
+SPY's, and a fill changes only its own instrument's position.
 
 This per-account shadow-liquidity rule is deliberately conservative inside one
-snapshot, but it is not a real matching-engine or queue-position model. One
-paper account never changes another user's market or simulated liquidity.
+snapshot, but it is not a real matching-engine or queue-position model. Each
+paper account is an independent simulated world: one account never changes
+another's market or simulated liquidity, even for the same instrument.
 
 ## Identity, ordering, and lineage
 
-- A client order ID may be processed only once, including when the first
-  result was a cancellation.
+- A client order ID may be processed only once per account, including when
+  the first result was a cancellation, and including for another instrument.
 - A generated fill ID is deterministic: `<client-order-id>:fill:0`.
-- An execution simulator is permanently bound to one account and instrument.
-- After the first execution, market observations must retain the same stream
-  identity and cannot move to a lower ingest sequence.
-- The same stream and ingest sequence cannot identify two different snapshots.
+- An execution simulator is permanently bound to one account. It keeps an
+  execution state per instrument: the latest executed observation and the
+  liquidity consumed from it.
+- After the first execution in any instrument, every instrument's market
+  observations must come from the same stream: one account uses one
+  compatible market stream or replay session.
+- Per instrument, observations cannot move to a lower ingest sequence, and the
+  same sequence cannot identify two different snapshots. Instruments are
+  independent: an AAPL observation at sequence 8 is valid after SPY executed
+  at sequence 12.
 - Rejected execution attempts do not consume liquidity or reserve their client
   order ID, so a caller may correct the routing error and retry.
 
@@ -131,9 +154,9 @@ corrected durable submission therefore requires a new ID.
 
 Every non-empty simulated fill is applied exactly once to the processor's
 owned `PaperAccount`. The fill in the accounting receipt is the same value as
-the fill in the execution report. Cash, position, cost basis, realized PnL,
-and fees therefore change through the existing accounting contract rather
-than a second execution-specific calculation.
+the fill in the execution report. Cash and the fill instrument's position,
+cost basis, realized PnL, and fees therefore change through the existing
+accounting contract rather than a second execution-specific calculation.
 
 The processor exposes only a const account view. Callers can request an
 explicit mark-to-market snapshot and verify the accounting identity:
@@ -142,13 +165,14 @@ explicit mark-to-market snapshot and verify the accounting identity:
 equity - starting cash = net total PnL
 ```
 
-The portfolio API marks the account at the current best bid through
-`value_portfolio`. It shares two rules with this pipeline so that valuation
-and execution cannot drift apart: `MarketDataQuality::is_suspect`, which the
-risk engine uses to reject suspect books, and `market_lineage_violation`,
-which the simulator uses to bind an account to one market timeline. The
-processor's `active_market()` exposes the observation of its latest
-execution for that check.
+The portfolio API marks each open position at its instrument's current best
+bid through `value_portfolio`. It shares two rules with this pipeline so that
+valuation and execution cannot drift apart: `MarketDataQuality::is_suspect`,
+which the risk engine uses to reject suspect books, and
+`market_lineage_violation`, which the simulator uses to bind an account to
+one stream and each instrument to its own timeline. The processor's
+`executions()` exposes each instrument's latest executed observation for that
+check.
 
 If accounting ever rejects a risk-approved simulated fill, the processor
 returns an invariant-violation error and permanently enters a faulted state.
@@ -174,6 +198,7 @@ and execute against the server's own quote. See
 ## Important limitations
 
 - Top-of-book only; no Level-2 sweep, queue, or market impact
+- No shared exchange: accounts never see each other's orders or liquidity
 - Immediate-or-cancel only; no resting order lifecycle
 - One fill at most per order
 - Long-only paper accounting

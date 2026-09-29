@@ -62,6 +62,8 @@ using chronos::test::wait_until_blocked_on_lock;
 using chronos::test::with_application_name;
 
 std::string connection_string;
+const InstrumentId kAapl("AAPL");
+const InstrumentId kSpy("SPY");
 
 static_assert(!std::is_copy_constructible_v<PostgresPaperOrderRepository>);
 static_assert(!std::is_move_constructible_v<PostgresPaperOrderRepository>);
@@ -144,6 +146,43 @@ OrderIntent order(
     };
 }
 
+TopOfBookEvent instrument_market(
+    const InstrumentId& instrument,
+    std::uint64_t sequence,
+    std::int64_t receive_timestamp,
+    std::string_view ask_quantity = "5"
+) {
+    TopOfBookEvent quote = market(
+        sequence,
+        receive_timestamp,
+        "99",
+        "5",
+        "101",
+        ask_quantity
+    );
+    quote.header.instrument = instrument;
+    return quote;
+}
+
+OrderIntent instrument_order(
+    const InstrumentId& instrument,
+    std::string account_id,
+    std::string client_order_id,
+    Side side,
+    std::string_view order_quantity,
+    std::int64_t submitted_at = 110
+) {
+    OrderIntent intent = order(
+        std::move(account_id),
+        std::move(client_order_id),
+        side,
+        order_quantity,
+        submitted_at
+    );
+    intent.instrument = instrument;
+    return intent;
+}
+
 PersistentPaperOrderSession create_session(
     PostgresPaperOrderRepository& store,
     const std::string& account_id,
@@ -152,7 +191,6 @@ PersistentPaperOrderSession create_session(
     auto created = PersistentPaperOrderSession::create(
         store,
         account_id,
-        InstrumentId("AAPL"),
         money("1000"),
         limits
     );
@@ -201,7 +239,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
     ));
     REQUIRE(first_persisted.account_version == 1);
     const auto first = require_order_receipt(std::move(first_persisted));
-    REQUIRE(first.account_after.position == quantity("3"));
+    REQUIRE(first.account_after.quantity(kAapl) == quantity("3"));
 
     auto restarted_store = repository();
     restarted_store.apply_migration(all_migrations_sql());
@@ -211,7 +249,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
     );
     REQUIRE(recovered.has_value());
     REQUIRE(recovered->version() == 1);
-    REQUIRE(recovered->account().state().position == quantity("3"));
+    REQUIRE(recovered->account().state().quantity(kAapl) == quantity("3"));
     const auto second = require_order_receipt(require_persisted_receipt(
         recovered->submit(
             order(account_id, "second", Side::Buy, "3", 110),
@@ -224,7 +262,7 @@ void test_fills_and_shadow_liquidity_survive_restart() {
     );
     REQUIRE(second.execution.fill->quantity == quantity("2"));
     REQUIRE(second.execution.unfilled_quantity == quantity("1"));
-    REQUIRE(second.account_after.position == quantity("5"));
+    REQUIRE(second.account_after.quantity(kAapl) == quantity("5"));
 
     const auto summary = restarted_store.journal_summary(account_id);
     REQUIRE(summary.order_count == 2);
@@ -239,9 +277,9 @@ void test_fills_and_shadow_liquidity_survive_restart() {
     REQUIRE(recovered_again.has_value());
     REQUIRE(recovered_again->account().state().cash == money("494.98"));
     REQUIRE(
-        recovered_again->account().state().open_cost_basis == money("505")
+        recovered_again->account().state().open_cost_basis() == money("505")
     );
-    REQUIRE(recovered_again->account().state().fees_paid == money("0.02"));
+    REQUIRE(recovered_again->account().state().fees_paid() == money("0.02"));
 }
 
 void test_duplicate_submission_rolls_back_every_database_change() {
@@ -269,7 +307,7 @@ void test_duplicate_submission_rolls_back_every_database_change() {
     );
     REQUIRE(session.version() == 1);
     REQUIRE(session.account().state().cash == cash_after_first);
-    REQUIRE(session.account().state().position == quantity("1"));
+    REQUIRE(session.account().state().quantity(kAapl) == quantity("1"));
 
     const auto summary = store.journal_summary(account_id);
     REQUIRE(summary.order_count == 1);
@@ -300,7 +338,7 @@ void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
         std::get<PreTradeRiskRejection>(rejected.result).code ==
         PreTradeRiskErrorCode::StaleMarketState
     );
-    REQUIRE(session.account().state().position == Quantity{});
+    REQUIRE(session.account().state().quantity(kAapl) == Quantity{});
 
     auto recovered = PersistentPaperOrderSession::load(store, account_id);
     REQUIRE(recovered.has_value());
@@ -313,7 +351,7 @@ void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
         PaperPersistenceConflictCode::DuplicateClientOrderId
     );
     REQUIRE(recovered->version() == 1);
-    REQUIRE(recovered->account().state().position == Quantity{});
+    REQUIRE(recovered->account().state().quantity(kAapl) == Quantity{});
 
     const auto accepted = require_order_receipt(require_persisted_receipt(
         recovered->submit(
@@ -321,7 +359,7 @@ void test_risk_rejection_is_durable_and_consumes_database_idempotency_key() {
             market(11, 109)
         )
     ));
-    REQUIRE(accepted.account_after.position == quantity("1"));
+    REQUIRE(accepted.account_after.quantity(kAapl) == quantity("1"));
     const auto summary = store.journal_summary(account_id);
     REQUIRE(summary.order_count == 2);
     REQUIRE(summary.event_count == 6);
@@ -347,12 +385,12 @@ void test_optimistic_version_conflict_preserves_committed_account() {
     );
     require_conflict(stale, PaperPersistenceConflictCode::VersionConflict);
     REQUIRE(second_session->version() == 0);
-    REQUIRE(second_session->account().state().position == Quantity{});
+    REQUIRE(second_session->account().state().quantity(kAapl) == Quantity{});
 
     auto recovered = PersistentPaperOrderSession::load(store, account_id);
     REQUIRE(recovered.has_value());
     REQUIRE(recovered->version() == 1);
-    REQUIRE(recovered->account().state().position == quantity("1"));
+    REQUIRE(recovered->account().state().quantity(kAapl) == quantity("1"));
     REQUIRE(recovered->account().state().cash == money("898.99"));
     const auto summary = store.journal_summary(account_id);
     REQUIRE(summary.order_count == 1);
@@ -410,7 +448,7 @@ void test_malformed_order_is_preserved_as_a_risk_rejection() {
         PreTradeRiskErrorCode::UnknownSide
     );
     REQUIRE(persisted.account_version == 1);
-    REQUIRE(session.account().state().position == Quantity{});
+    REQUIRE(session.account().state().quantity(kAapl) == Quantity{});
     REQUIRE(session.account().state().cash == money("1000"));
 
     const auto summary = store.journal_summary(account_id);
@@ -481,7 +519,6 @@ void test_text_with_nul_bytes_is_never_persisted() {
         PersistentPaperOrderSession::create(
             store,
             account_id_with_nul,
-            InstrumentId("AAPL"),
             money("1000"),
             risk_limits()
         ),
@@ -499,7 +536,7 @@ void test_text_with_nul_bytes_is_never_persisted() {
         std::invalid_argument
     );
     REQUIRE(session.version() == 0);
-    REQUIRE(session.account().state().position == Quantity{});
+    REQUIRE(session.account().state().quantity(kAapl) == Quantity{});
     const auto summary = store.journal_summary(account_id);
     REQUIRE(summary.order_count == 0);
     REQUIRE(summary.account_version == 0);
@@ -533,7 +570,7 @@ void test_lost_connection_is_reported_and_then_reconnected() {
     auto recovered = PersistentPaperOrderSession::load(store, account_id);
     REQUIRE(recovered.has_value());
     REQUIRE(recovered->version() == 1);
-    REQUIRE(recovered->account().state().position == quantity("1"));
+    REQUIRE(recovered->account().state().quantity(kAapl) == quantity("1"));
 
     terminate_backends(observer, application);
     REQUIRE(store.check_availability());
@@ -580,7 +617,7 @@ void test_connection_lost_during_commit_records_nothing() {
 
     REQUIRE(submitter_outcome == "unavailable");
     REQUIRE(session.version() == 0);
-    REQUIRE(session.account().state().position == Quantity{});
+    REQUIRE(session.account().state().quantity(kAapl) == Quantity{});
     const auto summary = store.journal_summary(account_id);
     REQUIRE(summary.order_count == 0);
     REQUIRE(summary.event_count == 0);
@@ -593,17 +630,449 @@ void test_connection_lost_during_commit_records_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-instrument accounts
+
+void require_same_state(
+    const PersistentPaperOrderSession& expected,
+    const PersistentPaperOrderSession& actual
+) {
+    REQUIRE(actual.account().state() == expected.account().state());
+    REQUIRE(actual.executions() == expected.executions());
+    const auto& limits = actual.risk_limits();
+    REQUIRE(limits.maximum_order_quantity ==
+        expected.risk_limits().maximum_order_quantity);
+    REQUIRE(limits.maximum_order_notional ==
+        expected.risk_limits().maximum_order_notional);
+    REQUIRE(limits.maximum_position_quantity ==
+        expected.risk_limits().maximum_position_quantity);
+    REQUIRE(limits.maximum_quote_age_nanoseconds ==
+        expected.risk_limits().maximum_quote_age_nanoseconds);
+    REQUIRE(limits.fee_per_fill == expected.risk_limits().fee_per_fill);
+    REQUIRE(actual.is_healthy() == expected.is_healthy());
+    REQUIRE(actual.version() == expected.version());
+}
+
+void test_several_positions_survive_restart_exactly() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("multi-restart");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "buy-aapl", Side::Buy, "2"),
+        instrument_market(kAapl, 10, 100)
+    ));
+    require_persisted_receipt(session.submit(
+        instrument_order(kSpy, account_id, "buy-spy", Side::Buy, "3"),
+        instrument_market(kSpy, 11, 101)
+    ));
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "sell-aapl", Side::Sell, "2", 111),
+        instrument_market(kAapl, 12, 102)
+    ));
+
+    // AAPL is closed and keeps its ledger; SPY is open. Cash is shared:
+    // 1000 - 202.01 - 303.01 + 197.99 = 692.97.
+    const auto& state = session.account().state();
+    REQUIRE(state.cash == money("692.97"));
+    REQUIRE(state.positions.size() == 2);
+    REQUIRE(!state.positions.at(kAapl).is_open());
+    REQUIRE(state.positions.at(kAapl).gross_realized_pnl == money("-4"));
+    REQUIRE(state.positions.at(kAapl).fees_paid == money("0.02"));
+    REQUIRE(state.positions.at(kSpy).quantity == quantity("3"));
+    REQUIRE(session.executions().size() == 2);
+    REQUIRE(session.executions().at(kSpy).consumed_ask_quantity == quantity("3"));
+    REQUIRE(session.executions().at(kAapl).active_market.header.ingest_sequence == 12);
+
+    auto restarted_store = repository();
+    auto recovered = PersistentPaperOrderSession::load(restarted_store, account_id);
+    REQUIRE(recovered.has_value());
+    require_same_state(session, *recovered);
+
+    PostgresTestConnection inspector(connection_string);
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(instrument || ':' || quantity_raw || ':' || "
+        "open_cost_basis_raw || ':' || gross_realized_pnl_raw || ':' || "
+        "fees_paid_raw || ':' || last_fill_timestamp_ns, ',' "
+        "ORDER BY instrument) FROM paper_positions WHERE account_id = $1",
+        {account_id}
+    ) == "AAPL:0:0:-400000000:2000000:111,SPY:300000000:30300000000:0:1000000:110");
+    REQUIRE(inspector.scalar(
+        "SELECT market_stream_id FROM paper_accounts WHERE account_id = $1",
+        {account_id}
+    ) == "market-stream");
+    // Each journal row records the ledger of its own instrument.
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(client_order_id || ':' || position_after_instrument "
+        "|| ':' || position_quantity_after_raw || ':' || account_cash_after_raw, "
+        "',' ORDER BY order_record_id) FROM paper_order_records "
+        "WHERE account_id = $1",
+        {account_id}
+    ) == "buy-aapl:AAPL:200000000:79799000000,"
+         "buy-spy:SPY:300000000:49498000000,"
+         "sell-aapl:AAPL:0:69297000000");
+
+    // The recovered session continues both instruments' timelines.
+    require_persisted_receipt(recovered->submit(
+        instrument_order(kSpy, account_id, "buy-spy-again", Side::Buy, "2", 112),
+        instrument_market(kSpy, 11, 101)
+    ));
+    REQUIRE(recovered->account().state().quantity(kSpy) == quantity("5"));
+    REQUIRE(recovered->executions().at(kSpy).consumed_ask_quantity == quantity("5"));
+}
+
+void test_an_order_rewrites_only_its_instrument_rows() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("row-isolation");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "buy-aapl", Side::Buy, "1"),
+        instrument_market(kAapl, 10, 100)
+    ));
+    PostgresTestConnection inspector(connection_string);
+    const auto row_versions = [&] {
+        return inspector.scalar(
+            "SELECT (SELECT xmin::text FROM paper_positions "
+            "        WHERE account_id = $1 AND instrument = 'AAPL') || '/' || "
+            "       (SELECT xmin::text FROM paper_execution_states "
+            "        WHERE account_id = $1 AND instrument = 'AAPL')",
+            {account_id}
+        );
+    };
+    const std::string aapl_rows = row_versions();
+
+    require_persisted_receipt(session.submit(
+        instrument_order(kSpy, account_id, "buy-spy", Side::Buy, "1"),
+        instrument_market(kSpy, 11, 101)
+    ));
+    OrderIntent passive = instrument_order(kSpy, account_id, "passive-spy", Side::Buy, "1");
+    passive.type = OrderType::Limit;
+    passive.limit_price = price("100");
+    require_persisted_receipt(session.submit(passive, instrument_market(kSpy, 12, 102)));
+
+    // Neither SPY order rewrote an AAPL row.
+    REQUIRE(row_versions() == aapl_rows);
+    REQUIRE(inspector.scalar(
+        "SELECT market_ingest_sequence FROM paper_execution_states "
+        "WHERE account_id = $1 AND instrument = 'SPY'",
+        {account_id}
+    ) == "12");
+}
+
+// A journal row the in-memory session does not know about takes the client
+// order ID, so the commit fails after the account, execution, and position
+// rows were written. Everything rolls back.
+void test_a_failed_commit_leaves_every_row_unchanged() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("atomic-commit");
+    auto session = create_session(store, account_id, risk_limits(5));
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "stale", Side::Buy, "1"),
+        instrument_market(kAapl, 10, 100)
+    ));
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "buy-aapl", Side::Buy, "1"),
+        instrument_market(kAapl, 11, 108)
+    ));
+    PostgresTestConnection editor(connection_string);
+    static_cast<void>(editor.query(
+        "INSERT INTO paper_order_records ("
+        "  account_id, client_order_id, intent_account_id, instrument,"
+        "  source_kind, source_id, side, order_type, quantity_raw,"
+        "  limit_price_raw, time_in_force, submitted_at_ns, market_instrument,"
+        "  market_stream_id, market_venue, market_event_timestamp_ns,"
+        "  market_receive_timestamp_ns, market_ingest_sequence,"
+        "  market_venue_sequence, market_quality_flags, market_bid_price_raw,"
+        "  market_bid_quantity_raw, market_ask_price_raw,"
+        "  market_ask_quantity_raw, outcome_kind, outcome_code, outcome_field,"
+        "  outcome_message, account_cash_after_raw, position_after_instrument,"
+        "  position_quantity_after_raw, position_open_cost_basis_after_raw,"
+        "  position_gross_realized_pnl_after_raw, position_fees_paid_after_raw,"
+        "  processed_by_execution) "
+        "SELECT account_id, 'taken', intent_account_id, instrument,"
+        "  source_kind, source_id, side, order_type, quantity_raw,"
+        "  limit_price_raw, time_in_force, submitted_at_ns, market_instrument,"
+        "  market_stream_id, market_venue, market_event_timestamp_ns,"
+        "  market_receive_timestamp_ns, market_ingest_sequence,"
+        "  market_venue_sequence, market_quality_flags, market_bid_price_raw,"
+        "  market_bid_quantity_raw, market_ask_price_raw,"
+        "  market_ask_quantity_raw, outcome_kind, outcome_code, outcome_field,"
+        "  outcome_message, account_cash_after_raw, position_after_instrument,"
+        "  position_quantity_after_raw, position_open_cost_basis_after_raw,"
+        "  position_gross_realized_pnl_after_raw, position_fees_paid_after_raw,"
+        "  processed_by_execution "
+        "FROM paper_order_records WHERE account_id = $1 AND client_order_id = 'stale'",
+        {account_id}
+    ));
+    const auto snapshot = [&] {
+        return editor.scalar(
+            "SELECT (SELECT version || ':' || cash_raw || ':' || "
+            "        coalesce(market_stream_id, '') FROM paper_accounts "
+            "        WHERE account_id = $1) || '/' || "
+            "       (SELECT count(*) FROM paper_positions WHERE account_id = $1) "
+            "       || '/' || "
+            "       (SELECT count(*) FROM paper_execution_states "
+            "        WHERE account_id = $1) || '/' || "
+            "       (SELECT count(*) FROM paper_events WHERE account_id = $1)",
+            {account_id}
+        );
+    };
+    const std::string before = snapshot();
+    const auto state_before = session.account().state();
+    const auto executions_before = session.executions();
+
+    require_conflict(
+        session.submit(
+            instrument_order(kSpy, account_id, "taken", Side::Buy, "1", 110),
+            instrument_market(kSpy, 12, 109)
+        ),
+        PaperPersistenceConflictCode::DuplicateClientOrderId
+    );
+    REQUIRE(snapshot() == before);
+    REQUIRE(session.account().state() == state_before);
+    REQUIRE(session.executions() == executions_before);
+    REQUIRE(session.account().state().position(kSpy) == nullptr);
+}
+
+// Every session is loaded at the same version and buys a different
+// instrument for 4 x 101 + 0.01 = 404.01. Optimistic concurrency serializes
+// the commits, so the shared 1000 of cash buys exactly two of them.
+void test_concurrent_orders_cannot_double_spend_shared_cash() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("double-spend");
+    create_session(store, account_id);
+    const std::vector<InstrumentId> instruments{
+        InstrumentId("AAPL"),
+        InstrumentId("MSFT"),
+        InstrumentId("QQQ"),
+        InstrumentId("SPY"),
+    };
+
+    std::vector<std::string> outcomes(instruments.size());
+    std::vector<int> version_conflicts(instruments.size(), 0);
+    std::vector<std::thread> traders;
+    for (std::size_t index = 0; index < instruments.size(); ++index) {
+        traders.emplace_back([&, index] {
+            try {
+                PostgresPaperOrderRepository trader_store(connection_string);
+                const OrderIntent intent = instrument_order(
+                    instruments[index],
+                    account_id,
+                    "spend-" + instruments[index].value(),
+                    Side::Buy,
+                    "4"
+                );
+                const TopOfBookEvent quote = instrument_market(
+                    instruments[index],
+                    20 + index,
+                    100
+                );
+                for (;;) {
+                    auto session = PersistentPaperOrderSession::load(
+                        trader_store,
+                        account_id
+                    );
+                    const auto result = session->submit(intent, quote);
+                    const auto* conflict =
+                        std::get_if<PaperPersistenceConflict>(&result);
+                    if (conflict != nullptr &&
+                        conflict->code ==
+                            PaperPersistenceConflictCode::VersionConflict) {
+                        ++version_conflicts[index];
+                        continue;
+                    }
+                    const auto& receipt =
+                        std::get<PersistentPaperOrderReceipt>(result);
+                    if (std::holds_alternative<PaperOrderReceipt>(receipt.result)) {
+                        outcomes[index] = "filled";
+                    } else {
+                        outcomes[index] = std::get<PreTradeRiskRejection>(
+                            receipt.result
+                        ).code == PreTradeRiskErrorCode::InsufficientCash
+                            ? "insufficient cash"
+                            : "other rejection";
+                    }
+                    return;
+                }
+            } catch (const std::exception& error) {
+                outcomes[index] = error.what();
+            }
+        });
+    }
+    for (auto& trader : traders) {
+        trader.join();
+    }
+
+    int filled = 0;
+    int insufficient = 0;
+    for (const auto& outcome : outcomes) {
+        filled += outcome == "filled" ? 1 : 0;
+        insufficient += outcome == "insufficient cash" ? 1 : 0;
+    }
+    REQUIRE(filled == 2);
+    REQUIRE(insufficient == 2);
+
+    auto recovered = PersistentPaperOrderSession::load(store, account_id);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->account().state().cash == money("191.98"));
+    REQUIRE(recovered->account().state().open_cost_basis() == money("808"));
+    REQUIRE(recovered->version() == 4);
+    const auto summary = store.journal_summary(account_id);
+    REQUIRE(summary.order_count == 4);
+    REQUIRE(summary.applied_fill_count == 2);
+}
+
+void test_accounts_consume_liquidity_independently() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string first_id = unique_test_id("world-a");
+    const std::string second_id = unique_test_id("world-b");
+    auto first = create_session(store, first_id);
+    auto second = create_session(store, second_id);
+    const TopOfBookEvent quote = instrument_market(kSpy, 10, 100, "5");
+    for (auto* session : {&first, &second}) {
+        const std::string& id = session->account().account_id();
+        const auto receipt = require_order_receipt(require_persisted_receipt(
+            session->submit(instrument_order(kSpy, id, "take-all", Side::Buy, "5"), quote)
+        ));
+        REQUIRE(receipt.execution.status == SimulatedExecutionStatus::Filled);
+    }
+    auto recovered = PersistentPaperOrderSession::load(store, first_id);
+    REQUIRE(recovered->executions().at(kSpy).consumed_ask_quantity == quantity("5"));
+    REQUIRE(recovered->account().state().position(kAapl) == nullptr);
+}
+
+void test_a_client_order_id_is_unique_across_instruments() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("unique-client-id");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "same-id", Side::Buy, "1"),
+        instrument_market(kAapl, 10, 100)
+    ));
+    require_conflict(
+        session.submit(
+            instrument_order(kSpy, account_id, "same-id", Side::Buy, "1"),
+            instrument_market(kSpy, 11, 101)
+        ),
+        PaperPersistenceConflictCode::DuplicateClientOrderId
+    );
+    REQUIRE(session.account().state().position(kSpy) == nullptr);
+
+    auto recovered = PersistentPaperOrderSession::load(store, account_id);
+    require_conflict(
+        recovered->submit(
+            instrument_order(kSpy, account_id, "same-id", Side::Buy, "1"),
+            instrument_market(kSpy, 11, 101)
+        ),
+        PaperPersistenceConflictCode::DuplicateClientOrderId
+    );
+    // The recorded order is the original AAPL order.
+    const auto lookup = store.find_order(account_id, "same-id");
+    REQUIRE(std::get<PaperOrderRecord>(lookup).intent.instrument == kAapl);
+    REQUIRE(store.journal_summary(account_id).order_count == 1);
+}
+
+void test_the_database_rejects_rows_that_do_not_reconcile() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("database-integrity");
+    auto session = create_session(store, account_id);
+    require_persisted_receipt(session.submit(
+        instrument_order(kAapl, account_id, "buy-aapl", Side::Buy, "1"),
+        instrument_market(kAapl, 10, 100)
+    ));
+    PostgresTestConnection editor(connection_string);
+    const std::string before = editor.scalar(
+        "SELECT cash_raw || '/' || (SELECT fees_paid_raw FROM paper_positions "
+        "WHERE account_id = $1) FROM paper_accounts WHERE account_id = $1",
+        {account_id}
+    );
+    // Each change is checked when its transaction commits.
+    REQUIRE_THROWS_AS(editor.query(
+        "UPDATE paper_positions SET fees_paid_raw = fees_paid_raw + 1 "
+        "WHERE account_id = $1",
+        {account_id}
+    ), chronos::test::TestFailure);
+    REQUIRE_THROWS_AS(editor.query(
+        "UPDATE paper_accounts SET cash_raw = cash_raw + 1 "
+        "WHERE account_id = $1",
+        {account_id}
+    ), chronos::test::TestFailure);
+    // A second stream, and a ledger without an execution state.
+    REQUIRE_THROWS_AS(editor.query(
+        "INSERT INTO paper_execution_states SELECT account_id, 'SPY', "
+        "'other-stream', market_venue, market_event_timestamp_ns, "
+        "market_receive_timestamp_ns, market_ingest_sequence, "
+        "market_venue_sequence, market_quality_flags, market_bid_price_raw, "
+        "market_bid_quantity_raw, market_ask_price_raw, "
+        "market_ask_quantity_raw, 0, 0 FROM paper_execution_states "
+        "WHERE account_id = $1",
+        {account_id}
+    ), chronos::test::TestFailure);
+    REQUIRE_THROWS_AS(editor.query(
+        "INSERT INTO paper_positions VALUES ($1, 'SPY', 0, 0, 0, 0, 1)",
+        {account_id}
+    ), chronos::test::TestFailure);
+    REQUIRE_THROWS_AS(editor.query(
+        "UPDATE paper_accounts SET market_stream_id = NULL "
+        "WHERE account_id = $1",
+        {account_id}
+    ), chronos::test::TestFailure);
+
+    // A cancelled order binds an account to a stream without creating a
+    // position. The execution-state trigger must still prevent the last
+    // state from being deleted while the account remains bound.
+    const std::string execution_only_id = unique_test_id("execution-only");
+    auto execution_only = create_session(store, execution_only_id);
+    OrderIntent passive = instrument_order(
+        kAapl,
+        execution_only_id,
+        "passive",
+        Side::Buy,
+        "1"
+    );
+    passive.type = OrderType::Limit;
+    passive.limit_price = price("1");
+    const auto cancelled = require_order_receipt(require_persisted_receipt(
+        execution_only.submit(passive, instrument_market(kAapl, 10, 100))
+    ));
+    REQUIRE(cancelled.execution.status == SimulatedExecutionStatus::Cancelled);
+    REQUIRE(execution_only.account().state().positions.empty());
+    REQUIRE_THROWS_AS(editor.query(
+        "DELETE FROM paper_execution_states WHERE account_id = $1",
+        {execution_only_id}
+    ), chronos::test::TestFailure);
+
+    REQUIRE(editor.scalar(
+        "SELECT cash_raw || '/' || (SELECT fees_paid_raw FROM paper_positions "
+        "WHERE account_id = $1) FROM paper_accounts WHERE account_id = $1",
+        {account_id}
+    ) == before);
+    auto recovered = PersistentPaperOrderSession::load(store, account_id);
+    require_same_state(session, *recovered);
+}
+
+// ---------------------------------------------------------------------------
 // Journal read model
 
 PaperJournalPage<PaperOrderRecord> require_order_page(
     PostgresPaperOrderRepository& store,
     const std::string& account_id,
     std::size_t limit,
-    std::optional<std::int64_t> before = std::nullopt
+    std::optional<std::int64_t> before = std::nullopt,
+    std::optional<InstrumentId> instrument = std::nullopt
 ) {
     auto page = store.list_orders(
         account_id,
-        PaperJournalPageRequest{.limit = limit, .before_record_id = before}
+        PaperJournalPageRequest{
+            .limit = limit,
+            .before_record_id = before,
+            .instrument = instrument,
+        }
     );
     REQUIRE(std::holds_alternative<PaperJournalPage<PaperOrderRecord>>(page));
     return std::get<PaperJournalPage<PaperOrderRecord>>(std::move(page));
@@ -613,11 +1082,16 @@ PaperJournalPage<PaperFillRecord> require_fill_page(
     PostgresPaperOrderRepository& store,
     const std::string& account_id,
     std::size_t limit,
-    std::optional<std::int64_t> before = std::nullopt
+    std::optional<std::int64_t> before = std::nullopt,
+    std::optional<InstrumentId> instrument = std::nullopt
 ) {
     auto page = store.list_fills(
         account_id,
-        PaperJournalPageRequest{.limit = limit, .before_record_id = before}
+        PaperJournalPageRequest{
+            .limit = limit,
+            .before_record_id = before,
+            .instrument = instrument,
+        }
     );
     REQUIRE(std::holds_alternative<PaperJournalPage<PaperFillRecord>>(page));
     return std::get<PaperJournalPage<PaperFillRecord>>(std::move(page));
@@ -659,7 +1133,11 @@ void test_empty_history_is_distinct_from_a_missing_account() {
             PaperJournalReadMiss::OrderNotFound);
 
     const std::string missing = unique_test_id("missing-history");
-    const PaperJournalPageRequest request{.limit = 10, .before_record_id = {}};
+    const PaperJournalPageRequest request{
+        .limit = 10,
+        .before_record_id = {},
+        .instrument = {},
+    };
     REQUIRE(std::get<PaperJournalReadMiss>(store.list_orders(missing, request)) ==
             PaperJournalReadMiss::AccountNotFound);
     REQUIRE(std::get<PaperJournalReadMiss>(store.list_fills(missing, request)) ==
@@ -926,13 +1404,67 @@ void test_pages_are_bounded_and_stable_while_orders_arrive() {
     REQUIRE(!past_oldest.next_before_record_id.has_value());
 }
 
+void test_history_can_be_filtered_by_instrument() {
+    auto store = repository();
+    store.apply_migration(all_migrations_sql());
+    const std::string account_id = unique_test_id("filtered-history");
+    auto session = create_session(store, account_id);
+    std::uint64_t sequence = 10;
+    const auto submit = [&](const InstrumentId& instrument, const std::string& id) {
+        require_persisted_receipt(session.submit(
+            instrument_order(instrument, account_id, id, Side::Buy, "1"),
+            instrument_market(instrument, sequence++, 100, "50")
+        ));
+    };
+    submit(kSpy, "spy-0");
+    submit(kAapl, "aapl-0");
+    submit(kSpy, "spy-1");
+    submit(kAapl, "aapl-1");
+    submit(kSpy, "spy-2");
+
+    const auto first = require_order_page(store, account_id, 2, std::nullopt, kSpy);
+    REQUIRE((client_order_ids(first) == std::vector<std::string>{"spy-2", "spy-1"}));
+    const auto rest = require_order_page(
+        store,
+        account_id,
+        2,
+        first.next_before_record_id,
+        kSpy
+    );
+    REQUIRE((client_order_ids(rest) == std::vector<std::string>{"spy-0"}));
+    REQUIRE(!rest.next_before_record_id.has_value());
+
+    const auto aapl = require_order_page(store, account_id, 10, std::nullopt, kAapl);
+    REQUIRE((client_order_ids(aapl) == std::vector<std::string>{"aapl-1", "aapl-0"}));
+    const auto fills = require_fill_page(store, account_id, 10, std::nullopt, kAapl);
+    REQUIRE(fills.records.size() == 2);
+    for (const auto& record : fills.records) {
+        REQUIRE(record.fill.instrument == kAapl);
+    }
+    REQUIRE(require_fill_page(store, account_id, 10).records.size() == 5);
+    // A symbol the account never traded has no history.
+    const auto none = require_order_page(
+        store,
+        account_id,
+        10,
+        std::nullopt,
+        InstrumentId("MSFT")
+    );
+    REQUIRE(none.records.empty());
+    REQUIRE(!none.next_before_record_id.has_value());
+}
+
 void test_invalid_read_requests_are_rejected_before_querying() {
     auto store = repository();
     const std::string account_id = unique_test_id("invalid-read");
     REQUIRE_THROWS_AS(
         store.list_orders(
             account_id,
-            PaperJournalPageRequest{.limit = 0, .before_record_id = {}}
+            PaperJournalPageRequest{
+                .limit = 0,
+                .before_record_id = {},
+                .instrument = {},
+            }
         ),
         std::invalid_argument
     );
@@ -940,7 +1472,11 @@ void test_invalid_read_requests_are_rejected_before_querying() {
         REQUIRE_THROWS_AS(
             store.list_fills(
                 account_id,
-                PaperJournalPageRequest{.limit = 1, .before_record_id = before}
+                PaperJournalPageRequest{
+                .limit = 1,
+                .before_record_id = before,
+                .instrument = {},
+            }
             ),
             std::invalid_argument
         );
@@ -953,7 +1489,11 @@ void test_invalid_read_requests_are_rejected_before_querying() {
     REQUIRE_THROWS_AS(
         store.list_orders(
             account_id + std::string("\0x", 2),
-            PaperJournalPageRequest{.limit = 1, .before_record_id = {}}
+            PaperJournalPageRequest{
+                .limit = 1,
+                .before_record_id = {},
+                .instrument = {},
+            }
         ),
         std::invalid_argument
     );
@@ -1010,7 +1550,11 @@ void test_inconsistent_journal_rows_fail_closed() {
         REQUIRE_THROWS_AS(
             store.list_orders(
                 account_id,
-                PaperJournalPageRequest{.limit = 5, .before_record_id = {}}
+                PaperJournalPageRequest{
+                .limit = 5,
+                .before_record_id = {},
+                .instrument = {},
+            }
             ),
             std::runtime_error
         );
@@ -1060,7 +1604,11 @@ void test_journal_reads_report_connection_loss_and_reconnect() {
     REQUIRE_THROWS_AS(
         store.list_orders(
             account_id,
-            PaperJournalPageRequest{.limit = 5, .before_record_id = {}}
+            PaperJournalPageRequest{
+                .limit = 5,
+                .before_record_id = {},
+                .instrument = {},
+            }
         ),
         PaperPersistenceUnavailable
     );
@@ -1132,6 +1680,34 @@ int main() {
             test_connection_lost_during_commit_records_nothing,
         },
         {
+            "several positions survive restart exactly",
+            test_several_positions_survive_restart_exactly,
+        },
+        {
+            "an order rewrites only its instrument rows",
+            test_an_order_rewrites_only_its_instrument_rows,
+        },
+        {
+            "a failed commit leaves every row unchanged",
+            test_a_failed_commit_leaves_every_row_unchanged,
+        },
+        {
+            "concurrent orders cannot double-spend shared cash",
+            test_concurrent_orders_cannot_double_spend_shared_cash,
+        },
+        {
+            "accounts consume liquidity independently",
+            test_accounts_consume_liquidity_independently,
+        },
+        {
+            "a client order ID is unique across instruments",
+            test_a_client_order_id_is_unique_across_instruments,
+        },
+        {
+            "the database rejects rows that do not reconcile",
+            test_the_database_rejects_rows_that_do_not_reconcile,
+        },
+        {
             "empty history is distinct from a missing account",
             test_empty_history_is_distinct_from_a_missing_account,
         },
@@ -1154,6 +1730,10 @@ int main() {
         {
             "pages are bounded and stable while orders arrive",
             test_pages_are_bounded_and_stable_while_orders_arrive,
+        },
+        {
+            "history can be filtered by instrument",
+            test_history_can_be_filtered_by_instrument,
         },
         {
             "invalid read requests are rejected",

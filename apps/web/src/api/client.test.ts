@@ -150,13 +150,30 @@ describe('ChronosClient', () => {
         ? { fills: [fillJson({ fill_id: 'older:fill:0' })], next_cursor: null }
         : { fills: [fillJson()], next_cursor: 'djF8ZmlsbHN8ZGVtby0xfDQy' },
     }));
-    const first = await api.client.listFills(ACCOUNT_ID, null);
-    const older = await api.client.listFills(ACCOUNT_ID, first.next_cursor);
+    const first = await api.client.listFills(ACCOUNT_ID, null, null);
+    const older = await api.client.listFills(ACCOUNT_ID, null, first.next_cursor);
     expect(older.fills[0]?.fill_id).toBe('older:fill:0');
     const [firstRequest, olderRequest] = api.requestsTo('GET', `${accountPath}/fills`);
     expect(firstRequest?.query.get('limit')).toBe(String(HISTORY_PAGE_SIZE));
     expect(firstRequest?.query.has('cursor')).toBe(false);
+    expect(firstRequest?.query.has('instrument')).toBe(false);
     expect(olderRequest?.query.get('cursor')).toBe('djF8ZmlsbHN8ZGVtby0xfDQy');
+  });
+
+  it('filters history to one symbol and keeps the filter on every page', async () => {
+    const api = createFakeApi();
+    api.on('GET', `${accountPath}/orders`, (request) => ({
+      status: 200,
+      body: request.query.has('cursor')
+        ? { orders: [partialOrderJson({ client_order_id: 'older', instrument: 'SPY' })], next_cursor: null }
+        : { orders: [partialOrderJson({ instrument: 'SPY' })], next_cursor: 'djJ8b3JkZXJzfGRlbW8tMXxTUFl8NDI' },
+    }));
+    const first = await api.client.listOrders(ACCOUNT_ID, 'SPY', null);
+    await api.client.listOrders(ACCOUNT_ID, 'SPY', first.next_cursor);
+    const [firstRequest, olderRequest] = api.requestsTo('GET', `${accountPath}/orders`);
+    expect(firstRequest?.query.get('instrument')).toBe('SPY');
+    expect(olderRequest?.query.get('instrument')).toBe('SPY');
+    expect(olderRequest?.query.get('cursor')).toBe('djJ8b3JkZXJzfGRlbW8tMXxTUFl8NDI');
   });
 
   it('looks up an order and reports an absent one as not recorded', async () => {
@@ -183,10 +200,10 @@ describe('ChronosClient', () => {
   it('sends account creation exactly as entered', async () => {
     const api = createFakeApi();
     api.on('POST', '/api/v1/accounts', { status: 201, body: { account: accountJson() } });
-    await api.client.createAccount({ account_id: ACCOUNT_ID, instrument: 'AAPL', starting_cash: '100000.00' });
+    await api.client.createAccount({ account_id: ACCOUNT_ID, starting_cash: '100000.00' });
+    // An account is not created for an instrument, so none is sent.
     expect(api.requestsTo('POST', '/api/v1/accounts')[0]?.body).toEqual({
       account_id: ACCOUNT_ID,
-      instrument: 'AAPL',
       starting_cash: '100000.00',
     });
   });

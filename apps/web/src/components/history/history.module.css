@@ -67,6 +67,10 @@
   gap: var(--space-3);
 }
 
+.filter {
+  max-width: 220px;
+}
+
 .skeletonRows {
   display: grid;
   gap: var(--space-2);

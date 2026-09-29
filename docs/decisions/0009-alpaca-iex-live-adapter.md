@@ -116,8 +116,9 @@ acknowledgement and rejection are ordinary messages.
   past an event whose receive time was already taken.
 - Alpaca publishes no venue sequence, so gaps upstream cannot be detected.
 - Corrections and cancels are not applied; execution and valuation use quotes.
-- Accounts remain single-instrument, and each live session needs a new
-  stream ID and new accounts.
+- Accounts remained single-instrument at the time (multi-instrument since
+  [ADR 0010](0010-multi-instrument-accounts.md)), and each live session needs
+  a new stream ID and new accounts.
 
 ## Revisit when
 

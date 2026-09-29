@@ -20,18 +20,21 @@ Chronos simulates trading only. It does not place real-money orders.
 - Quote-first, cost-bounded historical DBN acquisition
 - Offline deterministic DBN replay with event counts and final market views
 - Fill and trading-domain types
-- Single-instrument, long-only paper-account accounting
-- Exact cash, position, cost-basis, fee, and PnL calculations
+- Multi-instrument, long-only paper-account accounting: one shared cash
+  balance and a durable ledger per instrument, kept when a position closes
+- Exact cash, position, cost-basis, fee, and PnL calculations, with account
+  totals and the accounting identity checked across every position
 - Shared manual/model paper-order intents with explicit source attribution
 - Structured pre-trade validation, quote-freshness checks, and risk limits
 - Deterministic top-of-book IOC market and limit execution
-- Partial fills, cancellation reasons, idempotency, and per-account shadow
-  liquidity
+- Partial fills, cancellation reasons, account-wide idempotency, and
+  per-account, per-instrument shadow liquidity
 - End-to-end order processing that immediately books simulated fills into the
   owned paper account
 - Exact reconciliation from order and fill through cash, position, fees, and
   PnL
-- Optional PostgreSQL persistence with atomic account snapshots and an
+- Optional PostgreSQL persistence with atomic, normalized account, position,
+  and execution-state snapshots, commit-time integrity checks, and an
   append-only order, rejection, fill, and portfolio event journal
 - Validated restart recovery, database idempotency, and optimistic concurrency
 - Reconnection after a lost database connection, reported as a typed
@@ -44,20 +47,23 @@ Chronos simulates trading only. It does not place real-money orders.
   immediate-or-cancel order submission, history, and portfolio valuation, with
   exact decimal strings and stable machine-readable errors
 - Durable order and fill history read from the journal, with stable
-  newest-first keyset pagination and order lookup for reconciling uncertain
-  submissions
-- Read-only portfolio valuation at the server's current best bid, with exact
-  market value, unrealized and total PnL, equity, and a fixed-point return
-  percentage that reconcile before they are returned
-- A local React and TypeScript paper-trading workspace: account creation,
-  market and portfolio views, a manual order ticket that reconciles uncertain
-  submissions, and durable order and fill history
+  newest-first keyset pagination, an optional per-instrument filter, and
+  order lookup for reconciling uncertain submissions
+- Read-only portfolio valuation of every open position at its instrument's
+  current best bid, all or nothing, with exact per-position and account market
+  value, unrealized and total PnL, equity, and a fixed-point return percentage
+  that reconcile before they are returned
+- A local React and TypeScript paper-trading workspace: account creation, a
+  watchlist of the configured instruments with the selected symbol's quote,
+  portfolio positions and closed ledgers, a manual order ticket with a symbol
+  selector that reconciles uncertain submissions, and durable order and fill
+  history filterable by symbol
 - Paced historical replay inside the running server: a recording plays by
   receive time at `1x`, `10x`, `100x`, or `max` against an absolute
   steady-clock schedule, with start, pause, and resume controls
 - A provider-independent market-data source boundary with one lifecycle
   vocabulary, and a market-data resource reporting the source, stream, and
-  per-instrument quote availability
+  per-instrument quote availability and current quotes
 - Coalesced Server-Sent Events change notices that let the web workspace
   refresh market-dependent views as the market moves, with polling as the
   fallback
@@ -228,13 +234,17 @@ response contract, history pagination, the portfolio's best-bid mark policy,
 decimal and timestamp rules, error codes, market-state ownership, and
 limitations.
 
-A local database volume created before
-`migrations/002_paper_order_read_indexes.sql` existed needs that file applied
-once; it is idempotent:
+A local database volume created before a migration existed needs it applied
+once, in order; each file is idempotent. Migration 003 turns single-instrument
+accounts into multi-instrument ones: stop the server and back up the volume
+first, as described in
+[docs/postgresql-persistence.md](docs/postgresql-persistence.md#upgrading-an-existing-volume):
 
 ```sh
 docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/003_multi_instrument_accounts.sql
 ```
 
 ## Run the web workspace
@@ -330,5 +340,9 @@ notification decision in
 The Alpaca IEX live adapter is documented in
 [docs/alpaca-adapter.md](docs/alpaca-adapter.md), and its decision in
 [docs/decisions/0009-alpaca-iex-live-adapter.md](docs/decisions/0009-alpaca-iex-live-adapter.md).
+Multi-instrument accounts — the scopes of cash, positions, liquidity, and
+timelines, all-or-nothing valuation, and the normalized schema and its
+migration — are recorded in
+[docs/decisions/0010-multi-instrument-accounts.md](docs/decisions/0010-multi-instrument-accounts.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

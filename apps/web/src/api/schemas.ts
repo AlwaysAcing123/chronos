@@ -47,11 +47,22 @@ export const IdentifierSchema = z.string().regex(IDENTIFIER_PATTERN, 'expected a
 
 const PaperTradingMode = z.literal('paper');
 
+// One held position the server could not mark, and why.
+export const PositionMarkFailureSchema = z.object({
+  instrument: IdentifierSchema,
+  reason: z.string().min(1),
+  message: z.string(),
+});
+export type PositionMarkFailure = z.infer<typeof PositionMarkFailureSchema>;
+
 export const ErrorBodySchema = z.object({
   code: z.string().min(1),
   message: z.string(),
   field: z.string().nullable(),
   reason: z.string().nullable(),
+  // Present only when the reason is position_mark_unavailable: every held
+  // position that could not be marked.
+  instruments: z.array(PositionMarkFailureSchema).optional(),
 });
 export type ErrorBody = z.infer<typeof ErrorBodySchema>;
 
@@ -172,9 +183,15 @@ export const InstrumentAvailabilitySchema = z
     instrument: IdentifierSchema,
     execution_quote_available: z.boolean(),
     unavailable_reason: z.string().min(1).nullable(),
+    // The quote an order would execute against now, for reference.
+    quote: MarketObservationSchema.nullable(),
   })
   .refine((item) => item.execution_quote_available === (item.unavailable_reason === null), {
     message: 'an unavailable quote must say why',
+  })
+  .refine((item) => item.execution_quote_available === (item.quote !== null), {
+    message: 'exactly an available instrument carries its quote',
+    path: ['quote'],
   });
 export type InstrumentAvailability = z.infer<typeof InstrumentAvailabilitySchema>;
 
@@ -201,46 +218,77 @@ export const RiskLimitsSchema = z.object({
 });
 export type RiskLimits = z.infer<typeof RiskLimitsSchema>;
 
+// An open position's ledger. Quantity and cost basis are positive, so the
+// average entry price is always defined.
+export const OpenPositionSchema = z.object({
+  instrument: IdentifierSchema,
+  quantity: QuantitySchema,
+  open_cost_basis: MoneySchema,
+  average_entry_price: PriceSchema,
+  gross_realized_pnl: MoneySchema,
+  fees_paid: MoneySchema,
+  last_fill_at: TimestampSchema,
+});
+export type OpenPosition = z.infer<typeof OpenPositionSchema>;
+
+// A position that was closed keeps what it realized and paid.
+export const ClosedPositionSchema = z.object({
+  instrument: IdentifierSchema,
+  gross_realized_pnl: MoneySchema,
+  fees_paid: MoneySchema,
+  last_fill_at: TimestampSchema,
+});
+export type ClosedPosition = z.infer<typeof ClosedPositionSchema>;
+
+// Account totals are the server's sums over every position, open or closed.
 export const AccountSchema = z.object({
   trading_mode: PaperTradingMode,
   account_id: IdentifierSchema,
-  instrument: IdentifierSchema,
   version: UnsignedIntegerSchema,
   status: AccountStatusSchema,
+  market_stream_id: z.string().min(1).nullable(),
   starting_cash: MoneySchema,
   cash: MoneySchema,
-  position: QuantitySchema,
   open_cost_basis: MoneySchema,
-  average_entry_price: PriceSchema.nullable(),
   gross_realized_pnl: MoneySchema,
   fees_paid: MoneySchema,
   last_fill_at: TimestampSchema.nullable(),
+  positions: z.array(OpenPositionSchema),
+  closed_positions: z.array(ClosedPositionSchema),
   risk_limits: RiskLimitsSchema,
 });
 export type Account = z.infer<typeof AccountSchema>;
 
+// An open position marked at its best bid.
+export const ValuedPositionSchema = OpenPositionSchema.extend({
+  mark_price: PriceSchema,
+  market: MarketObservationSchema,
+  market_value: MoneySchema,
+  unrealized_pnl: MoneySchema,
+});
+export type ValuedPosition = z.infer<typeof ValuedPositionSchema>;
+
 export const PortfolioSchema = z.object({
   trading_mode: PaperTradingMode,
   account_id: IdentifierSchema,
-  instrument: IdentifierSchema,
   account_version: UnsignedIntegerSchema,
   status: AccountStatusSchema,
-  valued_at: TimestampSchema,
+  market_stream_id: z.string().min(1).nullable(),
+  // Null only before the market's first event, when nothing is held.
+  valued_at: TimestampSchema.nullable(),
   mark_policy: z.literal('best_bid'),
-  mark_price: PriceSchema,
-  market: MarketObservationSchema,
   starting_cash: MoneySchema,
   cash: MoneySchema,
-  position: QuantitySchema,
   open_cost_basis: MoneySchema,
-  average_entry_price: PriceSchema.nullable(),
-  position_market_value: MoneySchema,
+  market_value: MoneySchema,
   unrealized_pnl: MoneySchema,
   gross_realized_pnl: MoneySchema,
   fees_paid: MoneySchema,
   total_pnl: MoneySchema,
   equity: MoneySchema,
   return_percent: PercentageSchema,
+  positions: z.array(ValuedPositionSchema),
+  closed_positions: z.array(ClosedPositionSchema),
 });
 export type Portfolio = z.infer<typeof PortfolioSchema>;
 

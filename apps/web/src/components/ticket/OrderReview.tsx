@@ -13,7 +13,7 @@ export function RequestSummary({ request }: { readonly request: OrderRequest }) 
     <dl className={styles.summary}>
       <dt>Side</dt>
       <dd className={styles.side}>{SIDE[request.side]}</dd>
-      <dt>Instrument</dt>
+      <dt>Symbol</dt>
       <dd>{request.instrument}</dd>
       <dt>Type</dt>
       <dd>{ORDER_TYPE[request.type]}</dd>
@@ -41,10 +41,12 @@ export function OrderReview({
   request,
   onSubmit,
   onEdit,
+  submitDisabled,
 }: {
   readonly request: OrderRequest;
   readonly onSubmit: () => void;
   readonly onEdit: () => void;
+  readonly submitDisabled: boolean;
 }) {
   const submitButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -60,7 +62,7 @@ export function OrderReview({
         Simulated only. The server executes it once against its current quote; any unfilled quantity is cancelled.
       </p>
       <div className={formStyles.actions}>
-        <Button ref={submitButton} variant="primary" onClick={onSubmit}>
+        <Button ref={submitButton} variant="primary" onClick={onSubmit} disabled={submitDisabled}>
           Submit paper order
         </Button>
         <Button onClick={onEdit}>Edit</Button>

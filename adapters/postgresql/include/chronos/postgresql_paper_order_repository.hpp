@@ -104,9 +104,12 @@ struct PaperFillRecord {
 
 // A newest-first page. `before_record_id` excludes that record and every
 // newer one, so a page chain stays stable while new orders are recorded.
+// `instrument`, when present, keeps only the records for that instrument; a
+// chain of pages must use the same filter throughout.
 struct PaperJournalPageRequest {
     std::size_t limit;
     std::optional<std::int64_t> before_record_id;
+    std::optional<InstrumentId> instrument;
 };
 
 template <typename Record>
@@ -193,12 +196,16 @@ private:
         const PaperOrderProcessorRecoveryState& state
     );
 
+    // Writes the account row and only the position and execution rows that
+    // differ between `state_before`, the state at `expected_version`, and
+    // `state_after`, together with the journal record and its events.
     [[nodiscard]] CommitPaperOrderResult commit_order(
         std::string_view account_id,
         std::int64_t expected_version,
         const OrderIntent& intent,
         const TopOfBookEvent& market,
         const PaperOrderResult& result,
+        const PaperOrderProcessorRecoveryState& state_before,
         const PaperOrderProcessorRecoveryState& state_after
     );
 
@@ -224,7 +231,6 @@ public:
     > create(
         PostgresPaperOrderRepository& repository,
         std::string account_id,
-        InstrumentId instrument,
         Money starting_cash,
         PreTradeRiskLimits risk_limits
     );
@@ -256,9 +262,9 @@ public:
         return processor_.is_healthy();
     }
 
-    [[nodiscard]] const std::optional<TopOfBookEvent>& active_market()
+    [[nodiscard]] const InstrumentExecutionStates& executions()
         const noexcept {
-        return processor_.active_market();
+        return processor_.executions();
     }
 
     [[nodiscard]] std::int64_t version() const noexcept { return version_; }

@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 
 import type { Side } from '../../api/schemas';
 import { SIDE } from '../../presentation/vocabulary';
+import { SelectField } from '../form/Field';
 import { Alert } from '../ui/Alert';
 import { Button } from '../ui/Button';
 import { cx } from '../ui/cx';
@@ -83,6 +84,36 @@ export function HistoryView({
   );
 }
 
+const ALL_SYMBOLS = '*';
+
+// Narrows a history to one symbol. The filter is the server's: each choice
+// is its own newest-first history with its own cursor.
+export function SymbolFilter({
+  symbols,
+  value,
+  onChange,
+}: {
+  readonly symbols: readonly string[];
+  readonly value: string | null;
+  readonly onChange: (symbol: string | null) => void;
+}) {
+  return (
+    <div className={styles.filter}>
+      <SelectField
+        label="Symbol"
+        value={value ?? ALL_SYMBOLS}
+        options={[
+          { value: ALL_SYMBOLS, label: 'All symbols' },
+          ...symbols.map((symbol) => ({ value: symbol, label: symbol })),
+        ]}
+        onChange={(chosen) => {
+          onChange(chosen === ALL_SYMBOLS ? null : chosen);
+        }}
+      />
+    </div>
+  );
+}
+
 export function SideText({ side }: { readonly side: Side }) {
   return <span className={styles.side}>{SIDE[side]}</span>;
 }
@@ -103,12 +134,14 @@ export function HistoryTable<Row>({
   columns,
   rows,
   rowKey,
+  rowClassName,
 }: {
   readonly label: string;
   readonly caption: string;
   readonly columns: readonly Column<Row>[];
   readonly rows: readonly Row[];
   readonly rowKey: (row: Row) => string;
+  readonly rowClassName?: (row: Row) => string | undefined;
 }) {
   return (
     // Focusable so keyboard users can scroll a table wider than the screen.
@@ -126,7 +159,7 @@ export function HistoryTable<Row>({
         </thead>
         <tbody role="rowgroup">
           {rows.map((row) => (
-            <tr key={rowKey(row)} role="row">
+            <tr key={rowKey(row)} role="row" className={rowClassName?.(row)}>
               {columns.map((column) => (
                 <td
                   key={column.header}

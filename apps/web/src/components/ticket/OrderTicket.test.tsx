@@ -10,12 +10,19 @@ import {
   errorJson,
   faultedOrderJson,
   filledOrderJson,
+  marketDataJson,
   partialOrderJson,
   PERSISTENCE_UNAVAILABLE_MESSAGE,
   rejectedOrderJson,
   riskRejectionJson,
 } from '../../test/fixtures';
-import { accountPath, rememberSelectedAccount, renderWithServices, serveAccount } from '../../test/renderWithServices';
+import {
+  accountPath,
+  rememberSelectedAccount,
+  renderWithServices,
+  serveAccount,
+  serveServer,
+} from '../../test/renderWithServices';
 
 const ordersPath = `${accountPath}/orders`;
 
@@ -31,6 +38,7 @@ function recordedFor(request: RecordedRequest, fixture: Json): Json {
   return {
     ...fixture,
     client_order_id: body.client_order_id,
+    instrument: body.instrument,
     side: body.side,
     type: body.type,
     quantity: body.quantity,
@@ -382,6 +390,66 @@ describe('unrecorded and uncertain submissions', () => {
 
     const [first, second] = api.requestsTo('POST', ordersPath).map((request) => sentBody(request).client_order_id);
     expect(first).not.toEqual(second);
+  });
+});
+
+describe('symbols', () => {
+  it('does not offer review while the selected symbol is known to have no executable quote', async () => {
+    const api = createFakeApi();
+    rememberSelectedAccount();
+    serveAccount(api);
+    serveServer(api, marketDataJson({ reasons: { AAPL: 'no_top_of_book' } }));
+    renderWithServices(<App />, { api });
+
+    const ticket = await screen.findByRole('region', { name: 'Order ticket' });
+    expect(await within(ticket).findByText('No usable AAPL quote right now')).toBeInTheDocument();
+    await within(ticket).findByRole('button', { name: 'Review order' });
+    expect(within(ticket).getByRole('button', { name: 'Review order' })).toBeDisabled();
+    expect(api.requestsTo('POST', ordersPath)).toHaveLength(0);
+  });
+
+  it('trades the symbol chosen in the ticket and keeps a reviewed order on its own symbol', async () => {
+    const api = createFakeApi();
+    const { user, ticket } = await openTicket(api);
+    api.on('POST', ordersPath, (request) => ({
+      status: 201,
+      body: { order: recordedFor(request, filledOrderJson()), account: accountJson() },
+    }));
+    await user.selectOptions(within(ticket).getByRole('combobox', { name: 'Symbol' }), 'SPY');
+    expect(within(ticket).getByRole('group', { name: 'Reference quote for SPY' })).toHaveTextContent('769.78');
+    expect(within(ticket).getByRole('group', { name: 'Position and account limits' })).toHaveTextContent('Held (SPY)None');
+    await user.type(within(ticket).getByLabelText('Quantity (SPY)'), '1.5');
+    await user.click(within(ticket).getByRole('button', { name: 'Review order' }));
+
+    // Choosing another symbol elsewhere does not change the order under review.
+    const watchlist = screen.getByRole('region', { name: 'Watchlist' });
+    await user.click(within(watchlist).getByRole('radio', { name: 'AAPL' }));
+    expect(within(ticket).getByRole('group', { name: 'Reference quote for SPY' })).toBeInTheDocument();
+    expect(within(ticket).getByText('Symbol', { selector: 'dt' }).nextElementSibling).toHaveTextContent('SPY');
+    await user.click(within(ticket).getByRole('button', { name: 'Submit paper order' }));
+
+    expect(await within(ticket).findByText(/^Filled 1.5/)).toBeInTheDocument();
+    expect(sentBody(api.requestsTo('POST', ordersPath)[0]).instrument).toBe('SPY');
+    // A new order follows the selection again.
+    await user.click(within(ticket).getByRole('button', { name: 'New order' }));
+    expect(within(ticket).getByRole('combobox', { name: 'Symbol' })).toHaveValue('AAPL');
+    expect(within(ticket).getByRole('group', { name: 'Position and account limits' })).toHaveTextContent('Held (AAPL)2.5');
+  });
+
+  it('never reconciles an uncertain order to a recorded order for another symbol', async () => {
+    const api = createFakeApi();
+    const { user, ticket } = await openTicket(api);
+    api.on('POST', ordersPath, (request) => {
+      api.on('GET', `${ordersPath}/${String(sentBody(request).client_order_id)}`, {
+        status: 200,
+        body: { order: { ...recordedFor(request, partialOrderJson()), instrument: 'SPY' } },
+      });
+      return { status: 503, body: errorJson('persistence_unavailable', PERSISTENCE_UNAVAILABLE_MESSAGE) };
+    });
+    await reviewMarketBuy(user, ticket);
+    await user.click(within(ticket).getByRole('button', { name: 'Submit paper order' }));
+    expect(await within(ticket).findByText('This client order ID belongs to a different order')).toBeInTheDocument();
+    expect(api.requestsTo('POST', ordersPath)).toHaveLength(1);
   });
 });
 

@@ -185,8 +185,7 @@ std::string orders_path(const std::string& account_id) {
 ApiResponse create_account(
     TestApi& api,
     const std::string& account_id,
-    std::string_view starting_cash = "1000",
-    std::string_view instrument = "AAPL"
+    std::string_view starting_cash = "1000"
 ) {
     return call(
         api,
@@ -194,10 +193,19 @@ ApiResponse create_account(
         "/api/v1/accounts",
         Json{
             {"account_id", account_id},
-            {"instrument", instrument},
             {"starting_cash", starting_cash},
         }.dump()
     );
+}
+
+// The quantity of an open position, or "none" when the account holds none.
+std::string held_quantity(const Json& account, std::string_view instrument) {
+    for (const Json& position : account.at("positions")) {
+        if (position.at("instrument") == instrument) {
+            return position.at("quantity").get<std::string>();
+        }
+    }
+    return "none";
 }
 
 std::string new_account(TestApi& api, std::string_view prefix) {
@@ -211,12 +219,13 @@ Json order(
     std::string_view side,
     std::string_view quantity,
     std::optional<std::string_view> limit_price = std::nullopt,
-    std::string_view source_kind = "manual"
+    std::string_view source_kind = "manual",
+    std::string_view instrument = "AAPL"
 ) {
     Json body{
         {"client_order_id", std::move(client_order_id)},
         {"source", {{"kind", source_kind}, {"id", "local-trader"}}},
-        {"instrument", "AAPL"},
+        {"instrument", instrument},
         {"side", side},
         {"type", limit_price ? "limit" : "market"},
         {"quantity", quantity},
@@ -269,13 +278,15 @@ void test_account_lifecycle_uses_distinct_status_codes() {
     const Json& account = created.body.at("account");
     REQUIRE(account.at("trading_mode") == "paper");
     REQUIRE(account.at("account_id") == account_id);
-    REQUIRE(account.at("instrument") == "AAPL");
+    REQUIRE(!account.contains("instrument"));
     REQUIRE(account.at("version") == "0");
     REQUIRE(account.at("status") == "active");
+    REQUIRE(account.at("market_stream_id").is_null());
     REQUIRE(account.at("starting_cash") == "2500.75");
     REQUIRE(account.at("cash") == "2500.75");
-    REQUIRE(account.at("position") == "0");
-    REQUIRE(account.at("average_entry_price").is_null());
+    REQUIRE(account.at("open_cost_basis") == "0");
+    REQUIRE(account.at("positions") == Json::array());
+    REQUIRE(account.at("closed_positions") == Json::array());
     REQUIRE(account.at("last_fill_at").is_null());
     REQUIRE(account.at("risk_limits") == Json({
         {"maximum_order_quantity", "100"},
@@ -310,11 +321,19 @@ void test_account_lifecycle_uses_distinct_status_codes() {
     );
     REQUIRE(invalid.at("reason") == "invalid_identifier");
     REQUIRE(invalid.at("field") == "account_id");
-    REQUIRE(require_error(
-        create_account(api, unique_test_id("msft"), "1000", "MSFT"),
-        422,
-        "unsupported_instrument"
-    ).at("field") == "instrument");
+    // An account is not created for one instrument, so naming one is a
+    // malformed request, not a hint.
+    const Json named = require_error(
+        call(api, "POST", "/api/v1/accounts", Json{
+            {"account_id", unique_test_id("named")},
+            {"instrument", "AAPL"},
+            {"starting_cash", "1000"},
+        }.dump()),
+        400,
+        "malformed_request"
+    );
+    REQUIRE(named.at("reason") == "unexpected_field");
+    REQUIRE(named.at("field") == "instrument");
     REQUIRE(require_error(
         create_account(api, unique_test_id("broke"), "0"),
         422,
@@ -358,8 +377,11 @@ void test_filled_order_returns_exact_decimal_strings() {
     const Json& account = response.body.at("account");
     REQUIRE(account.at("version") == "1");
     REQUIRE(account.at("cash") == "747.49");
-    REQUIRE(account.at("position") == "2.5");
-    REQUIRE(account.at("average_entry_price") == "101");
+    REQUIRE(account.at("market_stream_id") == chronos::test::kTestStream);
+    REQUIRE(account.at("positions").size() == 1);
+    REQUIRE(account.at("positions")[0].at("instrument") == "AAPL");
+    REQUIRE(account.at("positions")[0].at("quantity") == "2.5");
+    REQUIRE(account.at("positions")[0].at("average_entry_price") == "101");
     REQUIRE(account.at("fees_paid") == "0.01");
     REQUIRE(
         call(api, "GET", accounts_path(account_id)).body.at("account") ==
@@ -401,7 +423,7 @@ void test_partial_fill_and_non_marketable_limit_are_201_outcomes() {
         "limit_not_marketable"
     );
     REQUIRE(passive.body.at("order").at("fill").is_null());
-    REQUIRE(passive.body.at("account").at("position") == "5");
+    REQUIRE(held_quantity(passive.body.at("account"), "AAPL") == "5");
     REQUIRE(passive.body.at("account").at("version") == "2");
 }
 
@@ -567,10 +589,10 @@ void test_duplicate_client_order_id_returns_409_without_recording() {
                 .at("field") == "client_order_id");
     REQUIRE(!duplicate.body.contains("order"));
     REQUIRE(recorded_orders(account_id) == 1);
-    REQUIRE(
-        call(api, "GET", accounts_path(account_id))
-            .body.at("account").at("position") == "1"
-    );
+    REQUIRE(held_quantity(
+        call(api, "GET", accounts_path(account_id)).body.at("account"),
+        "AAPL"
+    ) == "1");
 }
 
 void test_version_conflict_returns_409_and_the_same_id_can_retry() {
@@ -627,7 +649,6 @@ void test_routing_and_media_type_errors_are_json() {
     const std::string account_id = new_account(api, "http-routing");
     const std::string create_body = Json{
         {"account_id", unique_test_id("http-media")},
-        {"instrument", "AAPL"},
         {"starting_cash", "1"},
     }.dump();
 
@@ -707,7 +728,7 @@ void test_durable_state_is_visible_through_a_new_api_instance() {
     );
     REQUIRE(recovered.status == 200);
     REQUIRE(recovered.body.at("account") == account_before_restart);
-    REQUIRE(recovered.body.at("account").at("position") == "3");
+    REQUIRE(held_quantity(recovered.body.at("account"), "AAPL") == "3");
 
     apply(*restarted.market, quote(0, 0));
     const ApiResponse remaining = submit(
@@ -893,14 +914,13 @@ void test_socket_server_serves_json_with_paper_headers_and_limits() {
             "/api/v1/accounts",
             Json{
                 {"account_id", account_id},
-                {"instrument", "SPY"},
                 {"starting_cash", "10"},
             }.dump(),
             "application/json"
         ),
         201
     );
-    REQUIRE(created.at("account").at("instrument") == "SPY");
+    REQUIRE(created.at("account").at("starting_cash") == "10");
 
     // A second server must not share the port with a running one.
     PaperTradingHttpServer duplicate(
@@ -1092,12 +1112,14 @@ void test_history_queries_are_strict_on_every_route() {
     const std::string fills_cursor = chronos::paper_trading::encode_history_cursor(
         chronos::paper_trading::HistoryCursorKind::Fills,
         account_id,
+        std::nullopt,
         1
     );
     rejected(orders_path(account_id) + "?cursor=" + fills_cursor, "invalid_cursor");
     const std::string other_cursor = chronos::paper_trading::encode_history_cursor(
         chronos::paper_trading::HistoryCursorKind::Fills,
         other_account,
+        std::nullopt,
         1
     );
     rejected(fills_path(account_id) + "?cursor=" + other_cursor, "invalid_cursor");
@@ -1290,28 +1312,38 @@ void submit_portfolio_orders(TestApi& api, const std::string& account_id) {
 // realized PnL 49.5 - 50.5, cash 1000 - 202.01 + 49.49, fees 2 × 0.01, and
 // at the bid of 99, market value 148.5, unrealized PnL -3, total PnL -4.02.
 void require_expected_portfolio(const Json& portfolio, const std::string& account_id) {
+    require_no_json_numbers(portfolio);
     REQUIRE(portfolio.at("trading_mode") == "paper");
     REQUIRE(portfolio.at("account_id") == account_id);
-    REQUIRE(portfolio.at("instrument") == "AAPL");
     REQUIRE(portfolio.at("account_version") == "2");
     REQUIRE(portfolio.at("status") == "active");
+    REQUIRE(portfolio.at("market_stream_id") == chronos::test::kTestStream);
     REQUIRE(portfolio.at("valued_at") == "2026-09-25T13:30:00.000000000Z");
     REQUIRE(portfolio.at("mark_policy") == "best_bid");
-    REQUIRE(portfolio.at("mark_price") == "99");
-    REQUIRE(portfolio.at("market").at("ingest_sequence") == "0");
-    REQUIRE(portfolio.at("market").at("quality_flags") == Json::array({"replay"}));
     REQUIRE(portfolio.at("starting_cash") == "1000");
     REQUIRE(portfolio.at("cash") == "847.48");
-    REQUIRE(portfolio.at("position") == "1.5");
     REQUIRE(portfolio.at("open_cost_basis") == "151.5");
-    REQUIRE(portfolio.at("average_entry_price") == "101");
-    REQUIRE(portfolio.at("position_market_value") == "148.5");
+    REQUIRE(portfolio.at("market_value") == "148.5");
     REQUIRE(portfolio.at("unrealized_pnl") == "-3");
     REQUIRE(portfolio.at("gross_realized_pnl") == "-1");
     REQUIRE(portfolio.at("fees_paid") == "0.02");
     REQUIRE(portfolio.at("total_pnl") == "-4.02");
     REQUIRE(portfolio.at("equity") == "995.98");
     REQUIRE(portfolio.at("return_percent") == "-0.402");
+    REQUIRE(portfolio.at("closed_positions") == Json::array());
+    REQUIRE(portfolio.at("positions").size() == 1);
+    const Json& aapl = portfolio.at("positions")[0];
+    REQUIRE(aapl.at("instrument") == "AAPL");
+    REQUIRE(aapl.at("quantity") == "1.5");
+    REQUIRE(aapl.at("open_cost_basis") == "151.5");
+    REQUIRE(aapl.at("average_entry_price") == "101");
+    REQUIRE(aapl.at("mark_price") == "99");
+    REQUIRE(aapl.at("market").at("ingest_sequence") == "0");
+    REQUIRE(aapl.at("market").at("quality_flags") == Json::array({"replay"}));
+    REQUIRE(aapl.at("market_value") == "148.5");
+    REQUIRE(aapl.at("unrealized_pnl") == "-3");
+    REQUIRE(aapl.at("gross_realized_pnl") == "-1");
+    REQUIRE(aapl.at("fees_paid") == "0.02");
 }
 
 void test_portfolio_reflects_orders_submitted_through_the_api() {
@@ -1323,7 +1355,7 @@ void test_portfolio_reflects_orders_submitted_through_the_api() {
         account_id = new_account(api, "http-portfolio");
         const ApiResponse flat = call(api, "GET", portfolio_path(account_id));
         REQUIRE(flat.status == 200);
-        REQUIRE(flat.body.at("portfolio").at("average_entry_price").is_null());
+        REQUIRE(flat.body.at("portfolio").at("positions") == Json::array());
         REQUIRE(flat.body.at("portfolio").at("equity") == "1000");
 
         submit_portfolio_orders(api, account_id);
@@ -1383,30 +1415,43 @@ void test_portfolio_route_is_get_only_and_accepts_no_query() {
 }
 
 void test_portfolio_failures_have_stable_codes() {
-    TestApi api;
-    const std::string account_id = new_account(api, "http-portfolio-errors");
-    require_error(
-        call(api, "GET", portfolio_path(unique_test_id("absent"))),
-        404,
-        "account_not_found"
-    );
-    REQUIRE(require_error(
-        call(api, "GET", portfolio_path("bad id")),
-        400,
-        "malformed_request"
-    ).at("reason") == "invalid_identifier");
-    const auto unavailable_reason = [&](TestApi& target) {
+    std::string account_id;
+    {
+        TestApi api;
+        apply(*api.market, quote(0, 0));
+        account_id = new_account(api, "http-portfolio-errors");
+        REQUIRE(submit(api, account_id, order("hold", "buy", "1")).status == 201);
+        require_error(
+            call(api, "GET", portfolio_path(unique_test_id("absent"))),
+            404,
+            "account_not_found"
+        );
+        REQUIRE(require_error(
+            call(api, "GET", portfolio_path("bad id")),
+            400,
+            "malformed_request"
+        ).at("reason") == "invalid_identifier");
+    }
+    // The held AAPL position cannot be marked; the error says why for it.
+    const auto unmarkable_reason = [&](TestApi& target) {
         const ApiResponse response = call(target, "GET", portfolio_path(account_id));
         REQUIRE(!response.body.contains("portfolio"));
-        return require_error(response, 503, "market_data_unavailable").at("reason");
+        const Json error = require_error(response, 503, "market_data_unavailable");
+        REQUIRE(error.at("reason") == "position_mark_unavailable");
+        REQUIRE(error.at("instruments").size() == 1);
+        REQUIRE(error.at("instruments")[0].at("instrument") == "AAPL");
+        REQUIRE(!error.at("instruments")[0].at("message").get<std::string>().empty());
+        return error.at("instruments")[0].at("reason");
     };
-    REQUIRE(unavailable_reason(api) == "no_top_of_book");
+    TestApi restarted;
+    REQUIRE(unmarkable_reason(restarted) == "no_top_of_book");
 
     TestApi ask_only;
-    TopOfBookEvent no_bid = quote(0, 0);
+    apply(*ask_only.market, quote(0, 0));
+    TopOfBookEvent no_bid = quote(1, 1);
     no_bid.bid = std::nullopt;
     apply(*ask_only.market, no_bid);
-    REQUIRE(unavailable_reason(ask_only) == "missing_best_bid");
+    REQUIRE(unmarkable_reason(ask_only) == "missing_best_bid");
 
     TestApi interrupted;
     apply(*interrupted.market, quote(0, 0));
@@ -1414,7 +1459,7 @@ void test_portfolio_failures_have_stable_codes() {
     static_cast<void>(interrupted.market->apply(
         std::get<chronos::ValidatedMarketEvent>(gap)
     ));
-    REQUIRE(unavailable_reason(interrupted) == "stream_interrupted");
+    REQUIRE(unmarkable_reason(interrupted) == "stream_interrupted");
 
     TestApi stale;
     apply(*stale.market, quote(0, 0));
@@ -1423,7 +1468,93 @@ void test_portfolio_failures_have_stable_codes() {
         chronos::test::kMaximumQuoteAgeNanoseconds + 1,
         "SPY"
     ));
-    REQUIRE(unavailable_reason(stale) == "stale_market_state");
+    REQUIRE(unmarkable_reason(stale) == "stale_market_state");
+}
+
+void test_several_instruments_trade_and_value_through_the_api() {
+    TestApi api;
+    apply(*api.market, quote(0, 0));
+    apply(*api.market, quote(1, 1, "SPY", chronos::test::QuoteLevels{
+        .bid_price = "499",
+        .ask_price = "501",
+    }));
+    const std::string account_id = unique_test_id("http-multi");
+    REQUIRE(create_account(api, account_id, "5000").status == 201);
+
+    REQUIRE(submit(api, account_id, order("aapl", "buy", "2")).status == 201);
+    const ApiResponse spy = submit(
+        api,
+        account_id,
+        order("spy", "buy", "3", std::nullopt, "manual", "SPY")
+    );
+    REQUIRE(spy.status == 201);
+    REQUIRE(spy.body.at("order").at("instrument") == "SPY");
+    REQUIRE(spy.body.at("order").at("fill").at("price") == "501");
+    REQUIRE(spy.body.at("account").at("cash") == "3294.98");
+    REQUIRE(held_quantity(spy.body.at("account"), "AAPL") == "2");
+    REQUIRE(held_quantity(spy.body.at("account"), "SPY") == "3");
+
+    // An instrument this server does not trade is refused, not recorded.
+    REQUIRE(require_error(
+        submit(api, account_id, order("msft", "buy", "1", std::nullopt, "manual", "MSFT")),
+        422,
+        "unsupported_instrument"
+    ).at("field") == "instrument");
+
+    const Json portfolio = call(api, "GET", portfolio_path(account_id))
+        .body.at("portfolio");
+    require_no_json_numbers(portfolio);
+    REQUIRE(portfolio.at("positions").size() == 2);
+    REQUIRE(portfolio.at("positions")[0].at("instrument") == "AAPL");
+    REQUIRE(portfolio.at("positions")[1].at("instrument") == "SPY");
+    REQUIRE(portfolio.at("positions")[1].at("market_value") == "1497");
+    REQUIRE(portfolio.at("market_value") == "1695");
+    REQUIRE(portfolio.at("equity") == "4989.98");
+
+    // Sell all of AAPL: its ledger moves to the closed positions.
+    REQUIRE(submit(api, account_id, order("aapl-out", "sell", "2")).status == 201);
+    const Json after = call(api, "GET", accounts_path(account_id)).body.at("account");
+    REQUIRE(held_quantity(after, "AAPL") == "none");
+    REQUIRE(after.at("closed_positions") == Json::array({Json({
+        {"instrument", "AAPL"},
+        {"gross_realized_pnl", "-4"},
+        {"fees_paid", "0.02"},
+        {"last_fill_at", "2026-09-25T13:30:00.000000001Z"},
+    })}));
+
+    // History for one symbol, with a cursor bound to that filter.
+    const ApiResponse aapl_orders = call(
+        api,
+        "GET",
+        orders_path(account_id) + "?instrument=AAPL&limit=1"
+    );
+    REQUIRE(aapl_orders.status == 200);
+    REQUIRE(aapl_orders.body.at("orders")[0].at("client_order_id") == "aapl-out");
+    const std::string cursor =
+        aapl_orders.body.at("next_cursor").get<std::string>();
+    const ApiResponse older = call(
+        api,
+        "GET",
+        orders_path(account_id) + "?instrument=AAPL&limit=1&cursor=" + cursor
+    );
+    REQUIRE(older.body.at("orders")[0].at("client_order_id") == "aapl");
+    REQUIRE(require_error(
+        call(api, "GET", orders_path(account_id) + "?limit=1&cursor=" + cursor),
+        400,
+        "malformed_request"
+    ).at("reason") == "invalid_cursor");
+    const Json spy_fills = call(
+        api,
+        "GET",
+        accounts_path(account_id) + "/fills?instrument=SPY"
+    ).body;
+    REQUIRE(spy_fills.at("fills").size() == 1);
+    REQUIRE(spy_fills.at("fills")[0].at("instrument") == "SPY");
+    REQUIRE(require_error(
+        call(api, "GET", orders_path(account_id) + "?instrument=bad%20symbol"),
+        400,
+        "malformed_request"
+    ).at("field") == "instrument");
 }
 
 void test_portfolio_rejects_a_replay_behind_the_account() {
@@ -1554,14 +1685,22 @@ void test_market_data_resource_describes_source_stream_and_instruments() {
     REQUIRE(data.at("stream").at("stream_id") == chronos::test::kTestStream);
     REQUIRE(data.at("stream").at("market_time").is_null());
     REQUIRE(data.at("instruments") == Json::array({
-        {{"instrument", "AAPL"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}},
-        {{"instrument", "SPY"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}},
+        {{"instrument", "AAPL"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}, {"quote", nullptr}},
+        {{"instrument", "SPY"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}, {"quote", nullptr}},
     }));
 
     apply(*api.market, quote(0, 0));
     const Json quoted = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    require_no_json_numbers(quoted);
     REQUIRE(quoted.at("instruments").at(0).at("execution_quote_available") == true);
     REQUIRE(quoted.at("instruments").at(0).at("unavailable_reason").is_null());
+    // The quote an order would execute against now, per instrument.
+    REQUIRE(quoted.at("instruments").at(0).at("quote").at("ingest_sequence") == "0");
+    REQUIRE(quoted.at("instruments").at(0).at("quote").at("ask") == Json({
+        {"price", "101"},
+        {"quantity", "5"},
+    }));
+    REQUIRE(quoted.at("instruments").at(1).at("quote").is_null());
     REQUIRE(quoted.at("stream").at("last_ingest_sequence") == "0");
 }
 
@@ -1845,8 +1984,17 @@ void test_live_disconnect_blocks_orders_and_valuation_until_fresh_quotes() {
     const ApiResponse during = submit(api, account_id, order("during-gap", "buy", "1"));
     REQUIRE(require_error(during, 503, "market_data_unavailable").at("reason") ==
             "source_unavailable");
-    REQUIRE(require_error(call(api, "GET", portfolio_path(account_id)), 503, "market_data_unavailable")
-                .at("reason") == "source_unavailable");
+    const Json unmarked = require_error(
+        call(api, "GET", portfolio_path(account_id)),
+        503,
+        "market_data_unavailable"
+    );
+    REQUIRE(unmarked.at("reason") == "position_mark_unavailable");
+    REQUIRE(unmarked.at("instruments") == Json::array({Json({
+        {"instrument", "AAPL"},
+        {"reason", "source_unavailable"},
+        {"message", unmarked.at("instruments")[0].at("message")},
+    })}));
     REQUIRE(recorded_orders(account_id) == 1);
     const Json reconnecting = call(api, "GET", "/api/v1/market-data").body.at("market_data");
     REQUIRE(reconnecting.at("source").at("state") == "reconnecting");
@@ -1868,6 +2016,7 @@ void test_live_disconnect_blocks_orders_and_valuation_until_fresh_quotes() {
     REQUIRE((unavailable_reasons(api) ==
         std::vector<std::string>{"available", "awaiting_fresh_quote"}));
     REQUIRE(submit(api, account_id, order("after-gap", "buy", "1")).status == 201);
+    // SPY still awaits a fresh quote, but the account holds none of it.
     REQUIRE(call(api, "GET", portfolio_path(account_id)).status == 200);
     REQUIRE(recorded_orders(account_id) == 2);
 }
@@ -1995,6 +2144,10 @@ int main() {
         {
             "portfolio rejects a replay behind the account",
             test_portfolio_rejects_a_replay_behind_the_account,
+        },
+        {
+            "several instruments trade and value through the API",
+            test_several_instruments_trade_and_value_through_the_api,
         },
         {
             "portfolio outage returns a generic error",

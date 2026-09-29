@@ -203,15 +203,9 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             "order account does not match the paper account"
         );
     }
-    if (intent.instrument != account.instrument()) {
-        return rejection(
-            PreTradeRiskErrorCode::InstrumentMismatch,
-            "instrument",
-            "order instrument does not match the paper account"
-        );
-    }
-    if (account.state().last_fill_timestamp &&
-        intent.submitted_at < *account.state().last_fill_timestamp) {
+    const std::optional<Timestamp> latest_fill =
+        account.state().latest_fill_timestamp();
+    if (latest_fill && intent.submitted_at < *latest_fill) {
         return rejection(
             PreTradeRiskErrorCode::SubmissionTimestampMovedBackward,
             "submitted_at",
@@ -302,6 +296,7 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             );
         }
 
+        const Quantity held = account.state().quantity(intent.instrument);
         if (intent.side == Side::Buy) {
             const Money cash_required =
                 maximum_notional + limits_.fee_per_fill;
@@ -312,21 +307,21 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
                     "paper account lacks cash for the order and fee"
                 );
             }
-            const Quantity resulting_position =
-                account.state().position + intent.quantity;
+            const Quantity resulting_position = held + intent.quantity;
             if (resulting_position > limits_.maximum_position_quantity) {
                 return rejection(
                     PreTradeRiskErrorCode::PositionLimitExceeded,
                     "quantity",
-                    "order would exceed the configured position limit"
+                    "order would exceed the instrument's configured position "
+                    "limit"
                 );
             }
         } else {
-            if (intent.quantity > account.state().position) {
+            if (intent.quantity > held) {
                 return rejection(
                     PreTradeRiskErrorCode::InsufficientPosition,
                     "quantity",
-                    "sell order exceeds the paper account position"
+                    "sell order exceeds the instrument's position"
                 );
             }
             if (limits_.fee_per_fill > account.state().cash) {
@@ -336,6 +331,28 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
                     "paper account lacks cash for a possible partial-fill fee"
                 );
             }
+        }
+
+        // Each ledger can fit while an account total cannot. Accounting
+        // would then reject the fill and halt the account, so an order whose
+        // complete fill would overflow is rejected here instead.
+        const ApplyFillResult full_fill = account.preview_fill(Fill{
+            .fill_id = intent.client_order_id + ":risk-preview",
+            .instrument = intent.instrument,
+            .side = intent.side,
+            .price = opposite_side->price,
+            .quantity = intent.quantity,
+            .fee = limits_.fee_per_fill,
+            .timestamp = intent.submitted_at,
+        });
+        if (const auto* error = std::get_if<ApplyFillError>(&full_fill);
+            error && error->code == ApplyFillErrorCode::ArithmeticOverflow) {
+            return rejection(
+                PreTradeRiskErrorCode::ArithmeticOverflow,
+                "quantity",
+                "the order's fill would exceed the fixed-point range of an "
+                "account total"
+            );
         }
 
         return ApprovedOrderIntent(

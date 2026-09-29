@@ -591,6 +591,30 @@ if(BUILD_TESTING)
         set_tests_properties(chronos_postgresql_persistence_tests
             PROPERTIES SKIP_RETURN_CODE 77
         )
+
+        add_executable(chronos_postgresql_migration_tests
+            tests/postgresql_migration_tests.cpp
+        )
+
+        target_compile_definitions(chronos_postgresql_migration_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_postgresql_migration_tests
+            PRIVATE
+                chronos_postgresql_persistence
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_postgresql_migration_tests
+            COMMAND chronos_postgresql_migration_tests
+        )
+
+        set_tests_properties(chronos_postgresql_migration_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
     endif()
 
     if(CHRONOS_ENABLE_PAPER_TRADING_API)

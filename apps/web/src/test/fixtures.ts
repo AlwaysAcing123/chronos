@@ -81,6 +81,7 @@ export function marketDataJson({
   revision = '7',
   available = true,
   reasons,
+  quotes = {},
 }: {
   source?: Json;
   stream?: Json;
@@ -88,7 +89,10 @@ export function marketDataJson({
   available?: boolean;
   // Per-instrument unavailability; null means available.
   reasons?: Readonly<Record<string, string | null>>;
+  // Replaces an available instrument's quote.
+  quotes?: Readonly<Record<string, Json>>;
 } = {}): Json {
+  const quoteOf: Readonly<Record<string, Json>> = { AAPL: marketJson(), SPY: spyMarketJson(), ...quotes };
   return {
     trading_mode: 'paper',
     revision,
@@ -100,6 +104,7 @@ export function marketDataJson({
         instrument,
         execution_quote_available: reason === null,
         unavailable_reason: reason,
+        quote: reason === null ? quoteOf[instrument] : null,
       };
     }),
   };
@@ -115,21 +120,45 @@ export function riskLimitsJson(): Json {
   };
 }
 
-export function accountJson(overrides: Json = {}): Json {
+// The documented AAPL position: 2.5 held at an average of 337.
+export function openPositionJson(overrides: Json = {}): Json {
   return {
-    trading_mode: 'paper',
-    account_id: ACCOUNT_ID,
     instrument: 'AAPL',
-    version: '2',
-    status: 'active',
-    starting_cash: '100000',
-    cash: '99155.03',
-    position: '2.5',
+    quantity: '2.5',
     open_cost_basis: '842.5',
     average_entry_price: '337',
     gross_realized_pnl: '-1.77',
     fees_paid: '0.7',
     last_fill_at: MARKET_TIME,
+    ...overrides,
+  };
+}
+
+export function closedPositionJson(overrides: Json = {}): Json {
+  return {
+    instrument: 'SPY',
+    gross_realized_pnl: '2.5',
+    fees_paid: '0.7',
+    last_fill_at: MARKET_TIME,
+    ...overrides,
+  };
+}
+
+export function accountJson(overrides: Json = {}): Json {
+  return {
+    trading_mode: 'paper',
+    account_id: ACCOUNT_ID,
+    version: '2',
+    status: 'active',
+    market_stream_id: STREAM_ID,
+    starting_cash: '100000',
+    cash: '99155.03',
+    open_cost_basis: '842.5',
+    gross_realized_pnl: '-1.77',
+    fees_paid: '0.7',
+    last_fill_at: MARKET_TIME,
+    positions: [openPositionJson()],
+    closed_positions: [],
     risk_limits: riskLimitsJson(),
     ...overrides,
   };
@@ -138,13 +167,14 @@ export function accountJson(overrides: Json = {}): Json {
 export function flatAccountJson(overrides: Json = {}): Json {
   return accountJson({
     version: '0',
+    market_stream_id: null,
     cash: '100000',
-    position: '0',
     open_cost_basis: '0',
-    average_entry_price: null,
     gross_realized_pnl: '0',
     fees_paid: '0',
     last_fill_at: null,
+    positions: [],
+    closed_positions: [],
     ...overrides,
   });
 }
@@ -163,31 +193,73 @@ export function marketJson(overrides: Json = {}): Json {
   };
 }
 
+// The recording's final SPY quote, the latest event of the replay.
+export function spyMarketJson(overrides: Json = {}): Json {
+  return marketJson({
+    ingest_sequence: '121302',
+    event_timestamp: '2026-09-25T13:39:59.969499529Z',
+    receive_timestamp: '2026-09-25T13:39:59.969574414Z',
+    bid: { price: '769.7', quantity: '50' },
+    ask: { price: '769.78', quantity: '340' },
+    ...overrides,
+  });
+}
+
+// The documented AAPL position marked at its 335.82 bid.
+export function valuedPositionJson(overrides: Json = {}): Json {
+  return {
+    ...openPositionJson(),
+    mark_price: '335.82',
+    market: marketJson(),
+    market_value: '839.55',
+    unrealized_pnl: '-2.95',
+    ...overrides,
+  };
+}
+
 export function portfolioJson(overrides: Json = {}): Json {
   return {
     trading_mode: 'paper',
     account_id: ACCOUNT_ID,
-    instrument: 'AAPL',
     account_version: '2',
     status: 'active',
+    market_stream_id: STREAM_ID,
     valued_at: MARKET_TIME,
     mark_policy: 'best_bid',
-    mark_price: '335.82',
-    market: marketJson(),
     starting_cash: '100000',
     cash: '99155.03',
-    position: '2.5',
     open_cost_basis: '842.5',
-    average_entry_price: '337',
-    position_market_value: '839.55',
+    market_value: '839.55',
     unrealized_pnl: '-2.95',
     gross_realized_pnl: '-1.77',
     fees_paid: '0.7',
     total_pnl: '-5.42',
     equity: '99994.58',
     return_percent: '-0.00542',
+    positions: [valuedPositionJson()],
+    closed_positions: [],
     ...overrides,
   };
+}
+
+// A flat account's valuation: its cash, with nothing to mark.
+export function flatPortfolioJson(overrides: Json = {}): Json {
+  return portfolioJson({
+    account_version: '0',
+    market_stream_id: null,
+    cash: '100000',
+    open_cost_basis: '0',
+    market_value: '0',
+    unrealized_pnl: '0',
+    gross_realized_pnl: '0',
+    fees_paid: '0',
+    total_pnl: '0',
+    equity: '100000',
+    return_percent: '0',
+    positions: [],
+    closed_positions: [],
+    ...overrides,
+  });
 }
 
 // The documented 10-share market buy that filled 4 against the displayed ask.
@@ -325,9 +397,30 @@ export function fillJson(overrides: Json = {}): Json {
 export function errorJson(
   code: string,
   message: string,
-  { field = null, reason = null }: { field?: string | null; reason?: string | null } = {},
+  {
+    field = null,
+    reason = null,
+    instruments,
+  }: { field?: string | null; reason?: string | null; instruments?: readonly Json[] } = {},
 ): Json {
-  return { error: { code, message, field, reason } };
+  return { error: { code, message, field, reason, ...(instruments === undefined ? {} : { instruments }) } };
+}
+
+// A portfolio that cannot be valued because held positions have no mark.
+export function unmarkableJson(failures: Readonly<Record<string, string>>): Json {
+  const count = Object.keys(failures).length;
+  return errorJson(
+    'market_data_unavailable',
+    count === 1 ? 'an open position cannot be marked' : `${String(count)} open positions cannot be marked`,
+    {
+      reason: 'position_mark_unavailable',
+      instruments: Object.entries(failures).map(([instrument, reason]) => ({
+        instrument,
+        reason,
+        message: `no usable ${instrument} quote`,
+      })),
+    },
+  );
 }
 
 export const PERSISTENCE_UNAVAILABLE_MESSAGE =

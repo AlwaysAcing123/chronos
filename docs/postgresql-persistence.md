@@ -3,10 +3,12 @@
 ## Scope
 
 This component makes the in-memory paper-order processor durable. It stores a
-validated recovery snapshot and an append-only order/event journal in one
-PostgreSQL transaction. A new process can reconstruct the account, risk
-limits, processed client-order IDs, applied fill IDs, active market snapshot,
-and consumed shadow liquidity without relying on the previous process.
+validated recovery snapshot, normalized into an account row and a row per
+instrument, and an append-only order/event journal in one PostgreSQL
+transaction. A new process can reconstruct the account, every position, risk
+limits, processed client-order IDs, applied fill IDs, each instrument's
+active market snapshot, and consumed shadow liquidity without relying on the
+previous process.
 
 The adapter is optional. The accounting, market-data, replay, risk, and
 execution libraries still build without PostgreSQL or Docker.
@@ -15,16 +17,25 @@ execution libraries still build without PostgreSQL or Docker.
 
 For one submitted paper order, a successful database transaction contains:
 
-1. An optimistic account-version update.
-2. The complete original order intent and market observation.
-3. Its structured risk, execution, or processing outcome.
-4. Any simulated fill and the account state afterward.
-5. Ordered immutable audit events.
-6. The latest validated recovery snapshot.
+1. An optimistic account-version update of the account row (cash, health,
+   and stream binding).
+2. Only the position and execution-state rows the order changed: at most the
+   order instrument's ledger and execution state. Rows for other instruments
+   are not rewritten.
+3. The complete original order intent and market observation.
+4. Its structured risk, execution, or processing outcome.
+5. Any simulated fill, the cash, and the order instrument's ledger afterward.
+6. Ordered immutable audit events.
+
+The session passes the state it loaded at the expected version and the state
+after the order; the repository writes the difference. Because the version
+matched, the stored rows equal the loaded state, so the difference is exact.
+A ledger or execution state is created or changed, never removed.
 
 PostgreSQL commits all of these changes or none of them. A uniqueness failure,
-version conflict, connection error, or other database failure rolls back the
-transaction. `PersistentPaperOrderSession` also restores its in-memory state
+version conflict, connection error, integrity failure at commit, or other
+database failure rolls back the transaction, including position and
+execution rows already written in it. `PersistentPaperOrderSession` also restores its in-memory state
 to the pre-submission snapshot when persistence does not commit.
 
 ## Idempotency and concurrency
@@ -39,29 +50,53 @@ in-memory risk engine, which does not reserve IDs for rejections.
 Every account row has a monotonically increasing version. A session may
 commit only when its expected version matches the database. If two sessions
 load version 4, the first successful commit creates version 5 and the second
-receives a structured version conflict without overwriting the winner.
+receives a structured version conflict without overwriting the winner. Cash
+is shared by every instrument, so orders for different instruments on one
+account serialize on the same version: a retry re-runs risk against the cash
+the winner left, and cash cannot be spent twice.
 
 ## Recovery snapshot
 
-The authoritative snapshot stores:
+The authoritative snapshot is three tables:
 
-- Starting and current cash
-- Position and open cost basis
-- Realized PnL, paid fees, and latest fill timestamp
-- All configured pre-trade risk limits
-- Processor health state
-- Active top-of-book observation and its full lineage
-- Consumed bid and ask shadow liquidity
-- Account version
+- `paper_accounts`, one row per account: starting and current cash, all
+  configured pre-trade risk limits, processor health, the version, and
+  `market_stream_id`, the stream the account executes on (null before its
+  first execution).
+- `paper_positions`, one row per `(account_id, instrument)` the account has
+  filled: quantity, open cost basis, gross realized PnL, fees paid, and the
+  latest fill timestamp. A closed position keeps its row with zero quantity
+  and zero cost basis.
+- `paper_execution_states`, one row per `(account_id, instrument)` the
+  account has executed against: the active top-of-book observation with its
+  full lineage (`market_*` columns, the same shape as the journal's) and the
+  consumed bid and ask shadow liquidity.
+
+The database enforces the invariants that span them:
+
+- A position references its instrument's execution state, because every fill
+  executed against one.
+- Every execution state references `(account_id, market_stream_id)` on the
+  account, so an account's instruments cannot use different streams.
+- Deferred constraint triggers on accounts, positions, and execution states
+  check, at commit, that
+  `cash + Σ open cost basis = starting cash + Σ gross realized PnL − Σ fees`
+  and that an account is bound to a stream exactly when it has an execution
+  state. They run after every row an order writes, so a partial write never
+  commits.
+- Per-row checks keep quantities, cost, and fees non-negative, zero quantity
+  exactly when cost basis is zero, and consumed liquidity within the
+  displayed book.
 
 Applied fill IDs and processed client order IDs are reconstructed from the
 append-only order journal. All recovery queries use one repeatable-read,
 read-only database snapshot, so a concurrent commit cannot mix versions.
-Recovery passes through the same C++ validation
-boundaries used by direct state restoration. Negative balances, inconsistent
-cost basis, invalid market observations, duplicate IDs, mismatched account or
-instrument identity, and consumed liquidity beyond the visible book fail
-closed instead of creating a partially valid processor.
+Recovery passes through the same C++ validation boundaries used by direct
+state restoration. Negative balances, inconsistent cost basis, totals out of
+range, invalid market observations, duplicate IDs, mismatched account
+identity, execution states on different streams, a position without an
+execution state, and consumed liquidity beyond the visible book fail closed
+instead of creating a partially valid processor.
 
 ## Connection loss and text parameters
 
@@ -87,7 +122,14 @@ disagree with the in-memory idempotency state.
 
 `paper_order_records` preserves the routed account, requested account,
 instrument, exact order fields, exact market observation, structured outcome,
-optional fill, and account state after processing. Malformed input is retained
+optional fill, and a snapshot of state after processing: the account's cash
+(`account_cash_after_raw`) and one instrument's ledger
+(`position_after_instrument` and the `position_*_after_*` columns). For
+records written since migration 003 the instrument is the order's; for older
+records it is the account's single instrument, which differs from the
+order's only for the retired `instrument_mismatch` rejection. An instrument
+the account never filled has a zero ledger and a null fill time. These
+columns are audit data: recovery and every read use the snapshot tables. Malformed input is retained
 faithfully so a rejected order with an unknown enum value, zero quantity, or
 negative timestamp remains auditable.
 
@@ -121,7 +163,15 @@ and accounting are never re-run to reconstruct a result.
   most `limit + 1` rows; the extra row only signals an older page. There is no
   `OFFSET`. `paper_order_account_record_idx` serves order pages and lookups
   scanned by account, and the partial `paper_order_account_booked_fill_idx`
-  serves fill pages.
+  serves fill pages. With an instrument filter,
+  `paper_order_account_instrument_record_idx` and the partial
+  `paper_order_account_instrument_booked_fill_idx` on
+  `(account_id, instrument, order_record_id)` serve the same pages. Without
+  them a filtered page reads every journal row of the account: on a synthetic
+  journal of 249,000 rows whose largest account holds 50,000 AAPL orders and
+  40 SPY orders, a 40-row SPY page read 1,983 buffers (1,884 for fills) and
+  discarded 49,960 rows; with them, 5 buffers each, scanning the index
+  backward with no filter step.
 - **Keyset order.** Within one account, `order_record_id` increases in commit
   order: the identity sequence allocates in call order (cache 1), and a
   submission inserts its record only after locking the account row with the
@@ -144,11 +194,12 @@ and accounting are never re-run to reconstruct a result.
 
 ## Portfolio valuation
 
-The portfolio endpoint adds no table, column, or migration. It loads the
-account through the same recovery path, in one repeatable-read, read-only
-snapshot, and values it against the current market in memory. The persisted
-active top-of-book observation is what binds the valuation to the account's
-market timeline, and the persisted latest fill timestamp bounds market time.
+The portfolio endpoint adds no table or column. It loads the account through
+the same recovery path, in one repeatable-read, read-only snapshot, and
+values it against the current market in memory. The persisted stream binding
+and each instrument's active top-of-book observation are what bind the
+valuation to the account's market timeline, and the persisted latest fill
+timestamps bound market time.
 Nothing about a valuation is written; it is recomputed on every read.
 
 ## Migrations
@@ -160,24 +211,68 @@ changes add a new file.
 
 - `001_paper_trading.sql`: account snapshots and the order and event journal.
 - `002_paper_order_read_indexes.sql`: keyset indexes for the history API.
+- `003_multi_instrument_accounts.sql`: multi-instrument accounts. Moves each
+  account's position into `paper_positions` and its execution state into
+  `paper_execution_states`, adds the stream binding and commit-time
+  integrity triggers, records the instrument of the journal's "after"
+  snapshot, adds the filtered-history indexes, and drops the moved columns
+  so no value has two writable homes.
 
 PostgreSQL's image runs the mounted files only when it initializes an empty
-volume. For an existing local volume, apply a new file once:
+volume, so a fresh volume gets 001, 002, and 003 in order. An existing local
+volume needs each newer file applied once, in order.
 
-```sh
-docker compose exec -T postgres psql -U chronos -d chronos \
-  -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
-```
-
-Sending the file on standard input avoids depending on the container's
+Sending a file on standard input avoids depending on the container's
 `/docker-entrypoint-initdb.d` bind mount, which Docker Desktop on macOS can
 present as empty when it lacks permission to read the repository's folder.
-Integration tests apply every migration file in order before running.
+Integration tests apply every migration file in order before running, so
+running them against a database upgrades it.
 
-`002` uses a plain `CREATE INDEX`, which blocks writes while it builds. That
-is fine locally and in CI; a large production table would need
+`002` and `003` use plain `CREATE INDEX`, which blocks writes while it builds.
+That is fine locally and in CI; a large production table would need
 `CREATE INDEX CONCURRENTLY` outside a transaction, under a deliberate
 migration policy that Chronos does not yet define.
+
+### Upgrading an existing volume
+
+Migration 003 rewrites the account tables, so stop the paper-trading server
+and take a backup first. The backup is a single file outside the volume:
+
+```sh
+docker compose exec -T postgres pg_dump -U chronos -d chronos -Fc \
+  > chronos-before-003.dump
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/003_multi_instrument_accounts.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -c 'SELECT version, description FROM chronos_schema_migrations ORDER BY version'
+```
+
+What 003 guarantees:
+
+- **All or nothing.** The file is one transaction. It takes account, order,
+  and event table locks in the same order as an order writer, so concurrent
+  appliers wait rather than deadlock, and a second applier finds version 3
+  recorded and does nothing.
+- **Validated before anything changes.** An account without a fill must hold
+  no position state, and an account with fills must have an active market; a
+  violation raises an exception naming how many accounts are affected, and
+  the transaction rolls back with the old schema and data intact. After the
+  copy, every account's identity is re-checked with the new tables.
+- **No data loss.** Account IDs, cash, risk limits, health, and versions are
+  unchanged. Each account with a fill gets exactly one position row, and each
+  account with an active market one execution-state row, with the same raw
+  values. Journal rows and events are not changed apart from the recorded
+  instrument and the renamed "after" columns. The integration tests migrate
+  old-format data and compare every value; this repository's development
+  database was checked the same way with fingerprints of every account,
+  position, execution state, order, and event before and after.
+- **Idempotent.** Once version 3 is recorded the file does nothing.
+
+To restore the backup instead, recreate the volume and load the dump with
+`pg_restore -U chronos -d chronos --clean --if-exists`. There are no down
+migrations.
 
 ## Local development
 

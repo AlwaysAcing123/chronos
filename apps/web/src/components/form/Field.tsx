@@ -44,6 +44,57 @@ export function TextField({
   );
 }
 
+// A labelled native select whose hint is announced with it.
+export function SelectField<Value extends string>({
+  label,
+  hint,
+  value,
+  options,
+  onChange,
+  disabled = false,
+}: {
+  readonly label: string;
+  readonly hint?: ReactNode;
+  readonly value: Value;
+  readonly options: readonly { readonly value: Value; readonly label: string }[];
+  readonly onChange: (value: Value) => void;
+  readonly disabled?: boolean;
+}) {
+  const id = useId();
+  const hintId = `${id}-hint`;
+  return (
+    <div className={styles.field}>
+      <label className={styles.label} htmlFor={id}>
+        {label}
+      </label>
+      <select
+        id={id}
+        className={styles.input}
+        value={value}
+        onChange={(event) => {
+          const chosen = options.find((option) => option.value === event.target.value);
+          if (chosen !== undefined) {
+            onChange(chosen.value);
+          }
+        }}
+        disabled={disabled}
+        aria-describedby={hint === undefined ? undefined : hintId}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {hint !== undefined && (
+        <p id={hintId} className={styles.hint}>
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // A segmented single choice built from native radio buttons, so arrow keys
 // and screen readers behave as for any radio group.
 export function Choice<Value extends string>({

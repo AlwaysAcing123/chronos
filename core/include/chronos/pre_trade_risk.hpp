@@ -39,6 +39,8 @@ enum class PreTradeRiskErrorCode {
     MissingSourceId,
     UnknownOrderSource,
     AccountMismatch,
+    // Retained so journaled history stays readable; accounts are no longer
+    // bound to one instrument, so it is not produced.
     InstrumentMismatch,
     UnknownSide,
     UnknownOrderType,
@@ -119,6 +121,11 @@ using PreTradeRiskDecision = std::variant<
     PreTradeRiskRejection
 >;
 
+// Risk for one order against one instrument. Cash is shared by every
+// instrument in the account; position limits and the position a sale may
+// reduce are the order's instrument's alone. Submission time must not
+// precede the account's latest fill of any instrument, because submission
+// time is the market clock and the account's timeline must not move back.
 class PreTradeRiskEngine final {
 public:
     explicit PreTradeRiskEngine(PreTradeRiskLimits limits);

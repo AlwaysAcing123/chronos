@@ -4,7 +4,9 @@
 #include "postgres_test_support.hpp"
 #include "test_support.hpp"
 
+#include <algorithm>
 #include <cstdlib>
+#include <initializer_list>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -79,6 +81,16 @@ using chronos::test::wait_until_blocked_on_lock;
 using chronos::test::with_application_name;
 
 std::string connection_string;
+const InstrumentId kAapl("AAPL");
+const InstrumentId kSpy("SPY");
+
+chronos::paper_trading::PaperOrderRequest for_instrument(
+    chronos::paper_trading::PaperOrderRequest request,
+    std::string instrument
+) {
+    request.instrument = std::move(instrument);
+    return request;
+}
 
 std::unique_ptr<PaperTradingService> make_service(
     const MarketState& market,
@@ -123,7 +135,6 @@ std::string create_account(
     std::string account_id = unique_test_id(prefix);
     require_account(service.create_account(CreatePaperAccountRequest{
         .account_id = account_id,
-        .instrument = "AAPL",
         .starting_cash = Money::parse(starting_cash),
     }));
     return account_id;
@@ -151,17 +162,16 @@ void test_account_is_created_with_server_risk_limits_and_retrieved() {
     const PaperAccountView created = require_account(service->create_account(
         CreatePaperAccountRequest{
             .account_id = account_id,
-            .instrument = "AAPL",
             .starting_cash = Money::parse("1000.5"),
         }
     ));
     REQUIRE(created.account_id == account_id);
-    REQUIRE(created.instrument == InstrumentId("AAPL"));
     REQUIRE(created.version == 0);
     REQUIRE(created.is_healthy);
     REQUIRE(created.state.starting_cash == Money::parse("1000.5"));
     REQUIRE(created.state.cash == Money::parse("1000.5"));
-    REQUIRE(created.state.position == Quantity{});
+    REQUIRE(created.state.positions.empty());
+    REQUIRE(!created.market_stream.has_value());
     REQUIRE(same_limits(created.risk_limits, paper_risk_limits()));
 
     const PaperAccountView loaded = require_account(
@@ -180,7 +190,6 @@ void test_duplicate_account_leaves_the_original_unchanged() {
     const PaperTradingError duplicate = require_error(
         service->create_account(CreatePaperAccountRequest{
             .account_id = account_id,
-            .instrument = "SPY",
             .starting_cash = Money::parse("5000"),
         }),
         PaperTradingErrorCode::AccountAlreadyExists
@@ -190,7 +199,7 @@ void test_duplicate_account_leaves_the_original_unchanged() {
     const PaperAccountView original = require_account(
         service->get_account(account_id)
     );
-    REQUIRE(original.instrument == InstrumentId("AAPL"));
+    REQUIRE(original.state.starting_cash == Money::parse("1000"));
     REQUIRE(original.state.cash == Money::parse("1000"));
 }
 
@@ -198,31 +207,20 @@ void test_account_requests_are_validated_before_persistence() {
     const auto market = market_state();
     const auto service = make_service(*market);
 
-    const auto create = [&](std::string account_id,
-                            std::string instrument,
-                            std::string_view cash) {
+    const auto create = [&](std::string account_id, std::string_view cash) {
         return service->create_account(CreatePaperAccountRequest{
             .account_id = std::move(account_id),
-            .instrument = std::move(instrument),
             .starting_cash = Money::parse(cash),
         });
     };
     REQUIRE(require_error(
-        create(unique_test_id("unsupported"), "MSFT", "1000"),
-        PaperTradingErrorCode::UnsupportedInstrument
-    ).field == "instrument");
-    REQUIRE(require_error(
-        create(unique_test_id("zero-cash"), "AAPL", "0"),
+        create(unique_test_id("zero-cash"), "0"),
         PaperTradingErrorCode::InvalidStartingCash
     ).field == "starting_cash");
     REQUIRE(require_error(
-        create(unique_test_id("negative-cash"), "AAPL", "-1"),
+        create(unique_test_id("negative-cash"), "-1"),
         PaperTradingErrorCode::InvalidStartingCash
     ).field == "starting_cash");
-    REQUIRE(require_error(
-        create(unique_test_id("bad-instrument"), "AA PL", "1000"),
-        PaperTradingErrorCode::InvalidIdentifier
-    ).field == "instrument");
 
     for (const std::string& invalid : {
              std::string(),
@@ -235,7 +233,7 @@ void test_account_requests_are_validated_before_persistence() {
              std::string(65, 'a'),
          }) {
         REQUIRE(require_error(
-            create(invalid, "AAPL", "1000"),
+            create(invalid, "1000"),
             PaperTradingErrorCode::InvalidIdentifier
         ).field == "account_id");
         REQUIRE(require_error(
@@ -246,7 +244,7 @@ void test_account_requests_are_validated_before_persistence() {
 
     std::string longest = unique_test_id("max-length");
     longest.resize(chronos::paper_trading::kMaximumIdentifierLength, 'x');
-    require_account(create(longest, "AAPL", "1000"));
+    require_account(create(longest, "1000"));
     require_error(
         service->get_account(unique_test_id("missing")),
         PaperTradingErrorCode::AccountNotFound
@@ -276,7 +274,7 @@ void test_marketable_order_fills_at_the_server_quote_and_market_time() {
     REQUIRE(receipt.accounting->notional == Money::parse("202"));
     REQUIRE(recorded.account.state == receipt.account_after);
     REQUIRE(recorded.account.state.cash == Money::parse("797.99"));
-    REQUIRE(recorded.account.state.position == Quantity::parse("2"));
+    REQUIRE(recorded.account.state.quantity(kAapl) == Quantity::parse("2"));
     REQUIRE(recorded.account.version == 1);
 }
 
@@ -299,7 +297,7 @@ void test_order_beyond_displayed_liquidity_partially_fills() {
         receipt.execution.cancellation_reason ==
         SimulatedCancellationReason::DisplayedLiquidityExhausted
     );
-    REQUIRE(receipt.account_after.position == Quantity::parse("5"));
+    REQUIRE(receipt.account_after.quantity(kAapl) == Quantity::parse("5"));
 }
 
 void test_non_marketable_limit_is_cancelled_and_books_nothing() {
@@ -458,7 +456,7 @@ void test_duplicate_client_order_id_is_not_recorded_twice() {
     const PaperAccountView account = require_account(
         service->get_account(account_id)
     );
-    REQUIRE(account.state.position == Quantity::parse("1"));
+    REQUIRE(account.state.quantity(kAapl) == Quantity::parse("1"));
     REQUIRE(account.version == 1);
     REQUIRE(recorded_orders(account_id) == 1);
 }
@@ -533,7 +531,7 @@ void test_durable_state_and_shadow_liquidity_survive_a_new_service() {
         restarted->get_account(account_id)
     );
     REQUIRE(recovered.version == 1);
-    REQUIRE(recovered.state.position == Quantity::parse("3"));
+    REQUIRE(recovered.state.quantity(kAapl) == Quantity::parse("3"));
     REQUIRE(recovered.state.cash == Money::parse("696.99"));
 
     const PaperOrderReceipt after_restart = require_receipt(require_recorded(
@@ -699,9 +697,14 @@ std::vector<std::string> client_order_ids(const PaperFillHistoryPage& page) {
 
 HistoryPageRequest page(
     std::optional<std::size_t> limit,
-    std::optional<std::string> cursor = std::nullopt
+    std::optional<std::string> cursor = std::nullopt,
+    std::optional<std::string> instrument = std::nullopt
 ) {
-    return HistoryPageRequest{.limit = limit, .cursor = std::move(cursor)};
+    return HistoryPageRequest{
+        .limit = limit,
+        .cursor = std::move(cursor),
+        .instrument = std::move(instrument),
+    };
 }
 
 void test_history_distinguishes_missing_accounts_from_empty_history() {
@@ -831,6 +834,7 @@ void test_page_limits_and_cursors_are_validated_by_the_service() {
     const std::string fills_cursor = encode_history_cursor(
         HistoryCursorKind::Fills,
         account_id,
+        std::nullopt,
         5
     );
     REQUIRE(require_error(
@@ -842,7 +846,7 @@ void test_page_limits_and_cursors_are_validated_by_the_service() {
             account_id,
             page(
                 std::nullopt,
-                encode_history_cursor(HistoryCursorKind::Orders, other_account, 5)
+                encode_history_cursor(HistoryCursorKind::Orders, other_account, std::nullopt, 5)
             )
         ),
         PaperTradingErrorCode::InvalidCursor
@@ -850,8 +854,8 @@ void test_page_limits_and_cursors_are_validated_by_the_service() {
     for (const std::string& cursor : {
              std::string(),
              std::string("not a cursor"),
-             encode_history_cursor(HistoryCursorKind::Fills, account_id, 0),
-             encode_history_cursor(HistoryCursorKind::Fills, account_id, -1),
+             encode_history_cursor(HistoryCursorKind::Fills, account_id, std::nullopt, 0),
+             encode_history_cursor(HistoryCursorKind::Fills, account_id, std::nullopt, -1),
          }) {
         require_error(
             service->list_fills(account_id, page(std::nullopt, cursor)),
@@ -1063,18 +1067,20 @@ void require_expected_portfolio(const PaperPortfolioView& portfolio) {
     const auto& snapshot = portfolio.valuation.snapshot;
     REQUIRE(portfolio.account.version == 2);
     REQUIRE(snapshot.state == portfolio.account.state);
-    REQUIRE(snapshot.mark_price == Price::parse("99"));
+    REQUIRE(snapshot.open_positions.size() == 1);
+    REQUIRE(snapshot.open_positions[0].instrument == kAapl);
+    REQUIRE(snapshot.open_positions[0].mark_price == Price::parse("99"));
     REQUIRE(snapshot.state.cash == Money::parse("847.48"));
-    REQUIRE(snapshot.state.position == Quantity::parse("1.5"));
-    REQUIRE(snapshot.state.open_cost_basis == Money::parse("151.5"));
-    REQUIRE(snapshot.state.gross_realized_pnl == Money::parse("-1"));
-    REQUIRE(snapshot.state.fees_paid == Money::parse("0.02"));
+    REQUIRE(snapshot.state.quantity(kAapl) == Quantity::parse("1.5"));
+    REQUIRE(snapshot.open_cost_basis == Money::parse("151.5"));
+    REQUIRE(snapshot.gross_realized_pnl == Money::parse("-1"));
+    REQUIRE(snapshot.fees_paid == Money::parse("0.02"));
     REQUIRE(snapshot.market_value == Money::parse("148.5"));
     REQUIRE(snapshot.gross_unrealized_pnl == Money::parse("-3"));
     REQUIRE(snapshot.net_total_pnl == Money::parse("-4.02"));
     REQUIRE(snapshot.equity == Money::parse("995.98"));
     REQUIRE(portfolio.valuation.return_percent == Percentage::parse("-0.402"));
-    REQUIRE(portfolio.valuation.market == quote(0, 0));
+    REQUIRE(portfolio.valuation.marks.at(kAapl) == quote(0, 0));
     REQUIRE(
         portfolio.valuation.valued_at ==
         Timestamp::from_nanoseconds(kMarketOpenNanoseconds)
@@ -1105,31 +1111,62 @@ void test_portfolio_requires_a_valid_existing_account() {
     ).field == "account_id");
 }
 
-void test_portfolio_requires_a_current_quote_for_the_instrument() {
+// Every held instrument that cannot be marked, in instrument order, with
+// the reason for each.
+using MarkReason = std::variant<MarketStateUnavailableCode, PortfolioValuationErrorCode>;
+
+void require_unmarkable(
+    PaperPortfolioResult result,
+    std::initializer_list<std::pair<std::string_view, MarkReason>> expected
+) {
+    const PaperTradingError failure = require_market_unavailable(
+        std::move(result),
+        PortfolioValuationErrorCode::PositionMarkUnavailable
+    );
+    REQUIRE(failure.instruments.size() == expected.size());
+    std::size_t index = 0;
+    for (const auto& [instrument, reason] : expected) {
+        REQUIRE(failure.instruments[index].instrument ==
+            InstrumentId(std::string(instrument)));
+        REQUIRE(failure.instruments[index].reason == reason);
+        ++index;
+    }
+}
+
+void test_a_flat_account_is_valued_without_any_quote() {
     const auto market = market_state();
     const auto service = make_service(*market);
-    const std::string account_id = create_account(*service, "portfolio-quote");
+    const std::string account_id = create_account(*service, "portfolio-flat");
 
-    REQUIRE(require_error(
-        service->get_portfolio(account_id),
-        PaperTradingErrorCode::MarketDataUnavailable
-    ).market_state == MarketStateUnavailableCode::NoTopOfBook);
-    // Another instrument's book never marks the account.
+    // No event has arrived, so there is no market time to report.
+    const auto before_market = require_portfolio(service->get_portfolio(account_id));
+    REQUIRE(before_market.valuation.snapshot.equity == Money::parse("1000"));
+    REQUIRE(before_market.valuation.snapshot.open_positions.empty());
+    REQUIRE(!before_market.valuation.valued_at.has_value());
+
     apply(*market, quote(0, 0, "SPY"));
-    REQUIRE(require_error(
-        service->get_portfolio(account_id),
-        PaperTradingErrorCode::MarketDataUnavailable
-    ).market_state == MarketStateUnavailableCode::NoTopOfBook);
+    const auto with_market = require_portfolio(service->get_portfolio(account_id));
+    REQUIRE(with_market.valuation.valued_at ==
+        Timestamp::from_nanoseconds(kMarketOpenNanoseconds));
+    REQUIRE(with_market.valuation.return_percent == Percentage{});
+}
 
-    apply(*market, quote(1, 10));
-    apply(*market, quote(
-        2,
-        kMaximumQuoteAgeNanoseconds + 11,
-        "SPY"
+void test_portfolio_requires_a_current_quote_for_each_held_instrument() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "portfolio-quote");
+    require_recorded(service->submit_order(
+        order_request(account_id, "hold-aapl", Side::Buy, "1")
     ));
-    require_market_unavailable(
+    require_portfolio(service->get_portfolio(account_id));
+
+    // Another instrument's newer quote ages the AAPL mark, and never marks
+    // it.
+    apply(*market, quote(1, kMaximumQuoteAgeNanoseconds + 1, "SPY"));
+    require_unmarkable(
         service->get_portfolio(account_id),
-        PortfolioValuationErrorCode::StaleMarketState
+        {{"AAPL", PortfolioValuationErrorCode::StaleMarketState}}
     );
 
     auto gap = chronos::validate_market_event(quote(
@@ -1139,33 +1176,36 @@ void test_portfolio_requires_a_current_quote_for_the_instrument() {
     REQUIRE(std::holds_alternative<MarketStateUpdateError>(market->apply(
         std::get<chronos::ValidatedMarketEvent>(gap)
     )));
-    REQUIRE(require_error(
+    require_unmarkable(
         service->get_portfolio(account_id),
-        PaperTradingErrorCode::MarketDataUnavailable
-    ).market_state == MarketStateUnavailableCode::StreamInterrupted);
+        {{"AAPL", MarketStateUnavailableCode::StreamInterrupted}}
+    );
 }
 
 void test_portfolio_rejects_a_quote_without_a_usable_bid() {
-    const auto service_market = market_state();
-    TopOfBookEvent ask_only = quote(0, 0);
-    ask_only.bid = std::nullopt;
-    apply(*service_market, ask_only);
-    const auto service = make_service(*service_market);
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
     const std::string account_id = create_account(*service, "portfolio-no-bid");
-    require_market_unavailable(
+    require_recorded(service->submit_order(
+        order_request(account_id, "hold", Side::Buy, "1")
+    ));
+
+    TopOfBookEvent ask_only = quote(1, 1);
+    ask_only.bid = std::nullopt;
+    apply(*market, ask_only);
+    require_unmarkable(
         service->get_portfolio(account_id),
-        PortfolioValuationErrorCode::MissingBestBid
+        {{"AAPL", PortfolioValuationErrorCode::MissingBestBid}}
     );
 
-    const auto suspect_market = market_state();
-    TopOfBookEvent suspect = quote(0, 0);
+    TopOfBookEvent suspect = quote(2, 2);
     suspect.header.quality =
         suspect.header.quality.with(MarketDataQualityFlag::PotentiallyInvalidBook);
-    apply(*suspect_market, suspect);
-    const auto suspect_service = make_service(*suspect_market);
-    require_market_unavailable(
-        suspect_service->get_portfolio(account_id),
-        PortfolioValuationErrorCode::SuspectMarketState
+    apply(*market, suspect);
+    require_unmarkable(
+        service->get_portfolio(account_id),
+        {{"AAPL", PortfolioValuationErrorCode::SuspectMarketState}}
     );
 }
 
@@ -1232,7 +1272,9 @@ void test_portfolio_valuation_is_read_only() {
     const auto journal_before = inspector.journal_summary(account_id);
     const auto consumed_ask = [&] {
         return inspector.load_account(account_id)
-            ->processor.recovery_state().execution.consumed_ask_quantity;
+            ->processor.recovery_state()
+            .execution.instruments.at(kAapl)
+            .consumed_ask_quantity;
     };
     REQUIRE(consumed_ask() == Quantity::parse("3"));
     for (int valuation = 0; valuation < 3; ++valuation) {
@@ -1284,7 +1326,6 @@ void test_portfolio_without_starting_cash_is_a_valuation_failure() {
             PersistentPaperOrderSession::create(
                 direct,
                 account_id,
-                InstrumentId("AAPL"),
                 Money{},
                 paper_risk_limits()
             )
@@ -1295,6 +1336,323 @@ void test_portfolio_without_starting_cash_is_a_valuation_failure() {
         PaperTradingErrorCode::ValuationFailed
     );
     REQUIRE(failure.valuation == PortfolioValuationErrorCode::NonpositiveStartingCash);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instrument accounts
+
+void test_an_account_trades_several_instruments_with_shared_cash() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    apply(*market, quote(1, 1, "SPY", QuoteLevels{
+        .bid_price = "499",
+        .ask_price = "501",
+    }));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "multi", "5000");
+
+    require_recorded(service->submit_order(
+        order_request(account_id, "aapl", Side::Buy, "2")
+    ));
+    const RecordedPaperOrder spy = require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy", Side::Buy, "3"), "SPY")
+    ));
+    // SPY executed against its own quote: 3 x 501 + 0.01.
+    REQUIRE(spy.market.header.instrument == kSpy);
+    REQUIRE(require_receipt(spy).execution.fill->price == Price::parse("501"));
+    // 5000 - 202.01 - 1503.01 = 3294.98, shared by both positions.
+    REQUIRE(spy.account.state.cash == Money::parse("3294.98"));
+    REQUIRE(spy.account.state.quantity(kAapl) == Quantity::parse("2"));
+    REQUIRE(spy.account.state.quantity(kSpy) == Quantity::parse("3"));
+    REQUIRE(spy.account.market_stream ==
+        MarketDataStreamId(std::string(chronos::test::kTestStream)));
+
+    const PaperPortfolioView portfolio = require_portfolio(
+        service->get_portfolio(account_id)
+    );
+    const auto& snapshot = portfolio.valuation.snapshot;
+    REQUIRE(snapshot.open_positions.size() == 2);
+    REQUIRE(snapshot.open_positions[0].instrument == kAapl);
+    REQUIRE(snapshot.open_positions[0].market_value == Money::parse("198"));
+    REQUIRE(snapshot.open_positions[1].instrument == kSpy);
+    REQUIRE(snapshot.open_positions[1].market_value == Money::parse("1497"));
+    REQUIRE(snapshot.market_value == Money::parse("1695"));
+    REQUIRE(snapshot.gross_unrealized_pnl == Money::parse("-10"));
+    REQUIRE(snapshot.net_total_pnl == Money::parse("-10.02"));
+    REQUIRE(snapshot.equity == Money::parse("4989.98"));
+    REQUIRE(portfolio.valuation.marks.at(kSpy) == quote(1, 1, "SPY", QuoteLevels{
+        .bid_price = "499",
+        .ask_price = "501",
+    }));
+}
+
+void test_an_order_executes_only_against_its_own_instrument() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "own-quote");
+
+    // An AAPL quote cannot fill SPY: nothing is recorded.
+    const PaperTradingError unavailable = require_error(
+        service->submit_order(
+            for_instrument(order_request(account_id, "spy", Side::Buy, "1"), "SPY")
+        ),
+        PaperTradingErrorCode::MarketDataUnavailable
+    );
+    REQUIRE(unavailable.market_state == MarketStateUnavailableCode::NoTopOfBook);
+    REQUIRE(recorded_orders(account_id) == 0);
+
+    apply(*market, quote(1, 1, "SPY", QuoteLevels{.ask_price = "450"}));
+    const RecordedPaperOrder filled = require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy", Side::Buy, "1"), "SPY")
+    ));
+    REQUIRE(filled.market == quote(1, 1, "SPY", QuoteLevels{.ask_price = "450"}));
+    REQUIRE(require_receipt(filled).execution.fill->price == Price::parse("450"));
+    REQUIRE(filled.account.state.position(kAapl) == nullptr);
+}
+
+void test_an_unsupported_instrument_is_rejected_before_recording() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    apply(*market, quote(1, 1, "MSFT"));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "unsupported");
+
+    // MSFT has a quote, but this server does not trade it.
+    REQUIRE(require_error(
+        service->submit_order(
+            for_instrument(order_request(account_id, "msft", Side::Buy, "1"), "MSFT")
+        ),
+        PaperTradingErrorCode::UnsupportedInstrument
+    ).field == "instrument");
+    REQUIRE(require_error(
+        service->submit_order(
+            for_instrument(order_request(account_id, "bad", Side::Buy, "1"), "AA PL")
+        ),
+        PaperTradingErrorCode::InvalidIdentifier
+    ).field == "instrument");
+    REQUIRE(recorded_orders(account_id) == 0);
+    // The client order ID was not consumed.
+    require_recorded(service->submit_order(
+        order_request(account_id, "msft", Side::Buy, "1")
+    ));
+}
+
+void test_displayed_liquidity_is_consumed_per_instrument() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    apply(*market, quote(1, 1, "SPY"));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "per-instrument", "5000");
+
+    REQUIRE(require_receipt(require_recorded(service->submit_order(
+        order_request(account_id, "aapl-all", Side::Buy, "5")
+    ))).execution.status == SimulatedExecutionStatus::Filled);
+    // AAPL consumption did not reduce SPY's displayed size.
+    const PaperOrderReceipt spy = require_receipt(require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy-all", Side::Buy, "5"), "SPY")
+    )));
+    REQUIRE(spy.execution.status == SimulatedExecutionStatus::Filled);
+    REQUIRE(spy.execution.fill->quantity == Quantity::parse("5"));
+    const PaperOrderReceipt exhausted = require_receipt(require_recorded(
+        service->submit_order(order_request(account_id, "aapl-more", Side::Buy, "1"))
+    ));
+    REQUIRE(exhausted.execution.status == SimulatedExecutionStatus::Cancelled);
+}
+
+void test_a_client_order_id_repeated_for_another_symbol_is_a_duplicate() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    apply(*market, quote(1, 1, "SPY"));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "repeat-id");
+
+    require_recorded(service->submit_order(
+        order_request(account_id, "once", Side::Buy, "1")
+    ));
+    REQUIRE(require_error(
+        service->submit_order(
+            for_instrument(order_request(account_id, "once", Side::Buy, "1"), "SPY")
+        ),
+        PaperTradingErrorCode::DuplicateClientOrderId
+    ).field == "client_order_id");
+    // The original reconciles the retry.
+    const PaperOrderRecord original = require_order_record(
+        service->get_order(account_id, "once")
+    );
+    REQUIRE(original.intent.instrument == kAapl);
+    REQUIRE(recorded_orders(account_id) == 1);
+    REQUIRE(require_account(service->get_account(account_id))
+        .state.position(kSpy) == nullptr);
+}
+
+// Each order costs 4 x 101 + 0.01 = 404.01, so the shared 1000 of cash buys
+// exactly two whichever services and instruments win the races.
+void test_concurrent_services_cannot_double_spend_shared_cash() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0, "AAPL", QuoteLevels{.ask_quantity = "10"}));
+    apply(*market, quote(1, 1, "SPY", QuoteLevels{.ask_quantity = "10"}));
+    const auto first_service = make_service(*market);
+    const auto second_service = make_service(*market);
+    const std::string account_id = create_account(*first_service, "double-spend");
+
+    const std::vector<std::pair<std::string, std::string>> orders{
+        {"aapl-1", "AAPL"},
+        {"spy-1", "SPY"},
+        {"aapl-2", "AAPL"},
+        {"spy-2", "SPY"},
+    };
+    std::vector<std::string> outcomes(orders.size());
+    std::vector<std::thread> traders;
+    for (std::size_t index = 0; index < orders.size(); ++index) {
+        traders.emplace_back([&, index] {
+            PaperTradingService& service =
+                index % 2 == 0 ? *first_service : *second_service;
+            try {
+                for (;;) {
+                    auto result = service.submit_order(for_instrument(
+                        order_request(account_id, orders[index].first, Side::Buy, "4"),
+                        orders[index].second
+                    ));
+                    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+                        if (failure->code ==
+                            PaperTradingErrorCode::AccountVersionConflict) {
+                            continue;
+                        }
+                        outcomes[index] = failure->message;
+                        return;
+                    }
+                    const auto& recorded = std::get<RecordedPaperOrder>(result);
+                    outcomes[index] =
+                        std::holds_alternative<PaperOrderReceipt>(recorded.result)
+                        ? "filled"
+                        : std::get<PreTradeRiskRejection>(recorded.result).code ==
+                                PreTradeRiskErrorCode::InsufficientCash
+                            ? "insufficient cash"
+                            : "other rejection";
+                    return;
+                }
+            } catch (const std::exception& error) {
+                outcomes[index] = error.what();
+            }
+        });
+    }
+    for (auto& trader : traders) {
+        trader.join();
+    }
+    REQUIRE(std::count(outcomes.begin(), outcomes.end(), "filled") == 2);
+    REQUIRE(std::count(outcomes.begin(), outcomes.end(), "insufficient cash") == 2);
+    const PaperAccountView account = require_account(
+        first_service->get_account(account_id)
+    );
+    REQUIRE(account.state.cash == Money::parse("191.98"));
+    REQUIRE(account.version == 4);
+}
+
+void test_portfolio_reports_every_position_it_cannot_mark() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0));
+    apply(*market, quote(1, 1, "SPY"));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "unmarkable", "5000");
+    require_recorded(service->submit_order(
+        order_request(account_id, "aapl", Side::Buy, "1")
+    ));
+    require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy", Side::Buy, "1"), "SPY")
+    ));
+
+    // An unheld symbol ages both marks; neither is valued as zero.
+    apply(*market, quote(2, kMaximumQuoteAgeNanoseconds + 2, "MSFT"));
+    require_unmarkable(
+        service->get_portfolio(account_id),
+        {
+            {"AAPL", PortfolioValuationErrorCode::StaleMarketState},
+            {"SPY", PortfolioValuationErrorCode::StaleMarketState},
+        }
+    );
+    apply(*market, quote(3, kMaximumQuoteAgeNanoseconds + 3));
+    require_unmarkable(
+        service->get_portfolio(account_id),
+        {{"SPY", PortfolioValuationErrorCode::StaleMarketState}}
+    );
+
+    // Once SPY is closed, only AAPL needs a mark.
+    const auto sold = require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy-close", Side::Sell, "1"), "SPY")
+    ));
+    REQUIRE(std::holds_alternative<PreTradeRiskRejection>(sold.result));
+    apply(*market, quote(4, kMaximumQuoteAgeNanoseconds + 4, "SPY"));
+    require_recorded(service->submit_order(
+        for_instrument(order_request(account_id, "spy-close-fresh", Side::Sell, "1"), "SPY")
+    ));
+    const PaperPortfolioView valued = require_portfolio(service->get_portfolio(account_id));
+    REQUIRE(valued.valuation.snapshot.open_positions.size() == 1);
+    REQUIRE(valued.valuation.snapshot.open_positions[0].instrument == kAapl);
+    REQUIRE(!valued.account.state.positions.at(kSpy).is_open());
+}
+
+void test_history_can_be_filtered_by_instrument() {
+    const auto market = market_state();
+    apply(*market, quote(0, 0, "AAPL", QuoteLevels{.ask_quantity = "50"}));
+    apply(*market, quote(1, 1, "SPY", QuoteLevels{.ask_quantity = "50"}));
+    const auto service = make_service(*market);
+    const std::string account_id = create_account(*service, "filtered", "5000");
+    for (const auto& [id, instrument] : std::vector<std::pair<std::string, std::string>>{
+             {"spy-0", "SPY"},
+             {"aapl-0", "AAPL"},
+             {"spy-1", "SPY"},
+             {"aapl-1", "AAPL"},
+             {"spy-2", "SPY"},
+         }) {
+        require_recorded(service->submit_order(
+            for_instrument(order_request(account_id, id, Side::Buy, "1"), instrument)
+        ));
+    }
+
+    const auto first = require_order_history(
+        service->list_orders(account_id, page(2, std::nullopt, "SPY"))
+    );
+    REQUIRE((client_order_ids(first) == std::vector<std::string>{"spy-2", "spy-1"}));
+    const auto rest = require_order_history(
+        service->list_orders(account_id, page(2, first.next_cursor, "SPY"))
+    );
+    REQUIRE((client_order_ids(rest) == std::vector<std::string>{"spy-0"}));
+    REQUIRE(!rest.next_cursor.has_value());
+
+    // A filtered cursor pages only the same filter.
+    for (const std::optional<std::string>& other : {
+             std::optional<std::string>(),
+             std::optional<std::string>("AAPL"),
+         }) {
+        REQUIRE(require_error(
+            service->list_orders(account_id, page(2, first.next_cursor, other)),
+            PaperTradingErrorCode::InvalidCursor
+        ).field == "cursor");
+    }
+    const auto unfiltered = require_order_history(service->list_orders(account_id, page(2)));
+    require_error(
+        service->list_orders(account_id, page(2, unfiltered.next_cursor, "SPY")),
+        PaperTradingErrorCode::InvalidCursor
+    );
+    // An orders cursor is not a fills cursor, even with the same filter.
+    require_error(
+        service->list_fills(account_id, page(2, first.next_cursor, "SPY")),
+        PaperTradingErrorCode::InvalidCursor
+    );
+
+    const auto aapl_fills = require_fill_history(
+        service->list_fills(account_id, page(std::nullopt, std::nullopt, "AAPL"))
+    );
+    REQUIRE((client_order_ids(aapl_fills) ==
+        std::vector<std::string>{"aapl-1", "aapl-0"}));
+    REQUIRE(require_order_history(
+        service->list_orders(account_id, page(std::nullopt, std::nullopt, "MSFT"))
+    ).orders.empty());
+    REQUIRE(require_error(
+        service->list_orders(account_id, page(std::nullopt, std::nullopt, "bad symbol")),
+        PaperTradingErrorCode::InvalidIdentifier
+    ).field == "instrument");
 }
 
 }  // namespace
@@ -1418,8 +1776,12 @@ int main() {
             test_portfolio_requires_a_valid_existing_account,
         },
         {
-            "portfolio requires a current quote",
-            test_portfolio_requires_a_current_quote_for_the_instrument,
+            "a flat account is valued without any quote",
+            test_a_flat_account_is_valued_without_any_quote,
+        },
+        {
+            "portfolio requires a current quote per holding",
+            test_portfolio_requires_a_current_quote_for_each_held_instrument,
         },
         {
             "portfolio rejects a quote without a usable bid",
@@ -1444,6 +1806,38 @@ int main() {
         {
             "portfolio without starting cash fails valuation",
             test_portfolio_without_starting_cash_is_a_valuation_failure,
+        },
+        {
+            "an account trades several instruments with shared cash",
+            test_an_account_trades_several_instruments_with_shared_cash,
+        },
+        {
+            "an order executes only against its own instrument",
+            test_an_order_executes_only_against_its_own_instrument,
+        },
+        {
+            "an unsupported instrument is rejected before recording",
+            test_an_unsupported_instrument_is_rejected_before_recording,
+        },
+        {
+            "displayed liquidity is consumed per instrument",
+            test_displayed_liquidity_is_consumed_per_instrument,
+        },
+        {
+            "a client order ID repeated for another symbol is a duplicate",
+            test_a_client_order_id_repeated_for_another_symbol_is_a_duplicate,
+        },
+        {
+            "concurrent services cannot double-spend shared cash",
+            test_concurrent_services_cannot_double_spend_shared_cash,
+        },
+        {
+            "portfolio reports every position it cannot mark",
+            test_portfolio_reports_every_position_it_cannot_mark,
+        },
+        {
+            "history can be filtered by instrument",
+            test_history_can_be_filtered_by_instrument,
         },
     });
 }

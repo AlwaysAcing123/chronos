@@ -25,9 +25,10 @@ import {
   PortfolioEnvelopeSchema,
 } from './schemas';
 
+// An account trades every instrument the server offers, so it is not
+// created for one.
 export interface CreateAccountRequest {
   readonly account_id: string;
-  readonly instrument: string;
   readonly starting_cash: string;
 }
 
@@ -52,8 +53,20 @@ export interface ChronosClient {
   createAccount(request: CreateAccountRequest): Promise<Account>;
   getAccount(accountId: string, signal?: AbortSignal): Promise<Account>;
   getPortfolio(accountId: string, signal?: AbortSignal): Promise<PortfolioReading>;
-  listOrders(accountId: string, cursor: string | null, signal?: AbortSignal): Promise<OrderPage>;
-  listFills(accountId: string, cursor: string | null, signal?: AbortSignal): Promise<FillPage>;
+  // `instrument` null lists every symbol; a cursor pages only the filter
+  // that issued it.
+  listOrders(
+    accountId: string,
+    instrument: string | null,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<OrderPage>;
+  listFills(
+    accountId: string,
+    instrument: string | null,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<FillPage>;
   // Never cancellable: aborting would not stop the server from recording the
   // order, only hide the outcome.
   submitOrder(accountId: string, request: OrderRequest): Promise<SubmissionResponse>;
@@ -76,8 +89,16 @@ function accountPath(accountId: string): string {
   return `/api/v1/accounts/${encodeURIComponent(accountId)}`;
 }
 
-function historyPath(accountId: string, list: 'orders' | 'fills', cursor: string | null): string {
+function historyPath(
+  accountId: string,
+  list: 'orders' | 'fills',
+  instrument: string | null,
+  cursor: string | null,
+): string {
   const query = new URLSearchParams({ limit: String(HISTORY_PAGE_SIZE) });
+  if (instrument !== null) {
+    query.set('instrument', instrument);
+  }
   if (cursor !== null) {
     query.set('cursor', cursor);
   }
@@ -135,13 +156,13 @@ export function createChronosClient(transport: TransportOptions = DEFAULT_TRANSP
       throw failure;
     },
 
-    async listOrders(accountId, cursor, signal) {
-      const response = await get(historyPath(accountId, 'orders', cursor), signal);
+    async listOrders(accountId, instrument, cursor, signal) {
+      const response = await get(historyPath(accountId, 'orders', instrument, cursor), signal);
       return decodeBody(OrderPageSchema, requireStatus(response, 200));
     },
 
-    async listFills(accountId, cursor, signal) {
-      const response = await get(historyPath(accountId, 'fills', cursor), signal);
+    async listFills(accountId, instrument, cursor, signal) {
+      const response = await get(historyPath(accountId, 'fills', instrument, cursor), signal);
       return decodeBody(FillPageSchema, requireStatus(response, 200));
     },
 

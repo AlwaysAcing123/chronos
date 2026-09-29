@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { App } from './App';
 import { RECENT_ACCOUNTS_KEY, SELECTED_ACCOUNT_KEY } from './state/accountSelection';
 import { createFakeApi } from './test/fakeApi';
-import { ACCOUNT_ID, errorJson, flatAccountJson, healthJson, portfolioJson } from './test/fixtures';
+import { ACCOUNT_ID, errorJson, flatAccountJson, flatPortfolioJson, healthJson } from './test/fixtures';
 import { accountPath, rememberSelectedAccount, renderWithServices, serveAccount } from './test/renderWithServices';
 
 describe('account entry', () => {
@@ -18,22 +18,21 @@ describe('account entry', () => {
     expect(await screen.findByText('API online')).toBeInTheDocument();
   });
 
-  it('creates an account with a server-listed instrument and opens it', async () => {
+  it('creates an account that trades every server-listed instrument and opens it', async () => {
     const api = createFakeApi();
-    serveAccount(api, { account: flatAccountJson(), portfolio: portfolioJson(), orders: [], fills: [] });
+    serveAccount(api, { account: flatAccountJson(), portfolio: flatPortfolioJson(), orders: [], fills: [] });
     // Configuration order, not alphabetical.
     api.on('GET', '/health', { status: 200, body: healthJson({ tradeable_instruments: ['SPY', 'AAPL'] }) });
     api.on('POST', '/api/v1/accounts', {
       status: 201,
-      body: { account: flatAccountJson({ instrument: 'AAPL', starting_cash: '2500.75', cash: '2500.75' }) },
+      body: { account: flatAccountJson({ starting_cash: '2500.75', cash: '2500.75' }) },
     });
     const { user } = renderWithServices(<App />, { api });
 
-    await screen.findByRole('option', { name: 'AAPL' });
-    const instrument = screen.getByRole('combobox', { name: 'Instrument' });
-    expect(within(instrument).getAllByRole('option').map((option) => option.textContent)).toEqual(['SPY', 'AAPL']);
-    await user.selectOptions(instrument, 'AAPL');
     const create = screen.getByRole('region', { name: 'Create a paper account' });
+    expect(await within(create).findByText('Trades SPY, AAPL from one shared cash balance.')).toBeInTheDocument();
+    // An account is not created for one instrument, so there is nothing to choose.
+    expect(within(create).queryByRole('combobox')).not.toBeInTheDocument();
     await user.type(within(create).getByLabelText('Account ID'), ACCOUNT_ID);
     const cash = within(create).getByLabelText('Starting cash (simulated)');
     await user.clear(cash);
@@ -43,7 +42,6 @@ describe('account entry', () => {
     expect(await screen.findByRole('heading', { name: 'Order ticket' })).toBeInTheDocument();
     expect(api.requestsTo('POST', '/api/v1/accounts')[0]?.body).toEqual({
       account_id: ACCOUNT_ID,
-      instrument: 'AAPL',
       // Exactly as typed: the browser does not normalise decimals.
       starting_cash: '2500.750',
     });
@@ -54,7 +52,7 @@ describe('account entry', () => {
     const api = createFakeApi();
     api.on('GET', '/health', { status: 200, body: healthJson() });
     const { user } = renderWithServices(<App />, { api });
-    await screen.findByRole('option', { name: 'AAPL' });
+    await screen.findByText('Trades AAPL, SPY from one shared cash balance.');
     const create = screen.getByRole('region', { name: 'Create a paper account' });
     await user.type(within(create).getByLabelText('Account ID'), '-bad id');
     const cash = within(create).getByLabelText('Starting cash (simulated)');
@@ -75,7 +73,7 @@ describe('account entry', () => {
       body: errorJson('account_already_exists', 'paper account already exists', { field: 'account_id' }),
     });
     const { user } = renderWithServices(<App />, { api });
-    await screen.findByRole('option', { name: 'AAPL' });
+    await screen.findByText('Trades AAPL, SPY from one shared cash balance.');
     const create = screen.getByRole('region', { name: 'Create a paper account' });
     await user.type(within(create).getByLabelText('Account ID'), ACCOUNT_ID);
     await user.click(screen.getByRole('button', { name: 'Create paper account' }));
@@ -119,7 +117,7 @@ describe('selected account persistence', () => {
     expect(await screen.findByRole('heading', { name: 'Order ticket' })).toBeInTheDocument();
     const header = screen.getByRole('banner');
     expect(within(header).getByText(ACCOUNT_ID)).toBeInTheDocument();
-    expect(await within(header).findByText('AAPL')).toBeInTheDocument();
+    expect(await within(header).findByText('1 open position')).toBeInTheDocument();
   });
 
   it('stores only account IDs', async () => {
