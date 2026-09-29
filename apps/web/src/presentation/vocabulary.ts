@@ -5,6 +5,8 @@ import type { FailureCategory } from '../api/errors';
 import type {
   AccountStatus,
   CancellationReason,
+  MarketDataMode,
+  MarketDataSourceState,
   OrderStatus,
   OrderType,
   QualityFlag,
@@ -52,6 +54,27 @@ export const QUALITY_FLAG: Readonly<Record<QualityFlag, Labelled>> = {
   source_specific: { label: 'Source-specific', tone: 'neutral' },
 };
 
+export const MARKET_DATA_MODE: Readonly<Record<MarketDataMode, string>> = {
+  none: 'No market data',
+  historical_replay: 'Historical replay',
+  live: 'Live data',
+};
+
+export const SOURCE_STATE: Readonly<Record<MarketDataSourceState, Labelled>> = {
+  none: { label: 'No source', tone: 'neutral' },
+  ready: { label: 'Ready to start', tone: 'neutral' },
+  running: { label: 'Playing', tone: 'info' },
+  paused: { label: 'Paused', tone: 'caution' },
+  completed: { label: 'Completed', tone: 'neutral' },
+  connecting: { label: 'Connecting', tone: 'caution' },
+  authenticating: { label: 'Authenticating', tone: 'caution' },
+  subscribing: { label: 'Subscribing', tone: 'caution' },
+  live: { label: 'Live', tone: 'info' },
+  reconnecting: { label: 'Reconnecting', tone: 'caution' },
+  failed: { label: 'Failed', tone: 'negative' },
+  stopped: { label: 'Stopped', tone: 'neutral' },
+};
+
 // Codes of recorded rejections and faults (order.rejection.code).
 const RECORDED_OUTCOME: Readonly<Record<string, string>> = {
   risk_rejected: 'Rejected by pre-trade risk',
@@ -95,6 +118,8 @@ const REASON: Readonly<Record<string, string>> = {
   // Market data and valuation
   no_top_of_book: 'No quote has been received for this instrument',
   stream_interrupted: 'The market-data stream was interrupted; the server must be restarted',
+  source_unavailable: 'The market-data source is unavailable, so no quote is current',
+  awaiting_fresh_quote: 'Waiting for a new quote for this instrument since the market-data source resumed',
   missing_best_bid: 'The book has no bid to mark the position',
   suspect_market_state: 'The quote is flagged as a potentially invalid book or questionable receive time',
   stale_market_state: "The quote is older than the account's maximum quote age",
@@ -167,6 +192,14 @@ export const FAILURE: Readonly<Record<FailureCategory, FailureDescription>> = {
   internal_error: {
     title: 'The server hit an unexpected error',
     detail: 'Details are in the server log.',
+  },
+  invalid_replay_transition: {
+    title: 'The replay cannot do that now',
+    detail: 'The replay changed state before the request arrived; its current state is shown.',
+  },
+  replay_control_unavailable: {
+    title: 'This server is not replaying a recording',
+    detail: 'Replay controls apply only to a historical replay source.',
   },
   unexpected_response: {
     title: 'Unexpected response',

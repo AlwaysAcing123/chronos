@@ -323,6 +323,129 @@ void test_concurrent_readers_observe_consistent_snapshots() {
     REQUIRE(state.status().last_ingest_sequence == kUpdates);
 }
 
+void test_suspension_makes_every_quote_unavailable() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    require_step(state.apply(require_valid(top_of_book(0, 1'000))));
+    require_quote(state.execution_quote(InstrumentId("AAPL")));
+
+    state.suspend();
+    state.suspend();
+    require_unavailable(
+        state.execution_quote(InstrumentId("AAPL")),
+        MarketStateUnavailableCode::SourceUnavailable
+    );
+    require_unavailable(
+        state.execution_quote(InstrumentId("SPY")),
+        MarketStateUnavailableCode::SourceUnavailable
+    );
+    // Suspension is not corruption: the stream still reports accepting.
+    REQUIRE(!state.status().interruption.has_value());
+    REQUIRE(state.status().last_ingest_sequence == 0U);
+}
+
+void test_resume_requires_a_fresh_quote_per_instrument() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    require_step(state.apply(require_valid(top_of_book(0, 1'000, "AAPL"))));
+    require_step(state.apply(require_valid(top_of_book(1, 1'001, "SPY"))));
+    state.suspend();
+    // An event applied while suspended does not count as fresh.
+    require_step(state.apply(require_valid(top_of_book(2, 1'002, "AAPL"))));
+    state.resume();
+
+    require_unavailable(
+        state.execution_quote(InstrumentId("AAPL")),
+        MarketStateUnavailableCode::AwaitingFreshQuote
+    );
+    require_unavailable(
+        state.execution_quote(InstrumentId("SPY")),
+        MarketStateUnavailableCode::AwaitingFreshQuote
+    );
+    require_unavailable(
+        state.execution_quote(InstrumentId("MSFT")),
+        MarketStateUnavailableCode::NoTopOfBook
+    );
+
+    // A trade is not a quote.
+    require_step(state.apply(trade(3, 1'003)));
+    require_unavailable(
+        state.execution_quote(InstrumentId("AAPL")),
+        MarketStateUnavailableCode::AwaitingFreshQuote
+    );
+
+    require_step(state.apply(require_valid(top_of_book(4, 1'004, "AAPL"))));
+    const ExecutionQuote aapl = require_quote(
+        state.execution_quote(InstrumentId("AAPL"))
+    );
+    REQUIRE(aapl.top_of_book.header.ingest_sequence == 4U);
+    require_unavailable(
+        state.execution_quote(InstrumentId("SPY")),
+        MarketStateUnavailableCode::AwaitingFreshQuote
+    );
+
+    // Every suspension starts a new epoch.
+    state.suspend();
+    state.resume();
+    require_unavailable(
+        state.execution_quote(InstrumentId("AAPL")),
+        MarketStateUnavailableCode::AwaitingFreshQuote
+    );
+}
+
+void test_interruption_outranks_suspension() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    require_step(state.apply(require_valid(top_of_book(0, 1'000))));
+    state.suspend();
+    require_update_error(
+        state.apply(require_valid(top_of_book(5, 1'001))),
+        MarketStateUpdateErrorCode::ReplayRejected
+    );
+    require_unavailable(
+        state.execution_quote(InstrumentId("AAPL")),
+        MarketStateUnavailableCode::StreamInterrupted
+    );
+}
+
+void test_advanced_time_ages_a_silent_quote() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    require_step(state.apply(require_valid(top_of_book(0, 1'000))));
+
+    REQUIRE(!state.advance_time(Timestamp::from_nanoseconds(1'000)));
+    REQUIRE(!state.advance_time(Timestamp::from_nanoseconds(9'000)));
+    const ExecutionQuote quote = require_quote(
+        state.execution_quote(InstrumentId("AAPL"))
+    );
+    REQUIRE(quote.market_time == Timestamp::from_nanoseconds(9'000));
+    REQUIRE(quote.top_of_book.header.receive_timestamp ==
+        Timestamp::from_nanoseconds(1'000));
+    REQUIRE(state.status().market_time == Timestamp::from_nanoseconds(9'000));
+    REQUIRE(state.status().last_ingest_sequence == 0U);
+
+    const auto backward = state.advance_time(Timestamp::from_nanoseconds(8'999));
+    REQUIRE(backward.has_value());
+    REQUIRE(backward->code == MarketStateUpdateErrorCode::TimeMovedBackward);
+    // A rejected advance changes nothing and does not interrupt.
+    REQUIRE(state.status().market_time == Timestamp::from_nanoseconds(9'000));
+    REQUIRE(!state.status().interruption.has_value());
+
+    // An event received before the advanced time is a regression.
+    require_update_error(
+        state.apply(require_valid(top_of_book(1, 8'000))),
+        MarketStateUpdateErrorCode::ReplayRejected
+    );
+    const auto interrupted = state.advance_time(Timestamp::from_nanoseconds(10'000));
+    REQUIRE(interrupted.has_value());
+    REQUIRE(interrupted->code == MarketStateUpdateErrorCode::StreamInterrupted);
+}
+
+void test_time_can_advance_before_any_event() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    REQUIRE(!state.advance_time(Timestamp::from_nanoseconds(500)));
+    REQUIRE(state.status().market_time == Timestamp::from_nanoseconds(500));
+    REQUIRE(!state.status().last_ingest_sequence.has_value());
+    REQUIRE(state.advance_time(Timestamp::from_nanoseconds(-1)).has_value());
+    require_step(state.apply(require_valid(top_of_book(0, 500))));
+}
+
 }  // namespace
 
 int main() {
@@ -359,6 +482,26 @@ int main() {
         {
             "concurrent readers observe consistent snapshots",
             test_concurrent_readers_observe_consistent_snapshots,
+        },
+        {
+            "suspension makes every quote unavailable",
+            test_suspension_makes_every_quote_unavailable,
+        },
+        {
+            "resume requires a fresh quote per instrument",
+            test_resume_requires_a_fresh_quote_per_instrument,
+        },
+        {
+            "interruption outranks suspension",
+            test_interruption_outranks_suspension,
+        },
+        {
+            "advanced time ages a silent quote",
+            test_advanced_time_ages_a_silent_quote,
+        },
+        {
+            "time can advance before any event",
+            test_time_can_advance_before_any_event,
         },
     });
 }

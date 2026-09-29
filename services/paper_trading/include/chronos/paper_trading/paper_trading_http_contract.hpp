@@ -1,7 +1,11 @@
 #pragma once
 
+#include "chronos/market_data/market_data_notifier.hpp"
+#include "chronos/market_data/market_data_source.hpp"
 #include "chronos/paper_trading/http_message.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
+
+#include <cstdint>
 
 #include <optional>
 #include <string>
@@ -60,9 +64,47 @@ parse_history_query(std::string_view query);
     std::string_view query
 );
 
+// For commands without parameters: the body must be exactly an empty JSON
+// object, so a mistyped or misplaced option is rejected, not ignored.
+[[nodiscard]] std::optional<MalformedRequest> parse_empty_object_request(
+    std::string_view body
+);
+
+// The market-data resource: the source, the stream, and whether each
+// tradeable instrument has an execution quote now.
+struct MarketDataView {
+    market_data::MarketDataSourceStatus source;
+    MarketAvailability market;
+    // The notifier revision this view is at least as new as.
+    std::uint64_t revision;
+};
+
+[[nodiscard]] HttpResponse render_market_data(const MarketDataView& view);
+
+[[nodiscard]] HttpResponse render_replay_command_error(
+    const market_data::ReplayCommandError& error,
+    market_data::MarketDataMode mode
+);
+
+[[nodiscard]] HttpResponse render_event_stream_unavailable(
+    market_data::MarketDataNotifier::SubscribeError error
+);
+
+// Server-Sent Events text. The preamble sets the browser's reconnect delay;
+// each notice is one event or comment, and nullopt ends the stream.
+inline constexpr std::string_view kEventStreamPreamble = "retry: 3000\n\n";
+[[nodiscard]] std::optional<std::string> event_stream_text(
+    const market_data::MarketDataNotice& notice
+);
+
 [[nodiscard]] std::string format_timestamp(Timestamp timestamp);
 
-[[nodiscard]] HttpResponse render_health(const PaperTradingHealth& health);
+// With a source status, the body also reports the market-data source's
+// mode, label, and lifecycle state, such as a live feed still connecting.
+[[nodiscard]] HttpResponse render_health(
+    const PaperTradingHealth& health,
+    const std::optional<market_data::MarketDataSourceStatus>& source = std::nullopt
+);
 
 [[nodiscard]] HttpResponse render_account(
     const PaperAccountResult& result,

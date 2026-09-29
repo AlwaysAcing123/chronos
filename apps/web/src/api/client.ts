@@ -5,11 +5,21 @@ import type { HttpResponse, TransportOptions } from './http';
 import { decodeBody, failureOf, sendRequest } from './http';
 import type { OrderRequest, SubmissionResponse } from './submission';
 import { classifySubmission } from './submission';
-import type { Account, ErrorBody, FillPage, Health, Order, OrderPage, Portfolio } from './schemas';
+import type {
+  Account,
+  ErrorBody,
+  FillPage,
+  Health,
+  MarketData,
+  Order,
+  OrderPage,
+  Portfolio,
+} from './schemas';
 import {
   AccountEnvelopeSchema,
   FillPageSchema,
   HealthSchema,
+  MarketDataEnvelopeSchema,
   OrderEnvelopeSchema,
   OrderPageSchema,
   PortfolioEnvelopeSchema,
@@ -35,6 +45,8 @@ export type OrderLookup =
   | { readonly kind: 'recorded'; readonly order: Order }
   | { readonly kind: 'not_recorded' };
 
+export type ReplayCommand = 'start' | 'pause' | 'resume';
+
 export interface ChronosClient {
   getHealth(signal?: AbortSignal): Promise<Health>;
   createAccount(request: CreateAccountRequest): Promise<Account>;
@@ -46,6 +58,9 @@ export interface ChronosClient {
   // order, only hide the outcome.
   submitOrder(accountId: string, request: OrderRequest): Promise<SubmissionResponse>;
   lookupOrder(accountId: string, clientOrderId: string, signal?: AbortSignal): Promise<OrderLookup>;
+  getMarketData(signal?: AbortSignal): Promise<MarketData>;
+  // Returns the market data after the command, or throws its typed error.
+  controlReplay(command: ReplayCommand): Promise<MarketData>;
 }
 
 // Items per history page; "Load older" follows the server's keyset cursor.
@@ -144,6 +159,20 @@ export function createChronosClient(transport: TransportOptions = DEFAULT_TRANSP
         }
         throw error;
       }
+    },
+
+    async getMarketData(signal) {
+      const response = await get('/api/v1/market-data', signal);
+      return decodeBody(MarketDataEnvelopeSchema, requireStatus(response, 200)).market_data;
+    },
+
+    async controlReplay(command) {
+      const response = await sendRequest(transport, {
+        method: 'POST',
+        path: `/api/v1/market-data/replay/${command}`,
+        body: {},
+      });
+      return decodeBody(MarketDataEnvelopeSchema, requireStatus(response, 200)).market_data;
     },
 
     async lookupOrder(accountId, clientOrderId, signal) {

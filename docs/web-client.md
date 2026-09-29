@@ -14,8 +14,17 @@ The API contract it consumes is [paper-trading-api.md](paper-trading-api.md).
 
 - Create a paper account (ID, one of the server's tradeable instruments,
   starting cash) or open an existing one by ID.
-- Show the server and market-data state: API and database availability,
-  stream, state, latest ingest sequence, and market time.
+- Show the server's market-data source on every screen: whether it is a
+  historical replay or live, its label, state, replay speed, market time,
+  and exact event count, with Start, Pause, and Resume for a replay.
+- For a live source such as Alpaca IEX: a persistent notice that the feed is
+  one exchange, not SIP, the NBBO, or every exchange; the connection state
+  (connecting, authenticating, subscribing, live, reconnecting, failed); an
+  interruption notice while reconnecting; and which instruments are still
+  waiting for a fresh quote. There are no replay controls, and the browser
+  never sees or requests provider credentials.
+- Show API and database availability and the stream's state, latest ingest
+  sequence, and market time.
 - Show the account's exact portfolio valuation at the best bid, with the
   quote it was marked against: best bid and ask with size, observation
   sequence, event and receive times, venue, and quality flags.
@@ -27,8 +36,8 @@ The API contract it consumes is [paper-trading-api.md](paper-trading-api.md).
   and model orders are labelled by source and share one execution path.
 - Remember the selected account across reloads.
 
-It has no charts, streaming, models, authentication, or account list, because
-the API does not provide them yet.
+It has no charts, models, authentication, or account list, because the API
+does not provide them yet.
 
 ## Architecture
 
@@ -41,11 +50,13 @@ apps/web/src/
     submission.ts   classifies order-submission responses
     decimal.ts      lexical decimal rules; no number conversion
   state/        server state and client state
-    queries.ts      TanStack Query hooks and keys (the polling transport)
+    queries.ts      TanStack Query hooks, keys, and polling intervals
+    marketDataStream.tsx  the change stream that invalidates market reads
     orderTicket.ts  ticket lifecycle and uncertain-order reconciliation
     accountSelection.ts  the only browser-persisted state
   presentation/ one exhaustive mapping from backend vocabulary to text
-  components/   presentation only: shell, account, workspace, ticket, history
+  components/   presentation only: shell, source, account, workspace, ticket,
+                history
 ```
 
 Components never call `fetch` and never see raw JSON. They read resources
@@ -67,13 +78,26 @@ string slicing rather than `Date`. Browser wall-clock times appear only for
 
 ### Refresh
 
-Reads are polled; this is an interim transport, labelled in the header as
-"Polling every 2 s".
+Market-dependent reads follow the server's change stream
+(`GET /api/v1/market-data/events`, Server-Sent Events;
+[market-data-sources.md](market-data-sources.md#browser-notifications)). A
+notice carries no market data; `MarketDataStreamProvider` invalidates the
+market-data and portfolio queries, which refetch their typed resources. In-flight
+reads are not cancelled by a notice, so a burst of notices cannot starve them;
+a query that was already fetching when a notice arrived is read once more when
+it settles, so the last change of a burst is never left for the 15-second
+poll.
 
-| Resource | Interval |
-|---|---|
-| `/health` | 5 s |
-| Account, portfolio, newest order and fill pages | 2 s |
+| Resource | Stream open | Stream unavailable |
+|---|---|---|
+| `/api/v1/market-data`, portfolio | on each notice, plus every 15 s | every 2 s |
+| Account, newest order and fill pages | every 2 s | every 2 s |
+| `/health` | every 5 s | every 5 s |
+
+The header says which applies: "Streaming changes", "Connecting to change
+stream", or "Polling every 2 s". A dropped stream is retried by the browser;
+a refused one (such as `503 event_stream_unavailable`) is retried by the page
+after 2, 5, 10, then every 30 seconds, while polling continues.
 
 - TanStack Query never overlaps two reads of one resource, pauses polling
   while the tab is hidden, and refreshes when it becomes visible again.
@@ -84,8 +108,8 @@ Reads are polled; this is an interim transport, labelled in the header as
 - The header's "last refresh" is the oldest successful update among the reads
   on screen, so everything displayed was confirmed at or after that time.
 
-A future WebSocket or server-sent-event transport can write the same query
-keys and turn the intervals off, without changing any component.
+Presentation components read only the query hooks, so the transport
+changed from polling to notices without changing any of them.
 
 ### Unavailable data
 
@@ -93,7 +117,9 @@ A value the server cannot provide is shown as unavailable, never as zero.
 
 - When the portfolio cannot be valued (`market_data_unavailable` or
   `valuation_failed`), equity, PnL, market value, and return are shown as
-  unavailable with the server's reason. The ledger values (cash, position,
+  unavailable with the server's reason, including a disconnected live feed
+  (`source_unavailable`) or one still waiting for a fresh quote
+  (`awaiting_fresh_quote`). The ledger values (cash, position,
   cost basis, realized PnL, fees) then come from the account resource.
 - A failed read shows the failure and a retry button instead of the previous
   values.
@@ -166,8 +192,11 @@ npm ci
 npm run dev        # http://127.0.0.1:5173
 ```
 
-Without `--replay-dbn` the server has no market, and the workspace shows the
-portfolio and orders as unavailable with `no_top_of_book`.
+The replay waits in "Ready to start" until you press **Start replay** in the
+source bar (or start the server with `--replay-autostart`); add
+`--replay-speed 10x`, `100x`, or `max` to play faster. Without `--replay-dbn`
+the server has no market, and the workspace shows the portfolio and orders as
+unavailable with `no_top_of_book`.
 
 ### Development proxy
 
@@ -225,8 +254,12 @@ database, credentials, or market data; the live spec is skipped there.
 
 ## Limitations
 
-- Polling, not streaming. Replay is unpaced, so the served quote does not
-  move while the server runs.
+- A completed replay cannot be restarted from the page; restart the server
+  and use a new account.
+- A live quote is shown only through the selected account's portfolio, so an
+  instrument without an account shows its availability but not its price.
+- Change notices are coalesced to at most four per second, so the displayed
+  quote can lag the market state by up to 250 ms plus a request.
 - No authentication, and no account list: accounts are opened by ID, and the
   browser remembers only IDs it opened.
 - When the portfolio is unavailable, the quote is too: the API's error does

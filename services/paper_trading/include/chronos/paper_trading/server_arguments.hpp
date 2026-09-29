@@ -1,0 +1,64 @@
+#pragma once
+
+#include "chronos/paper_trading/paper_trading_http_server.hpp"
+#include "chronos/pre_trade_risk.hpp"
+#include "chronos/replay_schedule.hpp"
+
+#include <cstddef>
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace chronos::paper_trading {
+
+// Which optional market-data sources this server binary was built with.
+struct ServerCapabilities {
+    bool databento_replay{false};
+    bool alpaca_live{false};
+};
+
+struct ReplayArguments {
+    std::filesystem::path recording;
+    ReplaySpeed speed{ReplaySpeed::RealTime};
+    bool start_immediately{false};
+};
+
+// A validated server command line. At most one market-data source is
+// selected, a replay or Alpaca IEX; without one the market stays empty.
+struct ServerArguments {
+    std::string stream_id;
+    std::vector<InstrumentId> instruments;
+    std::optional<ReplayArguments> replay;
+    // Live data from Alpaca's IEX stream. Its credentials come only from
+    // the environment.
+    bool alpaca_iex{false};
+    HttpServerOptions http;
+    PreTradeRiskLimits risk_limits;
+};
+
+// Alpaca's free Basic plan allows 30 streamed symbols.
+inline constexpr std::size_t kAlpacaIexInstrumentLimit = 30;
+
+// A command line that cannot start the server. An empty message asks for
+// the help text only.
+class ServerUsageError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Strict: every option except --instrument may appear once, an instrument
+// may be listed once, and options for a source that is not selected or not
+// built are rejected rather than ignored. Credentials are never accepted
+// on the command line.
+[[nodiscard]] ServerArguments parse_server_arguments(
+    std::span<const std::string_view> arguments,
+    ServerCapabilities capabilities
+);
+
+[[nodiscard]] std::string server_usage();
+
+}  // namespace chronos::paper_trading

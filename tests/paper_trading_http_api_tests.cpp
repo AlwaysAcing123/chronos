@@ -1,7 +1,13 @@
+#include "chronos/market_data/market_data_notifier.hpp"
+#include "chronos/market_data/market_data_source.hpp"
+#include "chronos/market_data/market_state_feed.hpp"
+#include "chronos/market_data/monotonic_clock.hpp"
+#include "chronos/market_data/paced_replay_source.hpp"
 #include "chronos/paper_trading/history_cursor.hpp"
 #include "chronos/paper_trading/paper_trading_http_api.hpp"
 #include "chronos/paper_trading/paper_trading_http_server.hpp"
 #include "json_test_support.hpp"
+#include "market_data_test_support.hpp"
 #include "paper_trading_test_support.hpp"
 #include "postgres_test_support.hpp"
 #include "test_support.hpp"
@@ -9,8 +15,12 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -59,10 +69,37 @@ using Json = nlohmann::json;
 
 std::string connection_string;
 
-// One API stack: server-owned market state, service, and router.
+namespace market_data = chronos::market_data;
+
+// Change notices without throttling, so stream tests never wait on time.
+market_data::MarketDataNotifier::Options immediate_notices() {
+    return market_data::MarketDataNotifier::Options{
+        .maximum_subscribers = 2,
+        .minimum_interval = std::chrono::nanoseconds(0),
+        .heartbeat_interval = std::chrono::hours(1),
+    };
+}
+
+// One API stack: server-owned market state, market-data source, notifier,
+// service, and router. Without a source factory the server has no source.
 struct TestApi {
-    explicit TestApi(const std::string& connection = connection_string)
+    using SourceFactory = std::function<std::unique_ptr<market_data::MarketDataSource>(
+        market_data::MarketStateFeed&,
+        const market_data::MonotonicClock&
+    )>;
+
+    explicit TestApi(
+        const std::string& connection = connection_string,
+        const SourceFactory& make_source = {}
+    )
         : market(chronos::test::market_state()),
+          notifier(clock, immediate_notices()),
+          feed(*market, notifier),
+          source(make_source
+              ? make_source(feed, clock)
+              : std::make_unique<market_data::NoMarketDataSource>(
+                    paper_service_config().tradeable_instruments
+                )),
           service(std::make_unique<PaperTradingService>(
               std::make_unique<PostgresPaperOrderRepository>(connection),
               *market,
@@ -70,11 +107,17 @@ struct TestApi {
           )),
           api(std::make_unique<PaperTradingHttpApi>(
               *service,
+              *source,
+              notifier,
               [this](std::string_view line) { diagnostics.emplace_back(line); }
           )) {}
 
     std::vector<std::string> diagnostics;
+    chronos::test::ManualClock clock{chronos::test::ManualClock::Mode::Hold};
     std::unique_ptr<MarketState> market;
+    market_data::MarketDataNotifier notifier;
+    market_data::MarketStateFeed feed;
+    std::unique_ptr<market_data::MarketDataSource> source;
     std::unique_ptr<PaperTradingService> service;
     std::unique_ptr<PaperTradingHttpApi> api;
 };
@@ -122,6 +165,13 @@ Json require_error(
     REQUIRE(response.status == status);
     REQUIRE(response.body.at("error").at("code") == code);
     return response.body.at("error");
+}
+
+void require_allow(const ApiResponse& response, std::string_view allowed) {
+    require_error(response, 405, "method_not_allowed");
+    REQUIRE(response.headers.size() == 1);
+    REQUIRE(response.headers.front().name == "Allow");
+    REQUIRE(response.headers.front().value == allowed);
 }
 
 std::string accounts_path(const std::string& account_id) {
@@ -600,13 +650,6 @@ void test_routing_and_media_type_errors_are_json() {
         "route_not_found"
     );
 
-    const auto require_allow = [](const ApiResponse& response,
-                                  std::string_view allowed) {
-        require_error(response, 405, "method_not_allowed");
-        REQUIRE(response.headers.size() == 1);
-        REQUIRE(response.headers.front().name == "Allow");
-        REQUIRE(response.headers.front().value == allowed);
-    };
     require_allow(call(api, "POST", "/health", "{}"), "GET");
     require_allow(call(api, "GET", "/api/v1/accounts"), "POST");
     require_allow(call(api, "DELETE", accounts_path(account_id)), "GET");
@@ -1459,6 +1502,376 @@ void test_socket_server_serves_the_portfolio() {
     REQUIRE(serving.stop().empty());
 }
 
+
+// ---------------------------------------------------------------------------
+// Market data
+
+// A paced replay of two quotes an hour apart, driven by the stack's clock.
+TestApi::SourceFactory paced_replay() {
+    return [](market_data::MarketStateFeed& feed, const market_data::MonotonicClock& clock) {
+        std::deque<chronos::MarketEventRead> reads;
+        reads.emplace_back(chronos::test::validated(quote(0, 0)));
+        reads.emplace_back(chronos::test::validated(quote(1, 3'600'000'000'000)));
+        return std::make_unique<market_data::PacedReplaySource>(
+            std::make_unique<chronos::test::ScriptedReader>(std::move(reads)),
+            feed,
+            clock,
+            market_data::MarketDataSourceDescription{
+                .mode = market_data::MarketDataMode::HistoricalReplay,
+                .provider = "Databento",
+                .feed = "EQUS.MINI MBP-1",
+                .label = "Databento EQUS.MINI MBP-1 replay",
+                .coverage_notice = std::nullopt,
+                .coverage_label = std::nullopt,
+                .instruments = paper_service_config().tradeable_instruments,
+            },
+            market_data::PacedReplayOptions{.speed = chronos::ReplaySpeed::TenTimes},
+            nullptr
+        );
+    };
+}
+
+ApiResponse replay_command(TestApi& api, std::string_view command, std::string body = "{}") {
+    return call(api, "POST", "/api/v1/market-data/replay/" + std::string(command), std::move(body));
+}
+
+void test_market_data_resource_describes_source_stream_and_instruments() {
+    TestApi api;
+    const ApiResponse empty = call(api, "GET", "/api/v1/market-data");
+    REQUIRE(empty.status == 200);
+    const Json& data = empty.body.at("market_data");
+    REQUIRE(data.at("trading_mode") == "paper");
+    REQUIRE(data.at("revision") == "0");
+    const Json& source = data.at("source");
+    REQUIRE(source.at("mode") == "none");
+    REQUIRE(source.at("state") == "none");
+    REQUIRE(source.at("label") == "No market-data source");
+    REQUIRE(source.at("provider").is_null());
+    REQUIRE(source.at("coverage_label").is_null());
+    REQUIRE(source.at("replay_speed").is_null());
+    REQUIRE(source.at("events_applied") == "0");
+    REQUIRE(source.at("instruments") == Json::array({"AAPL", "SPY"}));
+    REQUIRE(data.at("stream").at("stream_id") == chronos::test::kTestStream);
+    REQUIRE(data.at("stream").at("market_time").is_null());
+    REQUIRE(data.at("instruments") == Json::array({
+        {{"instrument", "AAPL"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}},
+        {{"instrument", "SPY"}, {"execution_quote_available", false}, {"unavailable_reason", "no_top_of_book"}},
+    }));
+
+    apply(*api.market, quote(0, 0));
+    const Json quoted = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    REQUIRE(quoted.at("instruments").at(0).at("execution_quote_available") == true);
+    REQUIRE(quoted.at("instruments").at(0).at("unavailable_reason").is_null());
+    REQUIRE(quoted.at("stream").at("last_ingest_sequence") == "0");
+}
+
+void test_market_data_routes_are_strict() {
+    TestApi api;
+    require_allow(call(api, "POST", "/api/v1/market-data", "{}"), "GET");
+    require_error(call(api, "GET", "/api/v1/market-data?verbose=1"), 400, "malformed_request");
+    require_error(call(api, "GET", "/api/v1/market-data/quotes"), 404, "route_not_found");
+    require_error(call(api, "POST", "/api/v1/market-data/replay/stop"), 404, "route_not_found");
+    require_error(call(api, "POST", "/api/v1/market-data/replay"), 404, "route_not_found");
+    require_allow(call(api, "GET", "/api/v1/market-data/replay/start"), "POST");
+    require_allow(call(api, "POST", "/api/v1/market-data/events", "{}"), "GET");
+}
+
+void test_replay_commands_follow_the_source_lifecycle() {
+    TestApi api(connection_string, paced_replay());
+    const Json ready = call(api, "GET", "/api/v1/market-data").body.at("market_data").at("source");
+    REQUIRE(ready.at("mode") == "historical_replay");
+    REQUIRE(ready.at("state") == "ready");
+    REQUIRE(ready.at("replay_speed") == "10x");
+    REQUIRE(ready.at("label") == "Databento EQUS.MINI MBP-1 replay");
+
+    const ApiResponse started = replay_command(api, "start");
+    REQUIRE(started.status == 200);
+    REQUIRE(started.body.at("market_data").at("source").at("state") == "running");
+    // The first event is delivered at once; the second waits an hour at 10x.
+    REQUIRE(api.clock.await_waits(1));
+    REQUIRE(api.feed.events_applied() == 1);
+    const Json running = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    REQUIRE(running.at("source").at("events_applied") == "1");
+    REQUIRE(running.at("instruments").at(0).at("execution_quote_available") == true);
+
+    const Json again = require_error(replay_command(api, "start"), 409, "invalid_replay_transition");
+    REQUIRE(again.at("reason") == "running");
+    REQUIRE(again.at("message") == "cannot start a replay that is running");
+    REQUIRE(replay_command(api, "pause").body.at("market_data").at("source").at("state") == "paused");
+    REQUIRE(require_error(replay_command(api, "pause"), 409, "invalid_replay_transition").at("reason") == "paused");
+    REQUIRE(replay_command(api, "resume").body.at("market_data").at("source").at("state") == "running");
+    REQUIRE(require_error(replay_command(api, "resume"), 409, "invalid_replay_transition").at("reason") == "running");
+    api.source->stop();
+    REQUIRE(require_error(replay_command(api, "resume"), 409, "invalid_replay_transition").at("reason") == "stopped");
+}
+
+void test_replay_commands_accept_only_an_empty_object() {
+    TestApi api(connection_string, paced_replay());
+    const auto reason = [&](std::string body) {
+        return require_error(replay_command(api, "start", std::move(body)), 400, "malformed_request")
+            .at("reason");
+    };
+    REQUIRE(reason("") == "invalid_json");
+    REQUIRE(reason("[]") == "invalid_type");
+    REQUIRE(reason("{}{}") == "invalid_json");
+    REQUIRE(reason(R"({"speed":"10x"})") == "unexpected_field");
+    REQUIRE(reason(R"({"a":1,"a":1})") == "duplicate_field");
+    REQUIRE(reason("null") == "invalid_type");
+    require_error(
+        call(api, "POST", "/api/v1/market-data/replay/start", "{}", "text/plain"),
+        415,
+        "unsupported_media_type"
+    );
+    require_error(call(api, "POST", "/api/v1/market-data/replay/start?now=1", "{}"), 400, "malformed_request");
+    // None of the rejected requests changed the source.
+    REQUIRE(call(api, "GET", "/api/v1/market-data").body.at("market_data").at("source").at("state") == "ready");
+    REQUIRE(replay_command(api, "start", " { } ").status == 200);
+}
+
+void test_replay_commands_need_a_replay_source() {
+    TestApi api;
+    const Json error = require_error(replay_command(api, "start"), 409, "replay_control_unavailable");
+    REQUIRE(error.at("reason") == "none");
+}
+
+void test_event_stream_requests_are_validated() {
+    TestApi api;
+    const auto request = [](std::string query) {
+        return HttpRequest{
+            .method = "GET",
+            .path = "/api/v1/market-data/events",
+            .query = std::move(query),
+            .content_type = "",
+            .body = "",
+        };
+    };
+    REQUIRE(PaperTradingHttpApi::is_event_stream_request(request("")));
+    auto with_query = api.api->open_event_stream(request("since=3"));
+    REQUIRE(std::get<HttpResponse>(with_query).status == 400);
+
+    auto first = api.api->open_event_stream(request(""));
+    auto second = api.api->open_event_stream(request(""));
+    REQUIRE(std::holds_alternative<market_data::MarketDataSubscription>(first));
+    REQUIRE(std::holds_alternative<market_data::MarketDataSubscription>(second));
+    auto full = api.api->open_event_stream(request(""));
+    const Json too_many = Json::parse(std::get<HttpResponse>(full).body);
+    REQUIRE(std::get<HttpResponse>(full).status == 503);
+    REQUIRE(too_many.at("error").at("reason") == "too_many_event_streams");
+
+    api.api->close_event_streams();
+    auto closed = api.api->open_event_stream(request(""));
+    REQUIRE(Json::parse(std::get<HttpResponse>(closed).body).at("error").at("reason") == "server_stopping");
+    // Through the non-streaming entry point the route is not served.
+    REQUIRE(call(api, "GET", "/api/v1/market-data/events").status == 500);
+}
+
+void test_socket_server_streams_change_notices() {
+    TestApi api;
+    PaperTradingHttpServer server(
+        *api.api,
+        HttpServerOptions{.host = "127.0.0.1", .port = 0},
+        [](std::string_view) {}
+    );
+    const int port = server.bind();
+    ServingThread serving(server);
+
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(std::chrono::seconds(10));
+    std::string received;
+    bool published = false;
+    httplib::Headers headers;
+    const auto result = client.Get(
+        "/api/v1/market-data/events",
+        [&](const httplib::Response& response) {
+            headers = response.headers;
+            return response.status == 200;
+        },
+        [&](const char* data, std::size_t length) {
+            received.append(data, length);
+            // The first notice arrives at once; one publish yields another.
+            if (!published && received.find(R"("revision":"0")") != std::string::npos) {
+                published = true;
+                api.notifier.publish();
+            }
+            return received.find(R"(data: {"revision":"1"})") == std::string::npos;
+        }
+    );
+    // The client stops reading once it has both notices.
+    REQUIRE(result.error() == httplib::Error::Canceled);
+    REQUIRE(received.starts_with("retry: 3000\n\n"));
+    REQUIRE(received.find("event: market-data\ndata: {\"revision\":\"0\"}\n\n") != std::string::npos);
+    const auto header = [&](std::string_view name) {
+        const auto found = headers.find(std::string(name));
+        return found == headers.end() ? std::string() : found->second;
+    };
+    REQUIRE(header("Content-Type") == "text/event-stream");
+    REQUIRE(header("Cache-Control") == "no-store");
+    REQUIRE(header("X-Chronos-Trading-Mode") == "paper");
+    REQUIRE(header("X-Content-Type-Options") == "nosniff");
+
+    // A stream whose browser stays connected ends promptly at shutdown.
+    std::atomic<bool> lingering_open{false};
+    std::atomic<bool> lingering_ended{false};
+    std::thread lingering([&] {
+        httplib::Client idle("127.0.0.1", port);
+        idle.set_read_timeout(std::chrono::seconds(30));
+        static_cast<void>(idle.Get(
+            "/api/v1/market-data/events",
+            [&](const char*, std::size_t) {
+                lingering_open = true;
+                return true;
+            }
+        ));
+        lingering_ended = true;
+    });
+    const bool opened = chronos::test::eventually([&] { return lingering_open.load(); });
+    const std::string stop_failure = serving.stop();
+    lingering.join();
+    REQUIRE(opened);
+    REQUIRE(stop_failure.empty());
+    REQUIRE(lingering_ended);
+}
+
+
+// A live source whose lifecycle the test sets; the API sees only its status.
+class StubLiveSource final : public market_data::MarketDataSource {
+public:
+    explicit StubLiveSource(market_data::MarketDataSourceState state) : state_(state) {}
+
+    [[nodiscard]] market_data::MarketDataSourceStatus status() const override {
+        const std::lock_guard lock(mutex_);
+        return market_data::MarketDataSourceStatus{
+            .description = market_data::MarketDataSourceDescription{
+                .mode = market_data::MarketDataMode::Live,
+                .provider = "Alpaca",
+                .feed = "IEX",
+                .label = "Alpaca IEX",
+                .coverage_notice = "IEX only: not consolidated SIP data, not the NBBO.",
+                .coverage_label = "IEX only, not SIP or NBBO",
+                .instruments = {InstrumentId("AAPL"), InstrumentId("SPY")},
+            },
+            .state = state_,
+            .events_applied = 3,
+            .replay_speed = std::nullopt,
+            .diagnostic = state_ == market_data::MarketDataSourceState::Reconnecting
+                ? std::optional<std::string>("the connection closed; reconnecting in 1.000 s")
+                : std::nullopt,
+            .recording_sha256 = std::nullopt,
+        };
+    }
+
+    [[nodiscard]] market_data::ReplayCommandResult control_replay(
+        market_data::ReplayCommand
+    ) override {
+        const std::lock_guard lock(mutex_);
+        return market_data::ReplayCommandError{
+            .code = market_data::ReplayCommandErrorCode::NotReplay,
+            .state = state_,
+            .message = "the market-data source is live, not a replay",
+        };
+    }
+
+    void stop() noexcept override {}
+
+    void set_state(market_data::MarketDataSourceState state) {
+        const std::lock_guard lock(mutex_);
+        state_ = state;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    market_data::MarketDataSourceState state_;
+};
+
+TestApi::SourceFactory stub_live(market_data::MarketDataSourceState state) {
+    return [state](market_data::MarketStateFeed&, const market_data::MonotonicClock&) {
+        return std::make_unique<StubLiveSource>(state);
+    };
+}
+
+std::vector<std::string> unavailable_reasons(TestApi& api) {
+    std::vector<std::string> reasons;
+    const ApiResponse response = call(api, "GET", "/api/v1/market-data");
+    for (const Json& instrument : response.body.at("market_data").at("instruments")) {
+        reasons.push_back(
+            instrument.at("unavailable_reason").is_null()
+                ? "available"
+                : instrument.at("unavailable_reason").get<std::string>()
+        );
+    }
+    return reasons;
+}
+
+void test_live_source_is_described_with_its_coverage_limit() {
+    TestApi api(connection_string, stub_live(market_data::MarketDataSourceState::Connecting));
+    api.market->suspend();
+    const Json data = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    const Json& source = data.at("source");
+    REQUIRE(source.at("mode") == "live");
+    REQUIRE(source.at("provider") == "Alpaca");
+    REQUIRE(source.at("feed") == "IEX");
+    REQUIRE(source.at("label") == "Alpaca IEX");
+    REQUIRE(source.at("coverage_notice") == "IEX only: not consolidated SIP data, not the NBBO.");
+    REQUIRE(source.at("coverage_label") == "IEX only, not SIP or NBBO");
+    REQUIRE(source.at("state") == "connecting");
+    REQUIRE(source.at("replay_speed").is_null());
+    REQUIRE(source.at("recording_sha256").is_null());
+    REQUIRE((unavailable_reasons(api) ==
+        std::vector<std::string>{"source_unavailable", "source_unavailable"}));
+
+    // Health answers while the feed connects, and says so.
+    const ApiResponse health = call(api, "GET", "/health");
+    REQUIRE(health.status == 200);
+    REQUIRE((health.body.at("market_data_source") == Json{
+        {"mode", "live"}, {"label", "Alpaca IEX"}, {"state", "connecting"},
+    }));
+
+    const Json refused = require_error(replay_command(api, "start"), 409, "replay_control_unavailable");
+    REQUIRE(refused.at("reason") == "live");
+}
+
+void test_live_disconnect_blocks_orders_and_valuation_until_fresh_quotes() {
+    TestApi api(connection_string, stub_live(market_data::MarketDataSourceState::Live));
+    auto& stub = static_cast<StubLiveSource&>(*api.source);
+    const std::string account_id = new_account(api, "http-live-gap");
+    apply(*api.market, quote(0, 0, "AAPL"));
+    apply(*api.market, quote(1, 1, "SPY"));
+    REQUIRE(submit(api, account_id, order("before-gap", "buy", "1")).status == 201);
+    REQUIRE(call(api, "GET", portfolio_path(account_id)).status == 200);
+
+    // Connection lost: the last quotes must not be used.
+    api.market->suspend();
+    stub.set_state(market_data::MarketDataSourceState::Reconnecting);
+    const ApiResponse during = submit(api, account_id, order("during-gap", "buy", "1"));
+    REQUIRE(require_error(during, 503, "market_data_unavailable").at("reason") ==
+            "source_unavailable");
+    REQUIRE(require_error(call(api, "GET", portfolio_path(account_id)), 503, "market_data_unavailable")
+                .at("reason") == "source_unavailable");
+    REQUIRE(recorded_orders(account_id) == 1);
+    const Json reconnecting = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    REQUIRE(reconnecting.at("source").at("state") == "reconnecting");
+    REQUIRE(reconnecting.at("source").at("diagnostic") ==
+            "the connection closed; reconnecting in 1.000 s");
+    REQUIRE(call(api, "GET", "/health").body.at("market_data").at("state") == "accepting");
+
+    // Resubscribed: each instrument needs a quote from the new connection.
+    api.market->resume();
+    stub.set_state(market_data::MarketDataSourceState::Live);
+    REQUIRE((unavailable_reasons(api) ==
+        std::vector<std::string>{"awaiting_fresh_quote", "awaiting_fresh_quote"}));
+    REQUIRE(require_error(
+        submit(api, account_id, order("stale-after-gap", "buy", "1")),
+        503,
+        "market_data_unavailable"
+    ).at("reason") == "awaiting_fresh_quote");
+    apply(*api.market, quote(2, 2, "AAPL"));
+    REQUIRE((unavailable_reasons(api) ==
+        std::vector<std::string>{"available", "awaiting_fresh_quote"}));
+    REQUIRE(submit(api, account_id, order("after-gap", "buy", "1")).status == 201);
+    REQUIRE(call(api, "GET", portfolio_path(account_id)).status == 200);
+    REQUIRE(recorded_orders(account_id) == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -1591,5 +2004,34 @@ int main() {
             "socket server serves the portfolio",
             test_socket_server_serves_the_portfolio,
         },
+        {
+            "market-data resource describes source, stream, and instruments",
+            test_market_data_resource_describes_source_stream_and_instruments,
+        },
+        {"market-data routes are strict", test_market_data_routes_are_strict},
+        {
+            "replay commands follow the source lifecycle",
+            test_replay_commands_follow_the_source_lifecycle,
+        },
+        {
+            "replay commands accept only an empty object",
+            test_replay_commands_accept_only_an_empty_object,
+        },
+        {
+            "replay commands need a replay source",
+            test_replay_commands_need_a_replay_source,
+        },
+        {
+            "event-stream requests are validated",
+            test_event_stream_requests_are_validated,
+        },
+        {
+            "socket server streams change notices",
+            test_socket_server_streams_change_notices,
+        },
+        {"live source is described with its coverage limit",
+         test_live_source_is_described_with_its_coverage_limit},
+        {"live disconnect blocks orders and valuation until fresh quotes",
+         test_live_disconnect_blocks_orders_and_valuation_until_fresh_quotes},
     });
 }

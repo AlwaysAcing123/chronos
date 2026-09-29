@@ -37,6 +37,8 @@ export type FailureCategory =
   | 'valuation_failed'
   | 'persistence_unavailable'
   | 'internal_error'
+  | 'invalid_replay_transition'
+  | 'replay_control_unavailable'
   | 'unexpected_response'
   | 'network';
 
@@ -53,6 +55,8 @@ const CATEGORY_BY_CODE: Readonly<Record<string, FailureCategory>> = {
   valuation_failed: 'valuation_failed',
   persistence_unavailable: 'persistence_unavailable',
   internal_error: 'internal_error',
+  invalid_replay_transition: 'invalid_replay_transition',
+  replay_control_unavailable: 'replay_control_unavailable',
 };
 
 export function failureCategory(failure: ApiFailure): FailureCategory {

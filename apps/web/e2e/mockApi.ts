@@ -9,8 +9,11 @@ import {
   fillJson,
   flatAccountJson,
   healthJson,
+  liveSourceJson,
+  marketDataJson,
   partialOrderJson,
   portfolioJson,
+  replaySourceJson,
 } from '../src/test/fixtures';
 
 interface MockAccount {
@@ -24,6 +27,8 @@ export interface MockOptions {
   // Fail the first submission in transit even though it was recorded, as
   // when a response is lost after the commit.
   readonly loseFirstSubmissionResponse?: boolean;
+  // Serve an Alpaca IEX live source instead of a historical replay.
+  readonly liveSource?: boolean;
 }
 
 // The account after the documented 10-share market buy filled 4 at 337 with
@@ -63,11 +68,68 @@ function reply(route: Route, status: number, body: unknown) {
 
 const notFound = errorJson('account_not_found', 'paper account does not exist', { field: 'account_id' });
 
+// Commands the mock replay accepts, and the state each moves to.
+const REPLAY_TRANSITIONS: Readonly<Record<string, { from: string; to: string }>> = {
+  start: { from: 'ready', to: 'running' },
+  pause: { from: 'running', to: 'paused' },
+  resume: { from: 'paused', to: 'running' },
+};
+
 export async function mockChronosApi(page: Page, options: MockOptions = {}) {
   const accounts = new Map<string, MockAccount>();
   let submissions = 0;
+  let replayState = 'ready';
+  let revision = 0;
+  let liveState = 'live';
+  const marketData = () =>
+    options.liveSource === true
+      ? marketDataJson({
+          source: liveSourceJson({
+            state: liveState,
+            diagnostic:
+              liveState === 'reconnecting'
+                ? 'the connection closed: the WebSocket connection closed; reconnecting in 1.000 s'
+                : null,
+          }),
+          revision: String(revision),
+          reasons:
+            liveState === 'live' ? { AAPL: null, SPY: null } : { AAPL: 'source_unavailable', SPY: 'source_unavailable' },
+        })
+      : marketDataJson({ source: replaySourceJson({ state: replayState }), revision: String(revision) });
 
   await page.route('**/health', (route) => reply(route, 200, healthJson()));
+  await page.route('**/api/v1/market-data**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/v1/market-data/events') {
+      // One notice per connection; the browser reconnects after the retry delay.
+      return route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        headers: { 'Cache-Control': 'no-store', 'X-Chronos-Trading-Mode': 'paper' },
+        body: `retry: 3000\n\nevent: market-data\ndata: {"revision":"${String(revision)}"}\n\n`,
+      });
+    }
+    const command = path.split('/').at(-1) ?? '';
+    const transition = REPLAY_TRANSITIONS[command];
+    if (path === '/api/v1/market-data') {
+      return reply(route, 200, { market_data: marketData() });
+    }
+    if (transition === undefined) {
+      return reply(route, 404, errorJson('route_not_found', 'no such API route'));
+    }
+    if (transition.from !== replayState) {
+      return reply(
+        route,
+        409,
+        errorJson('invalid_replay_transition', `cannot ${command} a replay that is ${replayState}`, {
+          reason: replayState,
+        }),
+      );
+    }
+    replayState = transition.to;
+    revision += 1;
+    return reply(route, 200, { market_data: marketData() });
+  });
   await page.route('**/api/v1/accounts**', async (route) => {
     const request = route.request();
     const [accountId, resource, clientOrderId] = new URL(request.url()).pathname.split('/').slice(4);
@@ -142,5 +204,10 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
 
   return {
     submissionCount: () => submissions,
+    // Moves the mock live source, as a dropped or restored feed would.
+    setLiveState: (state: string) => {
+      liveState = state;
+      revision += 1;
+    },
   };
 }

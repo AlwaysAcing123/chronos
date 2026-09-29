@@ -1,12 +1,12 @@
-import type { Health } from '../../api/schemas';
 import { formatLocalClock } from '../../presentation/format';
 import type { Labelled } from '../../presentation/vocabulary';
 import { useHealth } from '../../state/queries';
 import type { RefreshSummary } from '../../state/refreshSummary';
 import { useRefreshSummary } from '../../state/refreshSummary';
 import { useChronosServices } from '../../state/services';
+import type { StreamStatus } from '../../state/streamStatus';
+import { useStreamStatus } from '../../state/streamStatus';
 import { Badge } from '../ui/Badge';
-import { MarketTime } from '../ui/MarketTime';
 import styles from './shell.module.css';
 
 function apiStatus(health: ReturnType<typeof useHealth>): Labelled {
@@ -21,57 +21,47 @@ function apiStatus(health: ReturnType<typeof useHealth>): Labelled {
     : { label: 'Database unavailable', tone: 'negative' };
 }
 
-function marketStatus(health: Health | undefined): Labelled | null {
-  if (health === undefined) {
-    return null;
+// How the page learns about changes: never described as more live than it is.
+function updatesText(stream: StreamStatus, marketMs: number | false): string {
+  switch (stream) {
+    case 'streaming':
+      return 'Streaming changes';
+    case 'connecting':
+      return 'Connecting to change stream';
+    case 'polling':
+      return marketMs === false ? 'Not polling' : `Polling every ${String(marketMs / 1000)} s`;
   }
-  const market = health.market_data;
-  if (market.state === 'interrupted') {
-    return { label: 'Market stream interrupted', tone: 'negative' };
-  }
-  return market.last_ingest_sequence === null
-    ? { label: 'No market data', tone: 'caution' }
-    : { label: 'Market stream accepting', tone: 'info' };
 }
 
 function refreshText({ confirmedAt, failingReads }: RefreshSummary): string {
-  if (confirmedAt !== null) {
-    return ` · last refresh ${formatLocalClock(confirmedAt)}`;
-  }
-  return failingReads > 0 ? ' · refresh failing' : ' · not yet refreshed';
+  const last =
+    confirmedAt !== null
+      ? ` · last refresh ${formatLocalClock(confirmedAt)}`
+      : failingReads > 0
+        ? ' · refresh failing'
+        : ' · not yet refreshed';
+  const failing =
+    failingReads > 0 ? ` · ${String(failingReads)} ${failingReads === 1 ? 'read' : 'reads'} failing` : '';
+  return confirmedAt !== null ? last + failing : last;
 }
 
 export function ConnectionStatus() {
   const health = useHealth();
   const refresh = useRefreshSummary();
+  const stream = useStreamStatus();
   const { refresh: policy } = useChronosServices();
   const api = apiStatus(health);
-  const current = health.status === 'success' ? health.data : undefined;
-  const market = marketStatus(current);
-  const marketTime = current?.market_data.market_time ?? null;
 
   return (
     <div className={styles.status} role="group" aria-label="Server status">
       <span className={styles.statusItem}>
         <Badge tone={api.tone}>{api.label}</Badge>
       </span>
-      {market && (
-        <span className={styles.statusItem}>
-          <Badge tone={market.tone}>{market.label}</Badge>
-          {marketTime && (
-            <span>
-              Market time <MarketTime value={marketTime} /> UTC
-            </span>
-          )}
-        </span>
-      )}
       <span className={styles.refresh}>
         <span className={styles.refreshDot} data-refreshing={String(refresh.refreshing)} aria-hidden="true" />
         <span>
-          {policy.accountMs === false ? 'Not polling' : `Polling every ${String(policy.accountMs / 1000)} s`}
+          {updatesText(stream, policy.marketMs)}
           {refreshText(refresh)}
-          {refresh.failingReads > 0 &&
-            ` · ${String(refresh.failingReads)} ${refresh.failingReads === 1 ? 'read' : 'reads'} failing`}
         </span>
       </span>
     </div>

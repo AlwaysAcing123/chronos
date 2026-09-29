@@ -30,6 +30,12 @@ option(
     OFF
 )
 
+option(
+    CHRONOS_ENABLE_ALPACA_ADAPTER
+    "Build the optional Alpaca IEX live market-data adapter"
+    OFF
+)
+
 if(CHRONOS_ENABLE_PAPER_TRADING_API AND
    NOT CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
     message(
@@ -102,6 +108,7 @@ add_library(chronos_market_replay
     core/src/current_market_view.cpp
     core/src/market_replay.cpp
     core/src/replay_clock.cpp
+    core/src/replay_schedule.cpp
 )
 
 target_include_directories(chronos_market_replay
@@ -125,6 +132,28 @@ target_link_libraries(chronos_market_state
     PUBLIC
         chronos_market_replay
         Threads::Threads
+    PRIVATE chronos_build_options
+)
+
+# Provider-independent market-data sources: the paced replay runner, the
+# source lifecycle, and browser change notifications. Provider adapters plug
+# in through core interfaces, so this library needs none of them.
+add_library(chronos_market_data_sources
+    services/market_data/src/market_data_notifier.cpp
+    services/market_data/src/market_data_source.cpp
+    services/market_data/src/market_state_feed.cpp
+    services/market_data/src/monotonic_clock.cpp
+    services/market_data/src/monotonic_utc_clock.cpp
+    services/market_data/src/paced_replay_source.cpp
+    services/market_data/src/reconnect_backoff.cpp
+)
+
+target_include_directories(chronos_market_data_sources
+    PUBLIC services/market_data/include
+)
+
+target_link_libraries(chronos_market_data_sources
+    PUBLIC chronos_market_state
     PRIVATE chronos_build_options
 )
 
@@ -166,12 +195,12 @@ if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
     )
 endif()
 
-if(CHRONOS_ENABLE_PAPER_TRADING_API)
+if(CHRONOS_ENABLE_PAPER_TRADING_API OR CHRONOS_ENABLE_ALPACA_ADAPTER)
     include(FetchContent)
 
     # These dependency names match the Databento SDK's declarations. The first
     # declaration wins, so a build that also enables the Databento adapter
-    # uses these hash-verified copies. See ADR 0004.
+    # uses these hash-verified copies. See ADR 0004 and ADR 0009.
     FetchContent_Declare(
         json
         URL
@@ -185,12 +214,13 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
     # publishes to every consumer. Translation units compiled with different
     # macros in one binary violate the one-definition rule, so this is the
     # only httplib configuration in the build. The Databento historical client
-    # requires OpenSSL; the API server needs neither TLS nor compression.
-    set(
-        HTTPLIB_REQUIRE_OPENSSL
-        ${CHRONOS_ENABLE_DATABENTO_ADAPTER}
-        CACHE BOOL "" FORCE
-    )
+    # and the Alpaca WebSocket stream require OpenSSL; the API server needs
+    # neither TLS nor compression.
+    if(CHRONOS_ENABLE_DATABENTO_ADAPTER OR CHRONOS_ENABLE_ALPACA_ADAPTER)
+        set(HTTPLIB_REQUIRE_OPENSSL ON CACHE BOOL "" FORCE)
+    else()
+        set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+    endif()
     set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
     set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
     set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
@@ -217,7 +247,33 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
                 INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${dependency_includes}"
         )
     endforeach()
+endif()
 
+if(CHRONOS_ENABLE_ALPACA_ADAPTER)
+    add_library(chronos_alpaca_adapter
+        adapters/alpaca/src/alpaca_credentials.cpp
+        adapters/alpaca/src/alpaca_live_source.cpp
+        adapters/alpaca/src/alpaca_normalizer.cpp
+        adapters/alpaca/src/alpaca_protocol.cpp
+        adapters/alpaca/src/alpaca_subscription.cpp
+        adapters/alpaca/src/alpaca_timestamp.cpp
+        adapters/alpaca/src/alpaca_websocket_transport.cpp
+    )
+
+    target_include_directories(chronos_alpaca_adapter
+        PUBLIC adapters/alpaca/include
+    )
+
+    target_link_libraries(chronos_alpaca_adapter
+        PUBLIC chronos_market_data_sources
+        PRIVATE
+            chronos_build_options
+            httplib::httplib
+            nlohmann_json::nlohmann_json
+    )
+endif()
+
+if(CHRONOS_ENABLE_PAPER_TRADING_API)
     add_library(chronos_paper_trading_service
         services/paper_trading/src/history_cursor.cpp
         services/paper_trading/src/paper_trading_service.cpp
@@ -238,10 +294,13 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
         services/paper_trading/src/paper_trading_http_api.cpp
         services/paper_trading/src/paper_trading_http_contract.cpp
         services/paper_trading/src/paper_trading_http_server.cpp
+        services/paper_trading/src/server_arguments.cpp
     )
 
     target_link_libraries(chronos_paper_trading_http
-        PUBLIC chronos_paper_trading_service
+        PUBLIC
+            chronos_market_data_sources
+            chronos_paper_trading_service
         PRIVATE
             chronos_build_options
             httplib::httplib
@@ -268,6 +327,15 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
             PRIVATE chronos_databento_adapter
         )
     endif()
+
+    if(CHRONOS_ENABLE_ALPACA_ADAPTER)
+        target_compile_definitions(chronos_paper_trading_server
+            PRIVATE CHRONOS_PAPER_TRADING_SERVER_WITH_ALPACA_LIVE
+        )
+        target_link_libraries(chronos_paper_trading_server
+            PRIVATE chronos_alpaca_adapter
+        )
+    endif()
 endif()
 
 if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
@@ -290,6 +358,7 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
 
     add_library(chronos_databento_adapter
         adapters/databento/src/databento_historical_recording_provider.cpp
+        adapters/databento/src/equities_mini_mbp1_event_reader.cpp
         adapters/databento/src/equities_mini_mbp1_file_reader.cpp
         adapters/databento/src/equities_mini_mbp1_normalizer.cpp
         adapters/databento/src/historical_recording_acquisition.cpp
@@ -408,6 +477,36 @@ if(BUILD_TESTING)
         COMMAND chronos_market_state_tests
     )
 
+    add_executable(chronos_replay_schedule_tests
+        tests/replay_schedule_tests.cpp
+    )
+
+    target_link_libraries(chronos_replay_schedule_tests
+        PRIVATE
+            chronos_market_replay
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_replay_schedule_tests
+        COMMAND chronos_replay_schedule_tests
+    )
+
+    add_executable(chronos_market_data_source_tests
+        tests/market_data_source_tests.cpp
+    )
+
+    target_link_libraries(chronos_market_data_source_tests
+        PRIVATE
+            chronos_market_data_sources
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_market_data_source_tests
+        COMMAND chronos_market_data_source_tests
+    )
+
     add_executable(chronos_paper_execution_tests
         tests/paper_execution_tests.cpp
     )
@@ -495,6 +594,21 @@ if(BUILD_TESTING)
     endif()
 
     if(CHRONOS_ENABLE_PAPER_TRADING_API)
+        add_executable(chronos_paper_trading_server_arguments_tests
+            tests/paper_trading_server_arguments_tests.cpp
+        )
+
+        target_link_libraries(chronos_paper_trading_server_arguments_tests
+            PRIVATE
+                chronos_paper_trading_http
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_paper_trading_server_arguments_tests
+            COMMAND chronos_paper_trading_server_arguments_tests
+        )
+
         add_executable(chronos_paper_trading_history_cursor_tests
             tests/paper_trading_history_cursor_tests.cpp
         )
@@ -620,6 +734,56 @@ if(BUILD_TESTING)
         add_test(
             NAME chronos_databento_secret_redaction_tests
             COMMAND chronos_databento_secret_redaction_tests
+        )
+    endif()
+
+    if(CHRONOS_ENABLE_ALPACA_ADAPTER)
+        add_executable(chronos_alpaca_adapter_tests
+            tests/alpaca_adapter_tests.cpp
+        )
+
+        target_link_libraries(chronos_alpaca_adapter_tests
+            PRIVATE
+                chronos_alpaca_adapter
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_alpaca_adapter_tests
+            COMMAND chronos_alpaca_adapter_tests
+        )
+
+        add_executable(chronos_alpaca_live_source_tests
+            tests/alpaca_live_source_tests.cpp
+        )
+
+        target_link_libraries(chronos_alpaca_live_source_tests
+            PRIVATE
+                chronos_alpaca_adapter
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_alpaca_live_source_tests
+            COMMAND chronos_alpaca_live_source_tests
+        )
+
+        # A local WebSocket server exercises the real transport; nothing
+        # leaves the loopback interface.
+        add_executable(chronos_alpaca_websocket_transport_tests
+            tests/alpaca_websocket_transport_tests.cpp
+        )
+
+        target_link_libraries(chronos_alpaca_websocket_transport_tests
+            PRIVATE
+                chronos_alpaca_adapter
+                chronos_build_options
+                httplib::httplib
+        )
+
+        add_test(
+            NAME chronos_alpaca_websocket_transport_tests
+            COMMAND chronos_alpaca_websocket_transport_tests
         )
     endif()
 endif()

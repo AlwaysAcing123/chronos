@@ -55,6 +55,13 @@ public:
         const ValidatedMarketEvent& event
     );
 
+    // Advances replay time without an event. A live feed calls this so that
+    // silence still ages its quotes; replaying a recording never does.
+    // Time may stay equal but never move backward.
+    [[nodiscard]] std::optional<ReplayClockError> advance_time(
+        Timestamp time
+    );
+
     [[nodiscard]] const MarketDataStreamId& stream() const noexcept {
         return stream_validator_.stream();
     }

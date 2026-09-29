@@ -224,6 +224,7 @@ Required:
 - Historical `EQUS.MINI` MBP-1 ingestion for the first top-of-book product slice
 - Historical `XNAS.ITCH` MBP-10 and MBO ingestion for later Nasdaq book reconstruction
 - Live `EQUS.MINI` recording only after historical replay and execution are correct
+- An inexpensive secondary live Level-1 adapter (Alpaca IEX, implemented; IEX-only, not SIP or NBBO) for local paper trading; see `docs/decisions/0009-alpaca-iex-live-adapter.md`
 - Snapshot and incremental book updates
 - Exchange timestamp and local receive timestamp
 - Dataset-aware sequence-gap, duplicate, and out-of-order detection
@@ -1147,7 +1148,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 7. **Complete:** Add a shared manual/model order-intent contract, risk checks, and simple top-of-book execution.
 8. **Complete:** Feed simulated fills into the existing accounting core and verify end-to-end reconciliation.
 9. **Complete:** Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
-10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Read-only portfolio valuation is complete: the durable account is marked at the server's current best bid with exact, reconciled market value, unrealized and total PnL, equity, and return, and refuses to value against missing, interrupted, suspect, or incompatible market data. The first web workspace is complete as a local React and TypeScript client: account creation and selection, market and portfolio views, a manual market/limit IOC order ticket with reconciliation of uncertain submissions, and durable order and fill history, all refreshed by polling. Live updates (WebSocket or server-sent events), authentication, and a real-time market view remain.
+10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Read-only portfolio valuation is complete: the durable account is marked at the server's current best bid with exact, reconciled market value, unrealized and total PnL, equity, and return, and refuses to value against missing, interrupted, suspect, or incompatible market data. The first web workspace is complete as a local React and TypeScript client: account creation and selection, market and portfolio views, a manual market/limit IOC order ticket with reconciliation of uncertain submissions, and durable order and fill history. Paced replay is complete: the server plays a recording by receive time at `1x`, `10x`, `100x`, or `max` while it serves requests, behind a provider-independent market-data source boundary with start, pause, and resume controls, and the workspace refreshes market-dependent views on coalesced Server-Sent Events change notices, falling back to polling. The first live source is complete: an optional Alpaca IEX adapter streams live Level-1 trades and quotes over one WebSocket, with an explicit connect, authenticate, and subscribe lifecycle, bounded reconnection, exact fail-closed normalization, environment-only credentials, and live freshness rules that never serve a quote while the feed is down or before a fresh quote arrives. It is labelled as IEX-only, not SIP or NBBO, and consumes market data only. Authentication remains.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
 
 The repository currently implements type-specific fixed-point price, money,
@@ -1183,9 +1184,16 @@ unusable market data. A local React and TypeScript workspace in `apps/web/`
 creates and opens paper accounts, shows the server's market state and exact
 portfolio valuation, submits manual paper orders through the same API and
 reconciles uncertain submissions by client order ID, and lists durable order
-and fill history. It polls the API; it does not stream. Chronos does not yet
-implement normalized market-event persistence, authentication, live updates,
-model deployment, historical charts, or the Models, Experiments, and Data
+and fill history. The server now plays a recording while it runs, paced by
+receive time against an absolute steady-clock schedule with start, pause, and
+resume, behind a provider-independent market-data source boundary, and the
+workspace refreshes market-dependent views on coalesced Server-Sent Events
+change notices instead of fast polling. An optional Alpaca IEX live adapter
+feeds the same market state from one upstream WebSocket, exactly and fail
+closed, suspending quotes while disconnected and requiring a fresh quote per
+instrument after each reconnection; it is IEX-only market data, never order
+routing, and accounts still trade one instrument each. Chronos does not yet implement
+normalized market-event persistence, authentication, model deployment, historical charts, or the Models, Experiments, and Data
 areas of the web application.
 
 ## 20. Post-submission OCaml learning and translation

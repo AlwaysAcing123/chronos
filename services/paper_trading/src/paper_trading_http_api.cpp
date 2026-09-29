@@ -146,6 +146,7 @@ std::optional<HttpResponse> require_json_body(const HttpRequest& request) {
 
 HttpResponse health(
     PaperTradingService& service,
+    const market_data::MarketDataSource& source,
     const DiagnosticLog& log,
     const HttpRequest& request
 ) {
@@ -155,7 +156,7 @@ HttpResponse health(
     if (auto rejected = require_no_query(request)) {
         return *rejected;
     }
-    HttpResponse response = render_health(service.health());
+    HttpResponse response = render_health(service.health(), source.status());
     if (response.status != 200) {
         log("health check: PostgreSQL is unavailable");
     }
@@ -305,14 +306,126 @@ HttpResponse fills(
     ));
 }
 
+constexpr std::string_view kEventStreamPath = "/api/v1/market-data/events";
+
+std::optional<market_data::ReplayCommand> replay_command(std::string_view name) {
+    for (const auto command : {
+             market_data::ReplayCommand::Start,
+             market_data::ReplayCommand::Pause,
+             market_data::ReplayCommand::Resume,
+         }) {
+        if (market_data::command_name(command) == name) {
+            return command;
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 PaperTradingHttpApi::PaperTradingHttpApi(
     PaperTradingService& service,
+    market_data::MarketDataSource& source,
+    market_data::MarketDataNotifier& notifier,
     DiagnosticLog log
 )
     : service_(service),
+      source_(source),
+      notifier_(notifier),
       log_(std::move(log)) {}
+
+bool PaperTradingHttpApi::is_event_stream_request(const HttpRequest& request) {
+    return request.method == "GET" && request.path == kEventStreamPath;
+}
+
+std::variant<HttpResponse, market_data::MarketDataSubscription>
+PaperTradingHttpApi::open_event_stream(const HttpRequest& request) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    auto subscription = notifier_.subscribe();
+    if (const auto* error =
+            std::get_if<market_data::MarketDataNotifier::SubscribeError>(
+                &subscription
+            )) {
+        return render_event_stream_unavailable(*error);
+    }
+    return std::get<market_data::MarketDataSubscription>(std::move(subscription));
+}
+
+void PaperTradingHttpApi::close_event_streams() { notifier_.close(); }
+
+std::size_t PaperTradingHttpApi::event_stream_capacity() const noexcept {
+    return notifier_.maximum_subscribers();
+}
+
+MarketDataView PaperTradingHttpApi::market_data_view() const {
+    // The revision is read first, so the view is at least as new as it.
+    const std::uint64_t revision = notifier_.revision();
+    return MarketDataView{
+        .source = source_.status(),
+        .market = service_.market_availability(),
+        .revision = revision,
+    };
+}
+
+HttpResponse PaperTradingHttpApi::market_data_route(
+    const HttpRequest& request,
+    const std::vector<std::string_view>& parts
+) {
+    if (parts.size() == 3) {
+        if (auto rejected = require_method(request, "GET")) {
+            return *rejected;
+        }
+        if (auto rejected = require_no_query(request)) {
+            return *rejected;
+        }
+        return render_market_data(market_data_view());
+    }
+    if (parts.size() == 4 && parts[3] == "events") {
+        if (auto rejected = require_method(request, "GET")) {
+            return *rejected;
+        }
+        // Only a streaming transport can serve this route.
+        log_("event stream requested through a non-streaming transport");
+        return render_error(
+            500,
+            "internal_error",
+            "the event stream is not available on this transport"
+        );
+    }
+    const std::optional<market_data::ReplayCommand> command =
+        parts.size() == 5 && parts[3] == "replay"
+        ? replay_command(parts[4])
+        : std::nullopt;
+    if (!command) {
+        return route_not_found();
+    }
+    if (auto rejected = require_method(request, "POST")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    if (auto rejected = require_json_body(request)) {
+        return *rejected;
+    }
+    if (auto malformed = parse_empty_object_request(request.body)) {
+        return render_malformed_request(*malformed);
+    }
+    const market_data::ReplayCommandResult result =
+        source_.control_replay(*command);
+    if (const auto* error = std::get_if<market_data::ReplayCommandError>(&result)) {
+        return render_replay_command_error(
+            *error,
+            source_.status().description.mode
+        );
+    }
+    return render_market_data(market_data_view());
+}
 
 HttpResponse PaperTradingHttpApi::handle(const HttpRequest& request) {
     try {
@@ -344,7 +457,11 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
     }
     const auto& parts = *segments;
     if (parts.size() == 1 && parts[0] == "health") {
-        return health(service_, log_, request);
+        return health(service_, source_, log_, request);
+    }
+    if (parts.size() >= 3 && parts[0] == "api" && parts[1] == "v1" &&
+        parts[2] == "market-data") {
+        return market_data_route(request, parts);
     }
 
     const bool is_accounts_path = parts.size() >= 3 && parts[0] == "api" &&

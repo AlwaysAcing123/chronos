@@ -1,3 +1,4 @@
+#include "chronos/databento/equities_mini_mbp1_event_reader.hpp"
 #include "chronos/databento/equities_mini_mbp1_file_reader.hpp"
 #include "chronos/databento/historical_recording_acquisition.hpp"
 #include "chronos/market_replay.hpp"
@@ -38,6 +39,7 @@ namespace adapter = chronos::databento_adapter;
 namespace db = ::databento;
 
 using adapter::EndOfRecording;
+using adapter::EquitiesMiniMbp1EventReader;
 using adapter::EquitiesMiniMbp1FileError;
 using adapter::EquitiesMiniMbp1FileErrorCode;
 using adapter::EquitiesMiniMbp1FileOpenResult;
@@ -708,6 +710,52 @@ void test_unmapped_instrument_is_a_structured_terminal_error() {
     );
 }
 
+// The provider-independent view streams the same events and ends with the
+// verified checksum, so a replay driver needs no Databento types.
+void test_event_reader_streams_events_and_ends_with_the_checksum() {
+    TemporaryDbnFile file;
+    file.write(valid_metadata(), valid_records());
+    auto opened = EquitiesMiniMbp1EventReader::open(
+        file.path(),
+        MarketDataStreamId("event-reader")
+    );
+    REQUIRE(std::holds_alternative<std::unique_ptr<EquitiesMiniMbp1EventReader>>(opened));
+    auto& reader = *std::get<std::unique_ptr<EquitiesMiniMbp1EventReader>>(opened);
+    std::vector<std::uint64_t> sequences;
+    while (true) {
+        auto next = reader.read_next();
+        if (auto* event = std::get_if<ValidatedMarketEvent>(&next)) {
+            sequences.push_back(chronos::market_event_header(event->value()).ingest_sequence);
+            continue;
+        }
+        const auto* end = std::get_if<chronos::EndOfMarketEvents>(&next);
+        REQUIRE(end != nullptr);
+        REQUIRE(end->source_sha256.has_value());
+        REQUIRE(end->source_sha256->size() == 64);
+        break;
+    }
+    REQUIRE((sequences == std::vector<std::uint64_t>{0, 1, 2}));
+}
+
+void test_event_reader_reports_errors_with_their_record() {
+    TemporaryDbnFile file;
+    db::Metadata metadata = valid_metadata();
+    metadata.mappings.resize(1);
+    file.write(metadata, {mbp1_record(kSpyInstrumentId, 1'000)});
+    auto opened = EquitiesMiniMbp1EventReader::open(file.path(), MarketDataStreamId("unmapped"));
+    auto& reader = *std::get<std::unique_ptr<EquitiesMiniMbp1EventReader>>(opened);
+    const auto next = reader.read_next();
+    const auto* error = std::get_if<chronos::MarketEventReadError>(&next);
+    REQUIRE(error != nullptr);
+    REQUIRE(error->message.starts_with("record 1: "));
+
+    const auto missing = EquitiesMiniMbp1EventReader::open(
+        file.path().parent_path() / "missing.dbn.zst",
+        MarketDataStreamId("missing")
+    );
+    REQUIRE(std::holds_alternative<EquitiesMiniMbp1FileError>(missing));
+}
+
 void test_normalization_error_preserves_nested_detail() {
     TemporaryDbnFile file;
     db::Mbp1Msg invalid = mbp1_record(kAaplInstrumentId, 1'000);
@@ -1065,6 +1113,14 @@ int main() {
         {
             "unmapped instrument",
             test_unmapped_instrument_is_a_structured_terminal_error,
+        },
+        {
+            "event reader streams events and ends with the checksum",
+            test_event_reader_streams_events_and_ends_with_the_checksum,
+        },
+        {
+            "event reader reports errors with their record",
+            test_event_reader_reports_errors_with_their_record,
         },
         {
             "nested normalization error",

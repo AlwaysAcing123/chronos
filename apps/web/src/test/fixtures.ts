@@ -25,6 +25,86 @@ export function healthJson(overrides: Json = {}): Json {
   };
 }
 
+export function marketStreamJson(overrides: Json = {}): Json {
+  return {
+    stream_id: STREAM_ID,
+    state: 'accepting',
+    last_ingest_sequence: '121302',
+    market_time: MARKET_TIME,
+    interruption: null,
+    ...overrides,
+  };
+}
+
+export function replaySourceJson(overrides: Json = {}): Json {
+  return {
+    mode: 'historical_replay',
+    provider: 'Databento',
+    feed: 'EQUS.MINI MBP-1',
+    label: 'Databento EQUS.MINI MBP-1 replay',
+    coverage_notice: null,
+    coverage_label: null,
+    state: 'running',
+    replay_speed: '10x',
+    events_applied: '121303',
+    diagnostic: null,
+    recording_sha256: null,
+    instruments: ['AAPL', 'SPY'],
+    ...overrides,
+  };
+}
+
+export const IEX_COVERAGE_NOTICE =
+  'IEX only: quotes and trades from the Investors Exchange alone. This is not consolidated SIP data, not the NBBO, and not every US exchange.';
+
+export function liveSourceJson(overrides: Json = {}): Json {
+  return {
+    mode: 'live',
+    provider: 'Alpaca',
+    feed: 'IEX',
+    label: 'Alpaca IEX',
+    coverage_notice: IEX_COVERAGE_NOTICE,
+    coverage_label: 'IEX only, not SIP or NBBO',
+    state: 'live',
+    replay_speed: null,
+    events_applied: '42',
+    diagnostic: null,
+    recording_sha256: null,
+    instruments: ['AAPL', 'SPY'],
+    ...overrides,
+  };
+}
+
+export function marketDataJson({
+  source = replaySourceJson(),
+  stream = marketStreamJson(),
+  revision = '7',
+  available = true,
+  reasons,
+}: {
+  source?: Json;
+  stream?: Json;
+  revision?: string;
+  available?: boolean;
+  // Per-instrument unavailability; null means available.
+  reasons?: Readonly<Record<string, string | null>>;
+} = {}): Json {
+  return {
+    trading_mode: 'paper',
+    revision,
+    source,
+    stream,
+    instruments: ['AAPL', 'SPY'].map((instrument) => {
+      const reason = reasons ? (reasons[instrument] ?? null) : available ? null : 'no_top_of_book';
+      return {
+        instrument,
+        execution_quote_available: reason === null,
+        unavailable_reason: reason,
+      };
+    }),
+  };
+}
+
 export function riskLimitsJson(): Json {
   return {
     maximum_order_quantity: '1000',

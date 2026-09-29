@@ -18,7 +18,13 @@ if (root === null) {
 createRoot(root).render(
   <StrictMode>
     <QueryClientProvider client={createQueryClient()}>
-      <ChronosServicesProvider services={{ client: createChronosClient(), refresh: POLLING_REFRESH_POLICY }}>
+      <ChronosServicesProvider
+        services={{
+          client: createChronosClient(),
+          refresh: POLLING_REFRESH_POLICY,
+          openNoticeStream: () => new EventSource('/api/v1/market-data/events'),
+        }}
+      >
         <App />
       </ChronosServicesProvider>
     </QueryClientProvider>

@@ -68,6 +68,14 @@ MarketReplayResult MarketReplay::accept(
     };
 }
 
+std::optional<ReplayClockError> MarketReplay::advance_time(Timestamp time) {
+    auto result = clock_.advance_to(time);
+    if (auto* error = std::get_if<ReplayClockError>(&result)) {
+        return std::move(*error);
+    }
+    return std::nullopt;
+}
+
 void MarketReplay::reset(
     std::uint64_t next_expected_ingest_sequence
 ) noexcept {
