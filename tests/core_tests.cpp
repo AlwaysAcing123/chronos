@@ -233,6 +233,29 @@ void test_fixed_point_multiplication_rounding() {
             money("1000.5"));
 }
 
+// The shared rounded division accepts 128-bit denominators, such as a sum
+// of two quantities, and stays defined at the edges of its range.
+void test_wide_rounded_division_is_exact_at_its_limits() {
+    using chronos::detail::WideInteger;
+    using chronos::detail::rounded_divide;
+    constexpr auto half_away = chronos::RoundingMode::HalfAwayFromZero;
+    const WideInteger large = WideInteger{1} << 126;
+    // Halfway with a denominator above 2^126: doubling the remainder would
+    // overflow, so the comparison must not.
+    REQUIRE(rounded_divide(large + large / 2, large, half_away) == 2);
+    REQUIRE(rounded_divide(-(large + large / 2), large, half_away) == -2);
+    REQUIRE(rounded_divide(large + large / 2 - 1, large, half_away) == 1);
+    // A remainder of 1.25 * 2^126 against 1.5 * 2^126: 0.83 rounds to 1.
+    REQUIRE(rounded_divide(large + large / 4, large + large / 2, half_away) == 1);
+    REQUIRE(rounded_divide(large / 4, large + large / 2, half_away) == 0);
+    REQUIRE(rounded_divide(7, WideInteger{2}, half_away) == 4);
+    REQUIRE(rounded_divide(-7, WideInteger{2}, chronos::RoundingMode::TowardZero) == -3);
+    const WideInteger minimum = -(((WideInteger{1} << 126) - 1) * 2) - 2;
+    REQUIRE_THROWS_AS(rounded_divide(minimum, WideInteger{1}, half_away), std::overflow_error);
+    REQUIRE_THROWS_AS(rounded_divide(large, WideInteger{1}, half_away), std::overflow_error);
+    REQUIRE_THROWS_AS(rounded_divide(1, WideInteger{0}, half_away), std::invalid_argument);
+}
+
 void test_proportions_and_average_price() {
     REQUIRE(chronos::proportional_amount(
                 money("40"), quantity("1"), quantity("3")
@@ -1020,6 +1043,7 @@ void test_provider_independent_market_events_preserve_semantics() {
 int main() {
     return chronos::test::run_tests({
         {"decimal parsing and formatting", test_decimal_parsing_and_formatting},
+        {"wide rounded division is exact at its limits", test_wide_rounded_division_is_exact_at_its_limits},
         {"decimal parser rejects invalid input", test_decimal_parser_rejects_invalid_input},
         {"decimal parser handles int64 boundaries", test_decimal_parser_handles_int64_boundaries},
         {"decimal arithmetic detects overflow", test_decimal_addition_and_subtraction_detect_overflow},

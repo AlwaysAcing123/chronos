@@ -104,6 +104,74 @@ target_link_libraries(chronos_market_data
     PRIVATE chronos_build_options
 )
 
+# Content hashing and the strict JSON used by persisted artifacts. No
+# third-party dependency, so the default build keeps none.
+add_library(chronos_canonical_data
+    core/src/canonical_json.cpp
+    core/src/sha256.cpp
+)
+
+target_include_directories(chronos_canonical_data
+    PUBLIC core/include
+)
+
+target_link_libraries(chronos_canonical_data
+    PRIVATE chronos_build_options
+)
+
+# Provider-independent normalized market datasets. See ADR 0012.
+add_library(chronos_datasets
+    datasets/src/artifact_directory.cpp
+    datasets/src/dataset_catalog.cpp
+    datasets/src/dataset_error.cpp
+    datasets/src/dataset_manifest.cpp
+    datasets/src/dataset_quality.cpp
+    datasets/src/dataset_reader.cpp
+    datasets/src/dataset_writer.cpp
+    datasets/src/json_fields.cpp
+    datasets/src/market_event_codec.cpp
+    datasets/src/ndjson_file.cpp
+)
+
+target_include_directories(chronos_datasets
+    PUBLIC datasets/include
+)
+
+target_link_libraries(chronos_datasets
+    PUBLIC
+        chronos_canonical_data
+        chronos_market_data
+    PRIVATE chronos_build_options
+)
+
+# Point-in-time features computed from validated market events.
+add_library(chronos_features
+    features/src/feature_artifact.cpp
+    features/src/feature_row_codec.cpp
+    features/src/top_of_book_features.cpp
+)
+
+target_include_directories(chronos_features
+    PUBLIC features/include
+)
+
+target_link_libraries(chronos_features
+    PUBLIC
+        chronos_datasets
+        chronos_market_data
+    PRIVATE chronos_build_options
+)
+
+add_executable(chronos_dataset
+    tools/dataset_cli.cpp
+)
+
+target_link_libraries(chronos_dataset
+    PRIVATE
+        chronos_features
+        chronos_build_options
+)
+
 add_library(chronos_market_replay
     core/src/current_market_view.cpp
     core/src/market_replay.cpp
@@ -361,6 +429,7 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
 
     add_library(chronos_databento_adapter
         adapters/databento/src/databento_historical_recording_provider.cpp
+        adapters/databento/src/dataset_conversion.cpp
         adapters/databento/src/equities_mini_mbp1_event_reader.cpp
         adapters/databento/src/equities_mini_mbp1_file_reader.cpp
         adapters/databento/src/equities_mini_mbp1_normalizer.cpp
@@ -375,6 +444,7 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
 
     target_link_libraries(chronos_databento_adapter
         PUBLIC
+            chronos_datasets
             chronos_market_data
             databento::databento
         PRIVATE chronos_build_options
@@ -392,6 +462,16 @@ if(CHRONOS_ENABLE_DATABENTO_ADAPTER)
 
     add_executable(chronos_databento_replay
         tools/databento_replay.cpp
+    )
+
+    add_executable(chronos_databento_normalize
+        tools/databento_normalize.cpp
+    )
+
+    target_link_libraries(chronos_databento_normalize
+        PRIVATE
+            chronos_databento_adapter
+            chronos_build_options
     )
 
     target_link_libraries(chronos_databento_replay
@@ -418,6 +498,71 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_core_tests
         COMMAND chronos_core_tests
+    )
+
+    add_executable(chronos_canonical_data_tests
+        tests/canonical_data_tests.cpp
+    )
+
+    target_link_libraries(chronos_canonical_data_tests
+        PRIVATE
+            chronos_canonical_data
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_canonical_data_tests
+        COMMAND chronos_canonical_data_tests
+    )
+
+    add_executable(chronos_normalized_dataset_tests
+        tests/normalized_dataset_tests.cpp
+    )
+
+    target_link_libraries(chronos_normalized_dataset_tests
+        PRIVATE
+            chronos_datasets
+            chronos_market_data_sources
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_normalized_dataset_tests
+        COMMAND chronos_normalized_dataset_tests
+    )
+
+    add_executable(chronos_dataset_cli_tests
+        tests/dataset_cli_tests.cpp
+    )
+
+    target_include_directories(chronos_dataset_cli_tests
+        PRIVATE tools
+    )
+
+    target_link_libraries(chronos_dataset_cli_tests
+        PRIVATE
+            chronos_datasets
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_dataset_cli_tests
+        COMMAND chronos_dataset_cli_tests
+    )
+
+    add_executable(chronos_feature_engine_tests
+        tests/feature_engine_tests.cpp
+    )
+
+    target_link_libraries(chronos_feature_engine_tests
+        PRIVATE
+            chronos_features
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_feature_engine_tests
+        COMMAND chronos_feature_engine_tests
     )
 
     add_executable(chronos_market_data_tests
@@ -834,6 +979,22 @@ if(BUILD_TESTING)
         add_test(
             NAME chronos_databento_file_reader_tests
             COMMAND chronos_databento_file_reader_tests
+        )
+
+        add_executable(chronos_databento_dataset_conversion_tests
+            tests/databento_dataset_conversion_tests.cpp
+        )
+
+        target_link_libraries(chronos_databento_dataset_conversion_tests
+            PRIVATE
+                chronos_databento_adapter
+                chronos_market_replay
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_databento_dataset_conversion_tests
+            COMMAND chronos_databento_dataset_conversion_tests
         )
 
         add_executable(chronos_databento_secret_redaction_tests
