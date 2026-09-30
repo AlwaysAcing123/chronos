@@ -147,7 +147,9 @@ arithmetic.
   interacts with other instruments. Immediate-or-cancel keeps every order's
   life inside one transaction, which is what makes the account-wide version
   check sufficient today. The execution state per instrument is where resting
-  quantity would attach.
+  quantity would attach. Resting orders and cancellation were later decided
+  in [ADR 0011](0011-durable-gtc-working-orders.md); replace remains
+  deferred.
 - **Authentication and ownership.** Accounts are identified by ID only on a
   localhost server. Ownership needs a principal on every request and an
   owner on every account, and a manual order's `source.id` should come from

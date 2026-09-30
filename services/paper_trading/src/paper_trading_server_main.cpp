@@ -9,6 +9,7 @@
 #include "chronos/paper_trading/paper_trading_http_server.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
 #include "chronos/paper_trading/server_arguments.hpp"
+#include "chronos/paper_trading/working_order_matcher.hpp"
 
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_DATABENTO_REPLAY)
 #include "chronos/databento/equities_mini_mbp1_event_reader.hpp"
@@ -26,6 +27,7 @@
 #include <pthread.h>
 #include <signal.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -171,7 +173,7 @@ int run(const paper_trading::ServerArguments& arguments) {
 
     // Declared in dependency order, so destruction runs in reverse: the
     // HTTP server stops first, and the source's thread is joined before the
-    // market state and notifier it feeds are destroyed.
+    // matcher, market state, and notifier it feeds are destroyed.
     const market_data::SteadyClock clock;
     chronos::MarketState market_state{
         chronos::MarketDataStreamId(arguments.stream_id),
@@ -180,7 +182,29 @@ int run(const paper_trading::ServerArguments& arguments) {
         clock,
         market_data::MarketDataNotifier::Options{}
     );
-    market_data::MarketStateFeed feed(market_state, notifier);
+    // Working orders are matched on the source's thread with a PostgreSQL
+    // connection of their own, so matching never waits for the API's.
+    // A match waits at most a second for an account another session holds,
+    // then retries, so a held lock cannot stop shutdown.
+    paper_trading::WorkingOrderMatcher matcher(
+        std::make_unique<chronos::PostgresPaperOrderRepository>(
+            database_url,
+            std::chrono::milliseconds(1'000)
+        ),
+        paper_trading::WorkingOrderMatcherOptions{},
+        [&notifier] { notifier.publish_activity(); },
+        log_line
+    );
+    // Applying and matching an event excludes submissions, which hold the
+    // gate from reading their quote until they commit.
+    market_data::MarketEventGate market_gate;
+    market_data::MarketStateFeed feed(
+        market_state,
+        notifier,
+        0,
+        &matcher,
+        &market_gate
+    );
     // The only read of the system clock: a live feed's receive times are
     // this instant plus monotonic elapsed time.
     const market_data::MonotonicUtcClock receive_clock(
@@ -189,6 +213,13 @@ int run(const paper_trading::ServerArguments& arguments) {
     );
     const std::unique_ptr<market_data::MarketDataSource> source =
         make_source(arguments, feed, clock, receive_clock);
+    // Destroyed before the source, whose destructor joins its thread: if
+    // startup fails from here on, a match retrying a lost connection on that
+    // thread is ended first, so the join cannot wait for the database.
+    const struct StopMatchingFirst {
+        paper_trading::WorkingOrderMatcher& matcher;
+        ~StopMatchingFirst() { matcher.stop(); }
+    } stop_matching_first{matcher};
     const market_data::MarketDataSourceStatus status = source->status();
     log_line(
         "market stream " + arguments.stream_id + ": " +
@@ -199,15 +230,28 @@ int run(const paper_trading::ServerArguments& arguments) {
         log_line("market data coverage: " + *status.description.coverage_notice);
     }
 
+    // A request waits at most five seconds for a locked account, then
+    // reports persistence as unavailable rather than holding the API.
     paper_trading::PaperTradingService service(
-        std::make_unique<chronos::PostgresPaperOrderRepository>(database_url),
+        std::make_unique<chronos::PostgresPaperOrderRepository>(
+            database_url,
+            std::chrono::milliseconds(5'000)
+        ),
         market_state,
         paper_trading::PaperTradingServiceConfig{
             .tradeable_instruments = arguments.instruments,
             .account_risk_limits = arguments.risk_limits,
-        }
+        },
+        [&notifier] { notifier.publish_activity(); },
+        &market_gate
     );
-    paper_trading::PaperTradingHttpApi api(service, *source, notifier, log_line);
+    paper_trading::PaperTradingHttpApi api(
+        service,
+        *source,
+        notifier,
+        log_line,
+        &matcher
+    );
     paper_trading::PaperTradingHttpServer server(api, arguments.http, log_line);
     const int port = server.bind();
     log_line(
@@ -230,6 +274,9 @@ int run(const paper_trading::ServerArguments& arguments) {
     // the thread must be joined before it is destroyed.
     pthread_kill(signal_waiter.native_handle(), SIGTERM);
     signal_waiter.join();
+    // A match waiting for PostgreSQL would hold the source's thread, so end
+    // it before joining that thread.
+    matcher.stop();
     source->stop();
     if (listen_failure) {
         std::rethrow_exception(listen_failure);

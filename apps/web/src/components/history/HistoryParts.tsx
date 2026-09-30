@@ -22,20 +22,25 @@ interface HistoryQuery {
   fetchNextPage(): Promise<unknown>;
 }
 
-// Loading, failure, empty, and paging states shared by both history lists.
+// Loading, failure, empty, and paging states shared by every paged list.
+// Histories page newest first into older records; working orders and an
+// order's lifecycle page forward, oldest first.
 export function HistoryView({
   query,
   itemCount,
   noun,
   emptyText,
   children,
+  ordering = 'newest',
 }: {
   readonly query: HistoryQuery;
   readonly itemCount: number;
   readonly noun: string;
   readonly emptyText: string;
   readonly children: ReactNode;
+  readonly ordering?: 'newest' | 'oldest' | 'priority';
 }) {
+  const forward = ordering !== 'newest';
   if (query.status === 'pending') {
     return (
       <div className={styles.skeletonRows} aria-label={`Loading ${noun}`} role="status">
@@ -51,7 +56,8 @@ export function HistoryView({
   return (
     <div className={styles.stack}>
       {query.isRefetchError && (
-        // The journal is append-only, so rows already read remain true.
+        // The journal is append-only, so rows already read remain true; a
+        // working order may have changed since.
         <Alert
           tone="caution"
           title={`Refreshing ${noun} failed`}
@@ -61,28 +67,41 @@ export function HistoryView({
             </Button>
           }
         >
-          Showing the {noun} read before the failure; recorded orders never change.
+          Showing the {noun} read before the failure;{' '}
+          {ordering === 'priority'
+            ? 'working orders may have filled or been cancelled since.'
+            : 'recorded history never changes.'}
         </Alert>
       )}
       {itemCount === 0 ? <p className={styles.empty}>{emptyText}</p> : children}
       {itemCount > 0 && (
         <div className={styles.footer}>
           <span>
-            {itemCount} {noun} loaded · newest first
+            {itemCount} {noun} loaded · {ORDERING_LABEL[ordering]}
           </span>
           {query.hasNextPage ? (
             <Button onClick={() => void query.fetchNextPage()} disabled={query.isFetchingNextPage}>
-              {query.isFetchingNextPage ? 'Loading…' : `Load older ${noun}`}
+              {query.isFetchingNextPage ? 'Loading…' : `Load ${forward ? 'more' : 'older'} ${noun}`}
             </Button>
           ) : (
-            <span>Oldest reached</span>
+            <span>{forward ? 'All loaded' : 'Oldest reached'}</span>
           )}
-          {query.isFetchNextPageError && <span role="status">Loading older {noun} failed. Try again.</span>}
+          {query.isFetchNextPageError && (
+            <span role="status">
+              Loading {forward ? 'more' : 'older'} {noun} failed. Try again.
+            </span>
+          )}
         </div>
       )}
     </div>
   );
 }
+
+const ORDERING_LABEL = {
+  newest: 'newest first',
+  oldest: 'oldest first',
+  priority: 'in priority order',
+} as const;
 
 const ALL_SYMBOLS = '*';
 

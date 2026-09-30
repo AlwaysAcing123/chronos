@@ -68,7 +68,7 @@ describe('portfolio', () => {
     expect(factValue(portfolio, 'Account version')).toBe('2');
     expect(within(portfolio).getByText(/not guaranteed liquidation value/)).toBeInTheDocument();
     expect(rowCells(portfolio, 'Open positions', 'AAPL')).toEqual([
-      'AAPL', '2.5', '337', '842.5', '335.82', '839.55', '-2.95', '-1.77', '0.7',
+      'AAPL', '2.5', '0', '2.5', '337', '842.5', '335.82', '839.55', '-2.95', '-1.77', '0.7',
     ]);
   });
 
@@ -100,7 +100,7 @@ describe('portfolio', () => {
     expect(within(open).getAllByRole('row').slice(1).map((row) => within(row).getAllByRole('cell')[0]?.textContent))
       .toEqual(['AAPL', 'SPY']);
     expect(rowCells(portfolio, 'Open positions', 'SPY')).toEqual([
-      'SPY', '2', '769.78', '1539.56', '769.7', '1539.4', '-0.16', '0', '0.35',
+      'SPY', '2', '0', '2', '769.78', '1539.56', '769.7', '1539.4', '-0.16', '0', '0.35',
     ]);
     expect(rowCells(portfolio, 'Closed positions', 'MSFT')).toEqual([
       'MSFT', '2.5', '0.7', '2026-09-2513:39:59.969574414',
@@ -113,7 +113,8 @@ describe('portfolio', () => {
       portfolio: portfolioJson({ equity: '92233720368.54775807', cash: '92233720368.54775807' }),
     });
     const { portfolio } = await openPortfolio(api);
-    expect(await within(portfolio).findAllByText('92233720368.54775807')).toHaveLength(2);
+    // Equity, cash, and the available cash that nothing reserves.
+    expect(await within(portfolio).findAllByText('92233720368.54775807')).toHaveLength(3);
   });
 
   it('shows unmarkable positions as unavailable, never as zero', async () => {
@@ -138,7 +139,7 @@ describe('portfolio', () => {
       expect(factValue(portfolio, 'Cash')).toBe('99155.03');
     });
     expect(rowCells(portfolio, 'Open positions', 'AAPL')).toEqual([
-      'AAPL', '2.5', '337', '842.5', 'Unavailable', 'Unavailable', 'Unavailable', '-1.77', '0.7',
+      'AAPL', '2.5', '0', '2.5', '337', '842.5', 'Unavailable', 'Unavailable', 'Unavailable', '-1.77', '0.7',
     ]);
     expect(within(portfolio).queryByText('Market value', { selector: 'dt' })).not.toBeInTheDocument();
   });

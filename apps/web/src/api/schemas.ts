@@ -124,12 +124,29 @@ export const MarketStreamSchema = z
   });
 export type MarketStream = z.infer<typeof MarketStreamSchema>;
 
+export const OrderMatchingStateSchema = z.enum(['running', 'retrying', 'stopped']);
+export type OrderMatchingState = z.infer<typeof OrderMatchingStateSchema>;
+
+// The working-order matcher, reported by servers that run one.
+export const OrderMatchingSchema = z.object({
+  state: OrderMatchingStateSchema,
+  observations: UnsignedIntegerSchema,
+  account_matches: UnsignedIntegerSchema,
+  fills: UnsignedIntegerSchema,
+  retries: UnsignedIntegerSchema,
+  failed_account_matches: UnsignedIntegerSchema,
+  total_matching_ns: UnsignedIntegerSchema,
+  longest_matching_ns: UnsignedIntegerSchema,
+});
+export type OrderMatching = z.infer<typeof OrderMatchingSchema>;
+
 export const HealthSchema = z.object({
   status: z.enum(['ok', 'unavailable']),
   trading_mode: PaperTradingMode,
   persistence: z.enum(['available', 'unavailable']),
   tradeable_instruments: z.array(IdentifierSchema).min(1),
   market_data: MarketStreamSchema,
+  order_matching: OrderMatchingSchema.optional(),
 });
 export type Health = z.infer<typeof HealthSchema>;
 
@@ -219,10 +236,13 @@ export const RiskLimitsSchema = z.object({
 export type RiskLimits = z.infer<typeof RiskLimitsSchema>;
 
 // An open position's ledger. Quantity and cost basis are positive, so the
-// average entry price is always defined.
+// average entry price is always defined. Shares held back for working sells
+// are reserved; the server reports what remains available.
 export const OpenPositionSchema = z.object({
   instrument: IdentifierSchema,
   quantity: QuantitySchema,
+  reserved_quantity: QuantitySchema,
+  available_quantity: QuantitySchema,
   open_cost_basis: MoneySchema,
   average_entry_price: PriceSchema,
   gross_realized_pnl: MoneySchema,
@@ -249,6 +269,10 @@ export const AccountSchema = z.object({
   market_stream_id: z.string().min(1).nullable(),
   starting_cash: MoneySchema,
   cash: MoneySchema,
+  // Cash working orders hold back, and the rest, as the server computed them.
+  reserved_cash: MoneySchema,
+  available_cash: MoneySchema,
+  working_order_count: UnsignedIntegerSchema,
   open_cost_basis: MoneySchema,
   gross_realized_pnl: MoneySchema,
   fees_paid: MoneySchema,
@@ -279,6 +303,8 @@ export const PortfolioSchema = z.object({
   mark_policy: z.literal('best_bid'),
   starting_cash: MoneySchema,
   cash: MoneySchema,
+  reserved_cash: MoneySchema,
+  available_cash: MoneySchema,
   open_cost_basis: MoneySchema,
   market_value: MoneySchema,
   unrealized_pnl: MoneySchema,
@@ -292,7 +318,14 @@ export const PortfolioSchema = z.object({
 });
 export type Portfolio = z.infer<typeof PortfolioSchema>;
 
+export const TimeInForceSchema = z.enum(['ioc', 'gtc']);
+export type TimeInForce = z.infer<typeof TimeInForceSchema>;
+
+// Working and partially_filled are the working states: the remainder rests
+// until later quotes fill it or it is cancelled.
 export const OrderStatusSchema = z.enum([
+  'working',
+  'partially_filled',
   'filled',
   'partially_filled_and_cancelled',
   'cancelled',
@@ -301,9 +334,16 @@ export const OrderStatusSchema = z.enum([
 ]);
 export type OrderStatus = z.infer<typeof OrderStatusSchema>;
 
+export const WORKING_STATUSES: readonly OrderStatus[] = ['working', 'partially_filled'];
+
+export function isWorking(status: OrderStatus): boolean {
+  return WORKING_STATUSES.includes(status);
+}
+
 export const CancellationReasonSchema = z.enum([
   'limit_not_marketable',
   'displayed_liquidity_exhausted',
+  'user_requested',
 ]);
 export type CancellationReason = z.infer<typeof CancellationReasonSchema>;
 
@@ -321,11 +361,10 @@ export const OrderFillSchema = z.object({
 });
 export type OrderFill = z.infer<typeof OrderFillSchema>;
 
-const EXECUTED_STATUSES: readonly OrderStatus[] = [
-  'filled',
-  'partially_filled_and_cancelled',
-  'cancelled',
-];
+const UNEXECUTED_STATUSES: readonly OrderStatus[] = ['rejected', 'faulted'];
+
+// Canonical decimals have one spelling for zero.
+const isZero = (value: string) => value === '0';
 
 export const OrderSchema = z
   .object({
@@ -336,45 +375,98 @@ export const OrderSchema = z
     instrument: IdentifierSchema,
     side: SideSchema,
     type: OrderTypeSchema,
+    // The original quantity: filled plus remaining.
     quantity: QuantitySchema,
     limit_price: PriceSchema.nullable(),
-    time_in_force: z.literal('ioc'),
+    time_in_force: TimeInForceSchema,
     submitted_at: TimestampSchema,
     status: OrderStatusSchema,
     filled_quantity: QuantitySchema,
+    remaining_quantity: QuantitySchema,
+    // The same value under its original name.
     unfilled_quantity: QuantitySchema,
+    filled_notional: MoneySchema,
+    fill_count: UnsignedIntegerSchema,
+    fee_charged: z.boolean(),
+    cumulative_fee: MoneySchema,
+    reserved_cash: MoneySchema,
+    reserved_quantity: QuantitySchema,
+    // A working order's durable acceptance priority; opaque to clients.
+    priority: UnsignedIntegerSchema.nullable(),
+    updated_at: TimestampSchema,
     cancellation_reason: CancellationReasonSchema.nullable(),
+    cancel_request_id: IdentifierSchema.nullable(),
+    // The fill booked while the submission was processed.
     fill: OrderFillSchema.nullable(),
     rejection: ErrorBodySchema.nullable(),
     market: MarketObservationSchema,
   })
   .superRefine((order, context) => {
     // The presentation relies on these contract invariants, so a record
-    // that breaks them is refused rather than shown half-explained.
-    const executed = EXECUTED_STATUSES.includes(order.status);
+    // that breaks them is refused rather than shown half-explained. They
+    // compare values; the client computes none.
+    const issue = (message: string, path: string) => {
+      context.addIssue({ code: 'custom', message, path: [path] });
+    };
+    const executed = !UNEXECUTED_STATUSES.includes(order.status);
+    const rests = order.time_in_force === 'gtc';
     if (executed === (order.rejection !== null)) {
-      context.addIssue({
-        code: 'custom',
-        message: 'only rejected and faulted orders carry a rejection',
-        path: ['rejection'],
-      });
+      issue('only rejected and faulted orders carry a rejection', 'rejection');
     }
-    const booksFill = order.status === 'filled' || order.status === 'partially_filled_and_cancelled';
-    if (booksFill !== (order.fill !== null)) {
-      context.addIssue({
-        code: 'custom',
-        message: 'only filled and partially filled orders carry a fill',
-        path: ['fill'],
-      });
+    if (order.unfilled_quantity !== order.remaining_quantity) {
+      issue('unfilled and remaining quantities are one value', 'unfilled_quantity');
+    }
+    if (rests) {
+      if (order.fill !== null && isZero(order.filled_quantity)) {
+        issue('a fill needs a filled quantity', 'fill');
+      }
+    } else {
+      const booksFill = order.status === 'filled' || order.status === 'partially_filled_and_cancelled';
+      if (booksFill !== (order.fill !== null)) {
+        issue('only filled and partially filled orders carry a fill', 'fill');
+      }
+    }
+    if (order.type === 'market' && rests) {
+      issue('a market order is immediate-or-cancel', 'time_in_force');
+    }
+    if (isWorking(order.status) && !rests) {
+      issue('only a good-til-cancelled order works', 'status');
     }
     const hasCancellation =
       order.status === 'cancelled' || order.status === 'partially_filled_and_cancelled';
     if (hasCancellation !== (order.cancellation_reason !== null)) {
-      context.addIssue({
-        code: 'custom',
-        message: 'only cancelled orders carry a cancellation reason',
-        path: ['cancellation_reason'],
-      });
+      issue('only cancelled orders carry a cancellation reason', 'cancellation_reason');
+    }
+    if ((order.cancellation_reason === 'user_requested') !== (order.cancel_request_id !== null)) {
+      issue('a client cancellation names its request', 'cancel_request_id');
+    }
+    // Clients cancel only good-til-cancelled orders, and nothing else
+    // cancels them.
+    if (order.cancellation_reason !== null && (order.cancellation_reason === 'user_requested') !== rests) {
+      issue('only a good-til-cancelled order is cancelled by a client', 'cancellation_reason');
+    }
+    const filledAny = !isZero(order.filled_quantity);
+    if (order.fee_charged !== filledAny || isZero(order.fill_count) === filledAny) {
+      issue('the first fill charges the fee', 'fee_charged');
+    }
+    if (isZero(order.filled_notional) === filledAny) {
+      issue('a filled quantity has a notional', 'filled_notional');
+    }
+    const remainingAny = !isZero(order.remaining_quantity);
+    if (
+      (order.status === 'working' && filledAny) ||
+      (order.status === 'partially_filled' && (!filledAny || !remainingAny)) ||
+      (order.status === 'filled' && remainingAny) ||
+      (order.status === 'partially_filled_and_cancelled' && (!filledAny || !remainingAny)) ||
+      (order.status === 'cancelled' && filledAny)
+    ) {
+      issue('the quantities do not fit the status', 'status');
+    }
+    if (!isWorking(order.status) && (!isZero(order.reserved_cash) || !isZero(order.reserved_quantity))) {
+      issue('only a working order reserves anything', 'reserved_cash');
+    }
+    if ((order.priority !== null) !== (rests && executed)) {
+      issue('exactly an executed good-til-cancelled order has a priority', 'priority');
     }
   });
 export type Order = z.infer<typeof OrderSchema>;
@@ -392,6 +484,8 @@ export const FillRecordSchema = z.object({
   notional: MoneySchema,
   fee: MoneySchema,
   filled_at: TimestampSchema,
+  // Its position among its order's fills; only the first pays the fee.
+  fill_index: UnsignedIntegerSchema,
 });
 export type FillRecord = z.infer<typeof FillRecordSchema>;
 
@@ -407,7 +501,62 @@ export const FillPageSchema = z.object({
 });
 export type FillPage = z.infer<typeof FillPageSchema>;
 
+// Working orders in priority order; every one is still working.
+export const WorkingOrderPageSchema = z.object({
+  orders: z.array(OrderSchema.refine((order) => isWorking(order.status), { message: 'expected a working order' })),
+  next_cursor: z.string().min(1).nullable(),
+});
+export type WorkingOrderPage = z.infer<typeof WorkingOrderPageSchema>;
+
+export const OrderEventTypeSchema = z.enum([
+  'order_submitted',
+  'risk_rejected',
+  'execution_rejected',
+  'order_completed',
+  'fill_applied',
+  'account_state_updated',
+  'processor_faulted',
+  'order_accepted',
+  'order_filled',
+  'order_cancelled',
+]);
+export type OrderEventType = z.infer<typeof OrderEventTypeSchema>;
+
+export const OrderEventSchema = z
+  .object({
+    sequence: UnsignedIntegerSchema,
+    type: OrderEventTypeSchema,
+    occurred_at: TimestampSchema,
+    fill: OrderFillSchema.nullable(),
+  })
+  .refine((event) => (event.type === 'fill_applied') === (event.fill !== null), {
+    message: 'exactly a fill event carries its fill',
+    path: ['fill'],
+  });
+export type OrderEvent = z.infer<typeof OrderEventSchema>;
+
+// One order's lifecycle, oldest first.
+export const OrderEventPageSchema = z.object({
+  events: z.array(OrderEventSchema),
+  next_cursor: z.string().min(1).nullable(),
+});
+export type OrderEventPage = z.infer<typeof OrderEventPageSchema>;
+
 export const AccountEnvelopeSchema = z.object({ account: AccountSchema });
+
+// A cancellation, or a retry of one that already happened.
+export const CancellationSchema = z.object({
+  order: OrderSchema,
+  account: AccountSchema,
+  already_cancelled: z.boolean(),
+});
+export type Cancellation = z.infer<typeof CancellationSchema>;
+
+// An order that has nothing left to cancel, as it is now.
+export const NotCancellableSchema = z.object({
+  error: ErrorBodySchema,
+  order: OrderSchema,
+});
 export const PortfolioEnvelopeSchema = z.object({ portfolio: PortfolioSchema });
 export const OrderEnvelopeSchema = z.object({ order: OrderSchema });
 

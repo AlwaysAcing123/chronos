@@ -19,7 +19,14 @@ import styles from './workspace.module.css';
 // Durable account totals, identical in the account and portfolio resources.
 type Ledger = Pick<
   Account | Portfolio,
-  'status' | 'starting_cash' | 'cash' | 'open_cost_basis' | 'gross_realized_pnl' | 'fees_paid'
+  | 'status'
+  | 'starting_cash'
+  | 'cash'
+  | 'reserved_cash'
+  | 'available_cash'
+  | 'open_cost_basis'
+  | 'gross_realized_pnl'
+  | 'fees_paid'
 >;
 
 function ledgerFacts(ledger: Ledger, version: string): Fact[] {
@@ -28,6 +35,9 @@ function ledgerFacts(ledger: Ledger, version: string): Fact[] {
     { label: 'Status', value: <Badge tone={status.tone}>{status.label}</Badge> },
     { label: 'Starting cash', value: <DecimalText value={ledger.starting_cash} /> },
     { label: 'Cash', value: <DecimalText value={ledger.cash} /> },
+    // Reservations never change cash; they only limit what new orders use.
+    { label: 'Reserved by working orders', value: <DecimalText value={ledger.reserved_cash} /> },
+    { label: 'Available cash', value: <DecimalText value={ledger.available_cash} /> },
     { label: 'Open cost basis', value: <DecimalText value={ledger.open_cost_basis} /> },
     { label: 'Realized PnL', value: <DecimalText value={ledger.gross_realized_pnl} signed /> },
     { label: 'Fees paid', value: <DecimalText value={ledger.fees_paid} /> },
@@ -61,6 +71,8 @@ const MARK_POLICY_NOTE =
 const LEDGER_COLUMNS: readonly Column<OpenPosition>[] = [
   { header: 'Symbol', cell: (position) => <span className={styles.symbol}>{position.instrument}</span> },
   { header: 'Quantity', numeric: true, cell: (position) => <DecimalText value={position.quantity} /> },
+  { header: 'Reserved', numeric: true, cell: (position) => <DecimalText value={position.reserved_quantity} /> },
+  { header: 'Available', numeric: true, cell: (position) => <DecimalText value={position.available_quantity} /> },
   { header: 'Avg entry', numeric: true, cell: (position) => <DecimalText value={position.average_entry_price} /> },
   { header: 'Cost basis', numeric: true, cell: (position) => <DecimalText value={position.open_cost_basis} /> },
 ];

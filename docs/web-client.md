@@ -37,17 +37,30 @@ The API contract it consumes is [paper-trading-api.md](paper-trading-api.md).
   average entry, cost basis, mark (best bid), market value, unrealized and
   realized PnL, and fees; closed positions with what they realized and paid;
   and the account ledger. Every value is the server's string.
-- Submit manual market or limit immediate-or-cancel paper orders for the
-  selected symbol, chosen in the ticket or the watchlist, with an inline
-  review before the final submission. Once an order is under review its
-  symbol, quote reference, and request are fixed, whatever is selected
-  afterwards.
-- Show each recorded outcome (filled, partially filled, cancelled, rejected,
-  faulted) and handle submissions whose outcome is unknown (below).
+- Submit manual market or limit paper orders for the selected symbol,
+  chosen in the ticket or the watchlist, with an inline review before the
+  final submission. A limit order is immediate or cancel (IOC) or good til
+  cancelled (GTC); a market order is always IOC, and the ticket says so
+  instead of offering a choice. The ticket shows the account's available
+  and reserved cash. Once an order is under review its symbol, quote
+  reference, time in force, and request are fixed, whatever is selected
+  afterwards, and the review says whether any remainder will rest.
+- Show each recorded outcome (working, partially filled and working, filled,
+  partially filled, cancelled, rejected, faulted) and handle submissions
+  whose outcome is unknown (below).
+- A **Working orders** panel lists the account's working orders in priority
+  order with limit, quantity, filled, remaining, status, source, and what
+  each reserves (the server's `reserved_cash` and, for a sell, shares). Each
+  row can cancel its remainder, with reconciliation when the outcome is
+  unknown (below), and open the order's lifecycle: its events and fills, in
+  order, read from the server.
+- The portfolio shows reserved and available cash, and each position's
+  reserved and available quantity.
 - List durable order and fill history with keyset "Load older" pages, each
   row showing its symbol, with a per-list symbol filter that asks the server
-  for that symbol's history. Manual and model orders are labelled by source
-  and share one execution path.
+  for that symbol's history. Orders show their time in force, remaining
+  quantity, and current status, and open the same lifecycle view. Manual and
+  model orders are labelled by source and share one execution path.
 - Remember the selected account and symbol across reloads.
 
 On a desktop the portfolio and market panels are stacked beside the order
@@ -73,11 +86,12 @@ apps/web/src/
     queries.ts      TanStack Query hooks, keys, and polling intervals
     marketDataStream.tsx  the change stream that invalidates market reads
     orderTicket.ts  ticket lifecycle and uncertain-order reconciliation
+    orderCancellation.ts  cancel requests and their reconciliation
     accountSelection.ts  the browser-persisted account selection
     instrumentSelection.ts  the browser-persisted selected symbol
   presentation/ one exhaustive mapping from backend vocabulary to text
   components/   presentation only: shell, source, account, workspace, ticket,
-                history
+                orders (working orders, lifecycle), history
 ```
 
 Components never call `fetch` and never see raw JSON. They read resources
@@ -103,7 +117,12 @@ Market-dependent reads follow the server's change stream
 (`GET /api/v1/market-data/events`, Server-Sent Events;
 [market-data-sources.md](market-data-sources.md#browser-notifications)). A
 notice carries no market data; `MarketDataStreamProvider` invalidates the
-market-data and portfolio queries, which refetch their typed resources. In-flight
+market-data and portfolio queries, which refetch their typed resources. When
+a notice's `activity_revision` differs from the last one seen, some account
+changed without this page asking, typically a working order filling, and
+every account query (account, working orders, order and fill history,
+lifecycles) is invalidated too. Market notices alone never refetch account
+history, so a busy replay does not become a request storm. In-flight
 reads are not cancelled by a notice, so a burst of notices cannot starve them;
 a query that was already fetching when a notice arrived is read once more when
 it settles, so the last change of a burst is never left for the 15-second
@@ -112,7 +131,7 @@ poll.
 | Resource | Stream open | Stream unavailable |
 |---|---|---|
 | `/api/v1/market-data`, portfolio | on each notice, plus every 15 s | every 2 s |
-| Account, newest order and fill pages | every 2 s | every 2 s |
+| Account, working orders, newest order and fill pages, an open lifecycle | on each activity change, plus every 2 s | every 2 s |
 | `/health` | every 5 s | every 5 s |
 
 The header says which applies: "Streaming changes", "Connecting to change
@@ -122,7 +141,8 @@ after 2, 5, 10, then every 30 seconds, while polling continues.
 
 - TanStack Query never overlaps two reads of one resource, pauses polling
   while the tab is hidden, and refreshes when it becomes visible again.
-- A recorded submission invalidates the account's reads immediately.
+- A recorded submission or cancellation invalidates the account's reads
+  immediately.
 - Polling of an account stops when the server reports it does not exist.
 - Loaded history pages are refetched from the newest page, so a new order
   shifts the pages rather than leaving a gap between them.
@@ -190,6 +210,39 @@ The ticket follows the API's reconciliation contract
 
 The ticket never creates a new client order ID for an order whose outcome is
 unknown. "Discard" appears only after a lookup proved the order unrecorded.
+`order_matching_busy` proves nothing was recorded and is transient, so it
+offers "Send again with the same ID" at once.
+
+A GTC order's result shows what rested ("Working: 10 rests at limit 336");
+its later fills appear in the working-orders panel, the blotter, the fills,
+and the portfolio as the server reports them.
+
+## Cancelling a working order
+
+Cancellation follows the same principle as submission: one request ID per
+attempt, never a second cancellation for an unknown outcome
+([paper-trading-api.md](paper-trading-api.md#post-apiv1accountsaccount_idordersclient_order_idcancel)).
+
+1. **Cancel remainder** generates one cancel request ID (`cancel-<time>-<random>`)
+   for the order. It is kept, and reused by every retry, until the outcome
+   is known.
+2. `200` is the cancelled order: the notice says how much filled and how
+   much was cancelled and released. `already_cancelled` means an earlier
+   try of the same request had cancelled it.
+3. `409 order_not_cancellable` carries the order as it is: it filled or was
+   cancelled first, and the notice says which.
+4. A network failure, timeout, `persistence_unavailable`, `internal_error`,
+   or a response outside the contract leaves the outcome unknown. The page
+   then reads the order before anything else is sent: `cancel_request_id`
+   equal to this request means it was cancelled; still working means it was
+   not, and "Send the same cancel again" is safe; terminal otherwise means
+   there is nothing left to cancel. If that read fails too, "Check again"
+   and the same cancel stay available, and nothing is claimed.
+5. Other refusals (such as a missing order) are shown with the server's
+   reason.
+
+The account's reads are invalidated after every outcome, so the panel, the
+portfolio, and the history all show the server's state.
 
 ## Running locally
 
@@ -260,17 +313,23 @@ Before the first browser run: `npx playwright install chromium`.
   boundary (`src/test/fakeApi.ts`) using contract JSON from
   `src/test/fixtures.ts`. They assert what users see and the exact requests
   sent: account creation and opening, exact strings, validation, every order
-  outcome, the reconciliation protocol, history paging, polling, persistence,
-  and keyboard submission.
-- **Browser tests** (`e2e/workspace.spec.ts`) run the production build with a
-  stateful mock answered inside the browser. They cover keyboard trading,
-  reload restoration, a lost submission response, layout without horizontal
-  scrolling, mobile section navigation, reduced motion, and axe-core WCAG 2.1
-  A/AA checks.
+  outcome, the reconciliation protocols for submissions and cancellations,
+  working orders and their lifecycle, history paging, polling and
+  activity-driven refresh, persistence, and keyboard submission.
+- **Browser tests** (`e2e/workspace.spec.ts`, `e2e/working-orders.spec.ts`)
+  run the production build with a stateful mock answered inside the browser.
+  They cover keyboard trading, reload restoration, a lost submission
+  response, a GTC order that rests, fills in part from a later quote, and is
+  cancelled, with every panel checked against hand-computed server values
+  and after a reload; a market order forced to IOC; layout without
+  horizontal scrolling, mobile section navigation, reduced motion, and
+  axe-core WCAG 2.1 A/AA checks.
 - **Live acceptance** (`e2e/live.spec.ts`) is skipped unless
   `CHRONOS_WEB_LIVE_API=1`. With the C++ server running on the recording, it
   trades through the preview proxy, adds a model-attributed order through the
-  API, and checks both in the blotter after a reload:
+  API, and checks both in the blotter after a reload; it also rests a GTC
+  buy far below the market, checks its reservation, and cancels it from the
+  working-orders panel:
 
   ```sh
   CHRONOS_WEB_LIVE_API=1 npm run test:e2e -- live.spec.ts
@@ -294,8 +353,8 @@ database, credentials, or market data; the live spec is skipped there.
   whose quotes were usable: the valuation is all or nothing. The watchlist
   still shows each symbol's current quote.
 - Manual orders use the fixed source ID `web-ticket`.
-- No resting orders, cancel/replace, price chart, valuation history, models,
-  or experiments.
+- Working orders can be cancelled but not replaced or amended. No price
+  chart, valuation history, models, or experiments.
 - Dark theme only; the plan's light theme is future work.
 - A ticket's in-progress state is lost on reload or account switch; the
   blotter shows whatever was recorded.

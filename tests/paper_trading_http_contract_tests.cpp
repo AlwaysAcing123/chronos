@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -162,9 +163,13 @@ PaperAccountView view_of(const PaperOrderProcessor& source, std::int64_t version
         .risk_limits = source.risk_limits(),
         .is_healthy = source.is_healthy(),
         .version = version,
+        .reservations = source.reservations(),
+        .working_orders = source.working_orders().size(),
     };
 }
 
+// A submission as the service records it, with the journal identity its
+// commit would assign.
 RecordedPaperOrder record(
     PaperOrderProcessor& source,
     OrderIntent order,
@@ -172,11 +177,19 @@ RecordedPaperOrder record(
     std::int64_t version
 ) {
     auto result = source.submit(order, market);
+    chronos::PaperOrderRecord recorded = chronos::submitted_order_record(
+        version,
+        order,
+        market,
+        result,
+        source.risk_limits().fee_per_fill
+    );
     return RecordedPaperOrder{
         .intent = std::move(order),
         .market = std::move(market),
         .result = std::move(result),
         .account = view_of(source, version),
+        .order = std::move(recorded),
     };
 }
 
@@ -545,8 +558,19 @@ void test_executed_orders_render_exact_strings_and_status_201() {
     REQUIRE(order.at("submitted_at") == "2026-09-25T13:30:00.000000000Z");
     REQUIRE(order.at("status") == "filled");
     REQUIRE(order.at("filled_quantity") == "2.5");
+    REQUIRE(order.at("remaining_quantity") == "0");
     REQUIRE(order.at("unfilled_quantity") == "0");
+    REQUIRE(order.at("filled_notional") == "252.5");
+    REQUIRE(order.at("fill_count") == "1");
+    REQUIRE(order.at("fee_charged") == true);
+    REQUIRE(order.at("cumulative_fee") == "0.01");
+    REQUIRE(order.at("reserved_cash") == "0");
+    REQUIRE(order.at("reserved_quantity") == "0");
+    // Only a good-til-cancelled order has a working priority.
+    REQUIRE(order.at("priority").is_null());
+    REQUIRE(order.at("updated_at") == "2026-09-25T13:30:00.000000000Z");
     REQUIRE(order.at("cancellation_reason").is_null());
+    REQUIRE(order.at("cancel_request_id").is_null());
     REQUIRE(order.at("fill") == Json({
         {"fill_id", "fill:fill:0"},
         {"side", "buy"},
@@ -577,6 +601,9 @@ void test_executed_orders_render_exact_strings_and_status_201() {
     REQUIRE(account.at("status") == "active");
     REQUIRE(account.at("market_stream_id") == chronos::test::kTestStream);
     REQUIRE(account.at("cash") == "747.49");
+    REQUIRE(account.at("reserved_cash") == "0");
+    REQUIRE(account.at("available_cash") == "747.49");
+    REQUIRE(account.at("working_order_count") == "0");
     REQUIRE(account.at("open_cost_basis") == "252.5");
     REQUIRE(account.at("gross_realized_pnl") == "0");
     REQUIRE(account.at("fees_paid") == "0.01");
@@ -584,6 +611,8 @@ void test_executed_orders_render_exact_strings_and_status_201() {
     REQUIRE(account.at("positions") == Json::array({Json({
         {"instrument", "AAPL"},
         {"quantity", "2.5"},
+        {"reserved_quantity", "0"},
+        {"available_quantity", "2.5"},
         {"open_cost_basis", "252.5"},
         {"average_entry_price", "101"},
         {"gross_realized_pnl", "0"},
@@ -692,6 +721,13 @@ void test_recorded_rejections_render_422_with_order_and_account() {
         .accounting_error = std::nullopt,
     };
     faulted.account.is_healthy = false;
+    faulted.order = chronos::submitted_order_record(
+        5,
+        faulted.intent,
+        faulted.market,
+        faulted.result,
+        engine.risk_limits().fee_per_fill
+    );
     const Json fault = require_error_body(
         chronos::paper_trading::render_order_submission(faulted),
         500,
@@ -1016,6 +1052,7 @@ PaperOrderRecord journal_record(
         .intent = recorded.intent,
         .market = recorded.market,
         .outcome = PreTradeRiskRejection{},
+        .state = std::nullopt,
     };
     std::visit(
         [&record](const auto& result) {
@@ -1193,6 +1230,7 @@ void test_fill_history_renders_linkage_and_exact_notional() {
         {"notional", "1"},
         {"fee", "0.00000001"},
         {"filled_at", "2026-09-25T13:30:00.000000007Z"},
+        {"fill_index", "0"},
     }));
 }
 
@@ -1307,6 +1345,8 @@ void test_portfolio_renders_every_field_as_an_exact_string() {
             {"mark_policy", "best_bid"},
             {"starting_cash", "1000"},
             {"cash", "797.99"},
+            {"reserved_cash", "0"},
+            {"available_cash", "797.99"},
             {"open_cost_basis", "202"},
             {"market_value", "198"},
             {"unrealized_pnl", "-4"},
@@ -1318,6 +1358,8 @@ void test_portfolio_renders_every_field_as_an_exact_string() {
             {"positions", Json::array({Json({
                 {"instrument", "AAPL"},
                 {"quantity", "2"},
+                {"reserved_quantity", "0"},
+                {"available_quantity", "2"},
                 {"open_cost_basis", "202"},
                 {"average_entry_price", "101"},
                 {"gross_realized_pnl", "0"},
@@ -1566,10 +1608,220 @@ void test_portfolio_errors_map_to_stable_codes_and_reasons() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Good-til-cancelled orders
+
+void test_cancel_and_forward_queries_parse_strictly() {
+    using chronos::paper_trading::CancelPaperOrderRequest;
+    using chronos::paper_trading::ForwardPageRequest;
+    auto parsed = chronos::paper_trading::parse_cancel_request(
+        "acct", "order-1", R"({"cancel_request_id":"cancel-1"})"
+    );
+    REQUIRE(std::holds_alternative<CancelPaperOrderRequest>(parsed));
+    const auto& request = std::get<CancelPaperOrderRequest>(parsed);
+    REQUIRE(request.account_id == "acct");
+    REQUIRE(request.client_order_id == "order-1");
+    REQUIRE(request.cancel_request_id == "cancel-1");
+    for (const auto& [body, reason, field] : std::vector<std::tuple<std::string, MalformedRequestReason, std::string>>{
+             {"{}", MalformedRequestReason::MissingField, "cancel_request_id"},
+             {R"({"cancel_request_id":7})", MalformedRequestReason::InvalidType, "cancel_request_id"},
+             {R"({"cancel_request_id":"c","note":"x"})", MalformedRequestReason::UnexpectedField, "note"},
+             {R"({"cancel_request_id":"a","cancel_request_id":"b"})", MalformedRequestReason::DuplicateField, "cancel_request_id"},
+             {"null", MalformedRequestReason::InvalidType, ""},
+         }) {
+        auto rejected = chronos::paper_trading::parse_cancel_request("acct", "order-1", body);
+        REQUIRE(std::holds_alternative<MalformedRequest>(rejected));
+        REQUIRE(std::get<MalformedRequest>(rejected).reason == reason);
+        REQUIRE(std::get<MalformedRequest>(rejected).field == field);
+    }
+
+    auto working = chronos::paper_trading::parse_forward_query("limit=5&cursor=abc&instrument=SPY", true);
+    REQUIRE(std::holds_alternative<ForwardPageRequest>(working));
+    REQUIRE(std::get<ForwardPageRequest>(working).limit == 5U);
+    REQUIRE(std::get<ForwardPageRequest>(working).instrument == "SPY");
+    auto per_order = chronos::paper_trading::parse_forward_query("instrument=SPY", false);
+    REQUIRE(std::get<MalformedRequest>(per_order).reason == MalformedRequestReason::UnexpectedField);
+    auto bad_limit = chronos::paper_trading::parse_forward_query("limit=05", false);
+    REQUIRE(std::get<MalformedRequest>(bad_limit).reason == MalformedRequestReason::InvalidLimit);
+    auto repeated = chronos::paper_trading::parse_forward_query("cursor=a&cursor=b", false);
+    REQUIRE(std::get<MalformedRequest>(repeated).reason == MalformedRequestReason::DuplicateField);
+}
+
+// A resting order renders its working state, reservation, and priority;
+// the same order after its cancellation, and every new error, render
+// stable codes.
+void test_working_orders_and_cancellations_render_exactly() {
+    auto engine = processor();
+    OrderIntent resting = intent("rest-1", Side::Buy, "4", 0, "100");
+    resting.time_in_force = TimeInForce::GoodTilCancelled;
+    const RecordedPaperOrder accepted = record(engine, resting, quote(3, 0), 17);
+    const HttpResponse response = chronos::paper_trading::render_order_submission(accepted);
+    REQUIRE(response.status == 201);
+    const Json body = response_json(response);
+    const Json& order = body.at("order");
+    REQUIRE(order.at("status") == "working");
+    REQUIRE(order.at("time_in_force") == "gtc");
+    REQUIRE(order.at("limit_price") == "100");
+    REQUIRE(order.at("quantity") == "4");
+    REQUIRE(order.at("filled_quantity") == "0");
+    REQUIRE(order.at("remaining_quantity") == "4");
+    REQUIRE(order.at("unfilled_quantity") == "4");
+    REQUIRE(order.at("filled_notional") == "0");
+    REQUIRE(order.at("fill_count") == "0");
+    REQUIRE(order.at("fee_charged") == false);
+    REQUIRE(order.at("cumulative_fee") == "0");
+    REQUIRE(order.at("reserved_cash") == "400.01");
+    REQUIRE(order.at("reserved_quantity") == "0");
+    REQUIRE(order.at("priority") == "17");
+    REQUIRE(order.at("updated_at") == "2026-09-25T13:30:00.000000000Z");
+    REQUIRE(order.at("cancel_request_id").is_null());
+    REQUIRE(body.at("account").at("reserved_cash") == "400.01");
+    REQUIRE(body.at("account").at("available_cash") == "599.99");
+    REQUIRE(body.at("account").at("working_order_count") == "1");
+
+    const auto cancelled = engine.cancel("rest-1", Timestamp::from_nanoseconds(kMarketOpenNanoseconds + 5));
+    const auto& cancellation = std::get<chronos::WorkingOrderCancellation>(cancelled);
+    PaperOrderRecord cancelled_record = accepted.order;
+    cancelled_record.state->status = chronos::PaperOrderStatus::Cancelled;
+    cancelled_record.state->reservation = chronos::OrderReservation{};
+    cancelled_record.state->cancellation_reason = chronos::SimulatedCancellationReason::UserRequested;
+    cancelled_record.state->cancel_request_id = "cancel-1";
+    cancelled_record.state->updated_at = cancellation.cancelled_at;
+    const Json rendered = response_json(chronos::paper_trading::render_cancellation(
+        chronos::paper_trading::CancelledPaperOrder{
+            .order = cancelled_record,
+            .account = view_of(engine, 18),
+            .already_cancelled = false,
+        }
+    ));
+    REQUIRE(rendered.at("already_cancelled") == false);
+    REQUIRE(rendered.at("order").at("status") == "cancelled");
+    REQUIRE(rendered.at("order").at("cancellation_reason") == "user_requested");
+    REQUIRE(rendered.at("order").at("cancel_request_id") == "cancel-1");
+    REQUIRE(rendered.at("order").at("updated_at") == "2026-09-25T13:30:00.000000005Z");
+    REQUIRE(rendered.at("account").at("reserved_cash") == "0");
+
+    PaperTradingError not_cancellable{
+        .code = PaperTradingErrorCode::OrderNotCancellable,
+        .field = "client_order_id",
+        .message = "detail",
+    };
+    not_cancellable.order = cancelled_record;
+    const HttpResponse conflict = chronos::paper_trading::render_cancellation(not_cancellable);
+    REQUIRE(conflict.status == 409);
+    const Json conflict_body = response_json(conflict);
+    REQUIRE(conflict_body.at("error").at("code") == "order_not_cancellable");
+    REQUIRE(conflict_body.at("order").at("status") == "cancelled");
+    for (const auto& [code, status, name] : std::vector<std::tuple<PaperTradingErrorCode, int, std::string>>{
+             {PaperTradingErrorCode::DuplicateCancelRequestId, 409, "duplicate_cancel_request_id"},
+             {PaperTradingErrorCode::OrderMatchingBusy, 503, "order_matching_busy"},
+         }) {
+        const HttpResponse error = chronos::paper_trading::render_cancellation(PaperTradingError{
+            .code = code,
+            .field = "",
+            .message = "detail",
+        });
+        REQUIRE(error.status == status);
+        REQUIRE(response_json(error).at("error").at("code") == name);
+    }
+}
+
+void test_order_events_render_their_fills() {
+    const chronos::Fill fill{
+        .fill_id = "rest-1:fill:1",
+        .instrument = InstrumentId("AAPL"),
+        .side = Side::Buy,
+        .price = Price::parse("99.5"),
+        .quantity = Quantity::parse("2"),
+        .fee = Money{},
+        .timestamp = Timestamp::from_nanoseconds(kMarketOpenNanoseconds + 9),
+    };
+    const Json body = response_json(chronos::paper_trading::render_order_events(
+        chronos::paper_trading::OrderEventPage{
+            .events = {
+                chronos::PaperOrderEventRecord{
+                    .sequence = 4,
+                    .type = chronos::PaperOrderEventType::FillApplied,
+                    .occurred_at = fill.timestamp,
+                    .fill = fill,
+                },
+                chronos::PaperOrderEventRecord{
+                    .sequence = 5,
+                    .type = chronos::PaperOrderEventType::OrderCancelled,
+                    .occurred_at = fill.timestamp,
+                    .fill = std::nullopt,
+                },
+            },
+            .next_cursor = "cursor-1",
+        }
+    ));
+    REQUIRE(body.at("events")[0] == Json({
+        {"sequence", "4"},
+        {"type", "fill_applied"},
+        {"occurred_at", "2026-09-25T13:30:00.000000009Z"},
+        {"fill", {
+            {"fill_id", "rest-1:fill:1"},
+            {"side", "buy"},
+            {"price", "99.5"},
+            {"quantity", "2"},
+            {"notional", "199"},
+            {"fee", "0"},
+            {"filled_at", "2026-09-25T13:30:00.000000009Z"},
+        }},
+    }));
+    REQUIRE(body.at("events")[1].at("type") == "order_cancelled");
+    REQUIRE(body.at("events")[1].at("fill").is_null());
+    REQUIRE(body.at("next_cursor") == "cursor-1");
+}
+
+void test_change_notices_and_health_report_activity_and_matching() {
+    const auto text = chronos::paper_trading::event_stream_text(
+        chronos::market_data::MarketDataChanged{.revision = 12, .activity_revision = 3}
+    );
+    REQUIRE(text == "event: market-data\ndata: {\"revision\":\"12\",\"activity_revision\":\"3\"}\n\n");
+    const Json health = response_json(chronos::paper_trading::render_health(
+        PaperTradingHealth{
+            .persistence_available = true,
+            .market = MarketStateStatus{
+                .stream = MarketDataStreamId("s"),
+                .last_ingest_sequence = std::nullopt,
+                .market_time = std::nullopt,
+                .interruption = std::nullopt,
+            },
+            .tradeable_instruments = {InstrumentId("AAPL")},
+        },
+        std::nullopt,
+        chronos::paper_trading::WorkingOrderMatcherStatus{
+            .state = chronos::paper_trading::WorkingOrderMatcherState::Retrying,
+            .observations = 9,
+            .account_matches = 4,
+            .fills = 2,
+            .retries = 1,
+            .failed_account_matches = 0,
+            .total_matching_time = std::chrono::nanoseconds(1'500),
+            .longest_matching_time = std::chrono::nanoseconds(700),
+        }
+    ));
+    REQUIRE(health.at("order_matching") == Json({
+        {"state", "retrying"},
+        {"observations", "9"},
+        {"account_matches", "4"},
+        {"fills", "2"},
+        {"retries", "1"},
+        {"failed_account_matches", "0"},
+        {"total_matching_ns", "1500"},
+        {"longest_matching_ns", "700"},
+    }));
+}
+
 }  // namespace
 
 int main() {
     return chronos::test::run_tests({
+        {"cancel and forward queries parse strictly", test_cancel_and_forward_queries_parse_strictly},
+        {"working orders and cancellations render", test_working_orders_and_cancellations_render_exactly},
+        {"order events render their fills", test_order_events_render_their_fills},
+        {"notices and health report activity", test_change_notices_and_health_report_activity_and_matching},
         {
             "create account request parses exact values",
             test_create_account_request_parses_exact_values,

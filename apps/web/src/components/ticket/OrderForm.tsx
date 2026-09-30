@@ -91,10 +91,31 @@ export function OrderForm({
           disabled={disabled}
         />
       )}
-      <div className={styles.fixedTerm}>
-        <span>Time in force</span>
-        <span>Immediate or cancel (IOC)</span>
-      </div>
+      {draft.type === 'limit' ? (
+        <Choice
+          legend="Time in force"
+          name="time_in_force"
+          value={draft.timeInForce}
+          options={[
+            { value: 'ioc', label: 'Immediate or cancel (IOC)' },
+            { value: 'gtc', label: 'Good til cancelled (GTC)' },
+          ]}
+          onChange={(timeInForce) => {
+            onChange({ ...draft, timeInForce });
+          }}
+          disabled={disabled}
+          hint={
+            draft.timeInForce === 'gtc'
+              ? 'Whatever does not fill now rests as a working order until later quotes fill it or you cancel it.'
+              : 'Executes once against the current quote; whatever does not fill is cancelled.'
+          }
+        />
+      ) : (
+        <div className={styles.fixedTerm}>
+          <span>Time in force</span>
+          <span>Immediate or cancel (IOC). A market order cannot rest.</span>
+        </div>
+      )}
       {/* Risk limits are fixed when the account is created, so they can never be stale. The position limit
           applies to each symbol separately; cash is shared by all of them. */}
       <div className={styles.context} role="group" aria-label="Position and account limits">
@@ -102,6 +123,22 @@ export function OrderForm({
           <span className={styles.contextLabel}>Held ({instrument})</span>
           <span className={styles.contextValue}>{held?.quantity ?? 'None'}</span>
         </div>
+        {held !== undefined && held.reserved_quantity !== '0' && (
+          <div className={styles.contextItem}>
+            <span className={styles.contextLabel}>Available to sell ({instrument})</span>
+            <span className={styles.contextValue}>{held.available_quantity}</span>
+          </div>
+        )}
+        <div className={styles.contextItem}>
+          <span className={styles.contextLabel}>Available cash</span>
+          <span className={styles.contextValue}>{account.available_cash}</span>
+        </div>
+        {account.reserved_cash !== '0' && (
+          <div className={styles.contextItem}>
+            <span className={styles.contextLabel}>Reserved by working orders</span>
+            <span className={styles.contextValue}>{account.reserved_cash}</span>
+          </div>
+        )}
         <div className={styles.contextItem}>
           <span className={styles.contextLabel}>Fee per fill</span>
           <span className={styles.contextValue}>{limits.fee_per_fill}</span>

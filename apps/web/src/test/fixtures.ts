@@ -122,9 +122,12 @@ export function riskLimitsJson(): Json {
 
 // The documented AAPL position: 2.5 held at an average of 337.
 export function openPositionJson(overrides: Json = {}): Json {
+  const quantity = typeof overrides.quantity === 'string' ? overrides.quantity : '2.5';
   return {
     instrument: 'AAPL',
     quantity: '2.5',
+    reserved_quantity: '0',
+    available_quantity: quantity,
     open_cost_basis: '842.5',
     average_entry_price: '337',
     gross_realized_pnl: '-1.77',
@@ -153,6 +156,9 @@ export function accountJson(overrides: Json = {}): Json {
     market_stream_id: STREAM_ID,
     starting_cash: '100000',
     cash: '99155.03',
+    reserved_cash: '0',
+    available_cash: typeof overrides.cash === 'string' ? overrides.cash : '99155.03',
+    working_order_count: '0',
     open_cost_basis: '842.5',
     gross_realized_pnl: '-1.77',
     fees_paid: '0.7',
@@ -208,7 +214,7 @@ export function spyMarketJson(overrides: Json = {}): Json {
 // The documented AAPL position marked at its 335.82 bid.
 export function valuedPositionJson(overrides: Json = {}): Json {
   return {
-    ...openPositionJson(),
+    ...openPositionJson(typeof overrides.quantity === 'string' ? { quantity: overrides.quantity } : {}),
     mark_price: '335.82',
     market: marketJson(),
     market_value: '839.55',
@@ -228,6 +234,8 @@ export function portfolioJson(overrides: Json = {}): Json {
     mark_policy: 'best_bid',
     starting_cash: '100000',
     cash: '99155.03',
+    reserved_cash: '0',
+    available_cash: typeof overrides.cash === 'string' ? overrides.cash : '99155.03',
     open_cost_basis: '842.5',
     market_value: '839.55',
     unrealized_pnl: '-2.95',
@@ -278,8 +286,18 @@ export function partialOrderJson(overrides: Json = {}): Json {
     submitted_at: MARKET_TIME,
     status: 'partially_filled_and_cancelled',
     filled_quantity: '4',
+    remaining_quantity: '6',
     unfilled_quantity: '6',
+    filled_notional: '1348',
+    fill_count: '1',
+    fee_charged: true,
+    cumulative_fee: '0.35',
+    reserved_cash: '0',
+    reserved_quantity: '0',
+    priority: null,
+    updated_at: MARKET_TIME,
     cancellation_reason: 'displayed_liquidity_exhausted',
+    cancel_request_id: null,
     fill: {
       fill_id: 'buy-1:fill:0',
       side: 'buy',
@@ -305,7 +323,9 @@ export function filledOrderJson(overrides: Json = {}): Json {
     limit_price: '300',
     status: 'filled',
     filled_quantity: '1.5',
+    remaining_quantity: '0',
     unfilled_quantity: '0',
+    filled_notional: '503.73',
     cancellation_reason: null,
     fill: {
       fill_id: `${clientOrderId}:fill:0`,
@@ -328,7 +348,12 @@ export function cancelledOrderJson(overrides: Json = {}): Json {
     limit_price: '300',
     status: 'cancelled',
     filled_quantity: '0',
+    remaining_quantity: '1',
     unfilled_quantity: '1',
+    filled_notional: '0',
+    fill_count: '0',
+    fee_charged: false,
+    cumulative_fee: '0',
     cancellation_reason: 'limit_not_marketable',
     fill: null,
     ...overrides,
@@ -350,7 +375,12 @@ export function rejectedOrderJson(overrides: Json = {}): Json {
     quantity: '900',
     status: 'rejected',
     filled_quantity: '0',
+    remaining_quantity: '900',
     unfilled_quantity: '900',
+    filled_notional: '0',
+    fill_count: '0',
+    fee_charged: false,
+    cumulative_fee: '0',
     cancellation_reason: null,
     fill: null,
     rejection: riskRejectionJson(),
@@ -363,7 +393,12 @@ export function faultedOrderJson(overrides: Json = {}): Json {
     client_order_id: 'buy-fault',
     status: 'faulted',
     filled_quantity: '0',
+    remaining_quantity: '10',
     unfilled_quantity: '10',
+    filled_notional: '0',
+    fill_count: '0',
+    fee_charged: false,
+    cumulative_fee: '0',
     cancellation_reason: null,
     fill: null,
     rejection: {
@@ -390,6 +425,74 @@ export function fillJson(overrides: Json = {}): Json {
     notional: '1348',
     fee: '0.35',
     filled_at: MARKET_TIME,
+    fill_index: '0',
+    ...overrides,
+  };
+}
+
+// A good-til-cancelled buy of 10 at 336 that rests below the 337 ask: it
+// reserves 336 × 10 = 3360 plus the 0.35 fee until its first fill.
+export function workingOrderJson(overrides: Json = {}): Json {
+  return partialOrderJson({
+    client_order_id: 'gtc-1',
+    type: 'limit',
+    quantity: '10',
+    limit_price: '336',
+    time_in_force: 'gtc',
+    status: 'working',
+    filled_quantity: '0',
+    remaining_quantity: '10',
+    unfilled_quantity: '10',
+    filled_notional: '0',
+    fill_count: '0',
+    fee_charged: false,
+    cumulative_fee: '0',
+    reserved_cash: '3360.35',
+    reserved_quantity: '0',
+    priority: '41',
+    cancellation_reason: null,
+    fill: null,
+    ...overrides,
+  });
+}
+
+// The same order after a later ask of 336 × 4 filled 4 of it: the fee is
+// paid, and the 6 still working reserve 336 × 6 = 2016.
+export function partiallyFilledWorkingOrderJson(overrides: Json = {}): Json {
+  return workingOrderJson({
+    status: 'partially_filled',
+    filled_quantity: '4',
+    remaining_quantity: '6',
+    unfilled_quantity: '6',
+    filled_notional: '1344',
+    fill_count: '1',
+    fee_charged: true,
+    cumulative_fee: '0.35',
+    reserved_cash: '2016',
+    updated_at: '2026-09-25T13:40:00.000000000Z',
+    ...overrides,
+  });
+}
+
+// Its remainder cancelled at the client's request: the fill and fee stand,
+// and nothing stays reserved.
+export function userCancelledOrderJson(overrides: Json = {}): Json {
+  return partiallyFilledWorkingOrderJson({
+    status: 'partially_filled_and_cancelled',
+    reserved_cash: '0',
+    cancellation_reason: 'user_requested',
+    cancel_request_id: 'cancel-1',
+    updated_at: '2026-09-25T13:40:01.000000000Z',
+    ...overrides,
+  });
+}
+
+export function orderEventJson(overrides: Json = {}): Json {
+  return {
+    sequence: '1',
+    type: 'order_submitted',
+    occurred_at: MARKET_TIME,
+    fill: null,
     ...overrides,
   };
 }

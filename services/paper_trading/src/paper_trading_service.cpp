@@ -140,8 +140,23 @@ PaperTradingError persistence_conflict(PaperPersistenceConflict conflict) {
                 "",
                 std::move(conflict.message)
             );
+        case PaperPersistenceConflictCode::DuplicateCancelRequestId:
+            return error(
+                PaperTradingErrorCode::DuplicateCancelRequestId,
+                "cancel_request_id",
+                std::move(conflict.message)
+            );
     }
     throw std::logic_error("unknown paper persistence conflict");
+}
+
+PaperTradingError order_matching_busy() {
+    return error(
+        PaperTradingErrorCode::OrderMatchingBusy,
+        "",
+        "working orders are still being matched against the latest market "
+        "event"
+    );
 }
 
 PaperTradingError order_not_found() {
@@ -218,6 +233,22 @@ std::optional<std::string> next_cursor(
     );
 }
 
+PaperAccountView account_view(
+    const PaperOrderProcessor& processor,
+    std::int64_t version
+) {
+    return PaperAccountView{
+        .account_id = processor.account().account_id(),
+        .state = processor.account().state(),
+        .market_stream = bound_market_stream(processor.executions()),
+        .risk_limits = processor.risk_limits(),
+        .is_healthy = processor.is_healthy(),
+        .version = version,
+        .reservations = processor.reservations(),
+        .working_orders = processor.working_orders().size(),
+    };
+}
+
 PaperAccountView account_view(const PersistentPaperOrderSession& session) {
     return PaperAccountView{
         .account_id = session.account().account_id(),
@@ -226,6 +257,70 @@ PaperAccountView account_view(const PersistentPaperOrderSession& session) {
         .risk_limits = session.risk_limits(),
         .is_healthy = session.is_healthy(),
         .version = session.version(),
+        .reservations = session.reservations(),
+        .working_orders = session.working_orders().size(),
+    };
+}
+
+PaperTradingError order_not_cancellable(PaperOrderRecord order) {
+    PaperTradingError failure = error(
+        PaperTradingErrorCode::OrderNotCancellable,
+        "client_order_id",
+        "the order has no working remainder to cancel"
+    );
+    failure.order = std::move(order);
+    return failure;
+}
+
+PaperTradingError invalid_cursor() {
+    return error(
+        PaperTradingErrorCode::InvalidCursor,
+        "cursor",
+        "cursor was not issued for this history of this account"
+    );
+}
+
+std::optional<PaperTradingError> invalid_page_limit(std::size_t limit) {
+    if (limit != 0 && limit <= kMaximumHistoryPageLimit) {
+        return std::nullopt;
+    }
+    return error(
+        PaperTradingErrorCode::InvalidPageLimit,
+        "limit",
+        "limit must be from 1 to " + std::to_string(kMaximumHistoryPageLimit)
+    );
+}
+
+// Validates a per-order page request and resolves its cursor.
+std::variant<PaperForwardPageRequest, PaperTradingError> order_page_request(
+    std::string_view account_id,
+    std::string_view client_order_id,
+    const ForwardPageRequest& request,
+    OrderCursorKind kind
+) {
+    if (request.instrument) {
+        throw std::invalid_argument("an order's pages have no instrument filter");
+    }
+    const std::size_t limit = request.limit.value_or(kDefaultHistoryPageLimit);
+    if (auto invalid = invalid_page_limit(limit)) {
+        return *invalid;
+    }
+    std::optional<std::int64_t> after;
+    if (request.cursor) {
+        after = decode_order_cursor(
+            *request.cursor,
+            kind,
+            account_id,
+            client_order_id
+        );
+        if (!after) {
+            return invalid_cursor();
+        }
+    }
+    return PaperForwardPageRequest{
+        .limit = limit,
+        .after = after,
+        .instrument = std::nullopt,
     };
 }
 
@@ -267,11 +362,15 @@ bool is_valid_identifier(std::string_view value) noexcept {
 PaperTradingService::PaperTradingService(
     std::unique_ptr<PostgresPaperOrderRepository> repository,
     const MarketState& market_state,
-    PaperTradingServiceConfig config
+    PaperTradingServiceConfig config,
+    ActivityCallback on_activity,
+    market_data::MarketEventGate* gate
 )
     : repository_(std::move(repository)),
       market_state_(market_state),
-      config_(std::move(config)) {
+      config_(std::move(config)),
+      on_activity_(std::move(on_activity)),
+      gate_(gate) {
     if (repository_ == nullptr) {
         throw std::invalid_argument(
             "paper-trading service requires a repository"
@@ -333,6 +432,12 @@ PaperAccountResult PaperTradingService::get_account(
     }
 }
 
+void PaperTradingService::notify_activity() const {
+    if (on_activity_) {
+        on_activity_();
+    }
+}
+
 PaperOrderSubmissionResult PaperTradingService::submit_order(
     const PaperOrderRequest& request
 ) {
@@ -364,13 +469,30 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
         );
     }
 
+    // Submissions wait for the market one at a time, and without the
+    // service lock: a queue of submissions keeps the feed waiting for at
+    // most one of them, and reads and cancellations never wait for the gate.
+    // The whole wait is bounded by one deadline.
+    const auto deadline =
+        std::chrono::steady_clock::now() + config_.order_matching_wait;
+    const std::unique_lock submitting(submission_mutex_, deadline);
+    if (!submitting.owns_lock()) {
+        return order_matching_busy();
+    }
+    // Before the account lock, as the feed takes it: no event is applied or
+    // matched from here until the order is recorded and read back.
+    std::optional<std::shared_lock<market_data::MarketEventGate::Mutex>> market;
+    if (gate_ != nullptr) {
+        market = gate_->hold_market(deadline);
+        if (!market) {
+            return order_matching_busy();
+        }
+    }
     const std::lock_guard lock(mutex_);
     try {
-        auto session = PersistentPaperOrderSession::load(
-            *repository_,
-            request.account_id
-        );
-        if (!session) {
+        std::optional<PaperAccountLock> locked =
+            repository_->lock_account(request.account_id);
+        if (!locked) {
             return account_not_found();
         }
 
@@ -381,6 +503,7 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
             market_state_.execution_quote(instrument);
         if (const auto* unavailable =
                 std::get_if<MarketStateUnavailable>(&quote_result)) {
+            locked->release();
             return market_data_unavailable(*unavailable);
         }
         ExecutionQuote quote =
@@ -398,21 +521,145 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
             .time_in_force = request.time_in_force,
             .submitted_at = quote.market_time,
         };
-        PersistentPaperOrderResult persisted = session->submit(
+        PaperOrderProcessor& processor = locked->processor();
+        // The matcher already offered this quote to every working order
+        // that existed when it was applied, so the new order simply follows
+        // them; it is offered no working order's liquidity twice.
+        const WorkingOrderMatch earlier_orders{
+            .observation = quote.top_of_book,
+            .fills = {},
+            .skipped = {},
+            .fault = std::nullopt,
+        };
+        PaperOrderResult result = processor.submit(intent, quote.top_of_book);
+        CommitPaperOrderResult committed = locked->commit_submission(
+            earlier_orders,
             intent,
-            quote.top_of_book
+            quote.top_of_book,
+            result
         );
-        if (auto* conflict =
-                std::get_if<PaperPersistenceConflict>(&persisted)) {
+        if (auto* conflict = std::get_if<PaperPersistenceConflict>(&committed)) {
             return persistence_conflict(std::move(*conflict));
+        }
+        PaperAccountView account =
+            account_view(processor, std::get<std::int64_t>(committed));
+        notify_activity();
+        // The response describes the order as recorded, read back while the
+        // market is still held, so no fill can come between it and the
+        // account above. If this read fails, the order is still recorded,
+        // and the client reconciles with get_order as after any uncertain
+        // result.
+        auto recorded = repository_->find_order(
+            request.account_id,
+            request.client_order_id
+        );
+        market.reset();
+        if (!std::holds_alternative<PaperOrderRecord>(recorded)) {
+            throw std::runtime_error("a committed order could not be read back");
         }
         return RecordedPaperOrder{
             .intent = std::move(intent),
             .market = std::move(quote.top_of_book),
-            .result = std::get<PersistentPaperOrderReceipt>(
-                std::move(persisted)
-            ).result,
-            .account = account_view(*session),
+            .result = std::move(result),
+            .account = std::move(account),
+            .order = std::get<PaperOrderRecord>(std::move(recorded)),
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+CancelPaperOrderResult PaperTradingService::cancel_order(
+    const CancelPaperOrderRequest& request
+) {
+    for (const auto& [value, field] : {
+             std::pair<std::string_view, std::string_view>{
+                 request.account_id,
+                 "account_id",
+             },
+             {request.client_order_id, "client_order_id"},
+             {request.cancel_request_id, "cancel_request_id"},
+         }) {
+        if (auto invalid = invalid_identifier(value, field)) {
+            return *invalid;
+        }
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        std::optional<PaperAccountLock> locked =
+            repository_->lock_account(request.account_id);
+        if (!locked) {
+            return account_not_found();
+        }
+        PaperOrderProcessor& processor = locked->processor();
+        // A retry of a request that already cancelled the order returns it
+        // unchanged; the same ID cannot cancel a second order.
+        if (const auto owner =
+                locked->order_cancelled_by(request.cancel_request_id)) {
+            if (*owner != request.client_order_id) {
+                locked->release();
+                return error(
+                    PaperTradingErrorCode::DuplicateCancelRequestId,
+                    "cancel_request_id",
+                    "cancel_request_id already cancelled another order of "
+                    "this account"
+                );
+            }
+            std::optional<PaperOrderRecord> order =
+                locked->find_order(request.client_order_id);
+            PaperAccountView account = account_view(processor, locked->version());
+            locked->release();
+            if (!order) {
+                throw std::runtime_error("a cancelled order is not recorded");
+            }
+            return CancelledPaperOrder{
+                .order = std::move(*order),
+                .account = std::move(account),
+                .already_cancelled = true,
+            };
+        }
+        std::optional<PaperOrderRecord> order =
+            locked->find_order(request.client_order_id);
+        if (!order) {
+            locked->release();
+            return order_not_found();
+        }
+        const std::optional<Timestamp> market_time =
+            market_state_.status().market_time;
+        const Timestamp at = market_time
+            ? *market_time
+            : (order->state ? order->state->updated_at
+                            : order->intent.submitted_at);
+        PaperOrderCancelResult cancelled =
+            processor.cancel(request.client_order_id, at);
+        if (std::holds_alternative<PaperOrderCancelError>(cancelled)) {
+            locked->release();
+            return order_not_cancellable(std::move(*order));
+        }
+        CommitPaperOrderResult committed = locked->commit_cancellation(
+            std::get<WorkingOrderCancellation>(cancelled),
+            request.cancel_request_id
+        );
+        if (auto* conflict = std::get_if<PaperPersistenceConflict>(&committed)) {
+            return persistence_conflict(std::move(*conflict));
+        }
+        PaperAccountView account =
+            account_view(processor, std::get<std::int64_t>(committed));
+        notify_activity();
+        auto recorded = repository_->find_order(
+            request.account_id,
+            request.client_order_id
+        );
+        if (!std::holds_alternative<PaperOrderRecord>(recorded)) {
+            throw std::runtime_error(
+                "a cancelled order could not be read back"
+            );
+        }
+        return CancelledPaperOrder{
+            .order = std::get<PaperOrderRecord>(std::move(recorded)),
+            .account = std::move(account),
+            .already_cancelled = false,
         };
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);
@@ -518,6 +765,170 @@ PaperFillHistoryResult PaperTradingService::list_fills(
                 request.instrument,
                 journal.next_before_record_id
             ),
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+WorkingOrderPageResult PaperTradingService::list_working_orders(
+    std::string_view account_id,
+    const ForwardPageRequest& request
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    if (request.instrument) {
+        if (auto invalid = invalid_identifier(*request.instrument, "instrument")) {
+            return *invalid;
+        }
+    }
+    const std::size_t limit = request.limit.value_or(kDefaultHistoryPageLimit);
+    if (auto invalid = invalid_page_limit(limit)) {
+        return *invalid;
+    }
+    const std::optional<std::string_view> instrument = request.instrument
+        ? std::optional<std::string_view>(*request.instrument)
+        : std::nullopt;
+    std::optional<std::int64_t> after;
+    if (request.cursor) {
+        after = decode_history_cursor(
+            *request.cursor,
+            HistoryCursorKind::WorkingOrders,
+            account_id,
+            instrument
+        );
+        if (!after) {
+            return invalid_cursor();
+        }
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto page = repository_->list_working_orders(
+            account_id,
+            PaperForwardPageRequest{
+                .limit = limit,
+                .after = after,
+                .instrument = request.instrument
+                    ? std::optional<InstrumentId>(InstrumentId(*request.instrument))
+                    : std::nullopt,
+            }
+        );
+        if (std::holds_alternative<PaperJournalReadMiss>(page)) {
+            return account_not_found();
+        }
+        auto& orders = std::get<PaperForwardPage<PaperOrderRecord>>(page);
+        return WorkingOrderPage{
+            .orders = std::move(orders.records),
+            .next_cursor = orders.next_after
+                ? std::optional<std::string>(encode_history_cursor(
+                      HistoryCursorKind::WorkingOrders,
+                      account_id,
+                      instrument,
+                      *orders.next_after
+                  ))
+                : std::nullopt,
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+OrderFillPageResult PaperTradingService::list_order_fills(
+    std::string_view account_id,
+    std::string_view client_order_id,
+    const ForwardPageRequest& request
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    if (auto invalid = invalid_identifier(client_order_id, "client_order_id")) {
+        return *invalid;
+    }
+    auto page_request = order_page_request(
+        account_id,
+        client_order_id,
+        request,
+        OrderCursorKind::Fills
+    );
+    if (auto* invalid = std::get_if<PaperTradingError>(&page_request)) {
+        return std::move(*invalid);
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto page = repository_->list_order_fills(
+            account_id,
+            client_order_id,
+            std::get<PaperForwardPageRequest>(page_request)
+        );
+        if (const auto* miss = std::get_if<PaperJournalReadMiss>(&page)) {
+            return *miss == PaperJournalReadMiss::AccountNotFound
+                ? account_not_found()
+                : order_not_found();
+        }
+        auto& fills = std::get<PaperForwardPage<PaperFillRecord>>(page);
+        return OrderFillPage{
+            .fills = std::move(fills.records),
+            .next_cursor = fills.next_after
+                ? std::optional<std::string>(encode_order_cursor(
+                      OrderCursorKind::Fills,
+                      account_id,
+                      client_order_id,
+                      *fills.next_after
+                  ))
+                : std::nullopt,
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return persistence_unavailable(failure);
+    }
+}
+
+OrderEventPageResult PaperTradingService::list_order_events(
+    std::string_view account_id,
+    std::string_view client_order_id,
+    const ForwardPageRequest& request
+) {
+    if (auto invalid = invalid_identifier(account_id, "account_id")) {
+        return *invalid;
+    }
+    if (auto invalid = invalid_identifier(client_order_id, "client_order_id")) {
+        return *invalid;
+    }
+    auto page_request = order_page_request(
+        account_id,
+        client_order_id,
+        request,
+        OrderCursorKind::Events
+    );
+    if (auto* invalid = std::get_if<PaperTradingError>(&page_request)) {
+        return std::move(*invalid);
+    }
+
+    const std::lock_guard lock(mutex_);
+    try {
+        auto page = repository_->list_order_events(
+            account_id,
+            client_order_id,
+            std::get<PaperForwardPageRequest>(page_request)
+        );
+        if (const auto* miss = std::get_if<PaperJournalReadMiss>(&page)) {
+            return *miss == PaperJournalReadMiss::AccountNotFound
+                ? account_not_found()
+                : order_not_found();
+        }
+        auto& events = std::get<PaperForwardPage<PaperOrderEventRecord>>(page);
+        return OrderEventPage{
+            .events = std::move(events.records),
+            .next_cursor = events.next_after
+                ? std::optional<std::string>(encode_order_cursor(
+                      OrderCursorKind::Events,
+                      account_id,
+                      client_order_id,
+                      *events.next_after
+                  ))
+                : std::nullopt,
         };
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);

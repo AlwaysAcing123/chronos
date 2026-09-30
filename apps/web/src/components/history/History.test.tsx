@@ -65,7 +65,7 @@ describe('order blotter', () => {
     expect(cancelled.getByText('Manual')).toBeInTheDocument();
     expect(filled.getByText('Filled')).toBeInTheDocument();
     expect(filled.getByText('335.82')).toBeInTheDocument();
-    expect(partial.getByText('Partially filled')).toBeInTheDocument();
+    expect(partial.getByText('Partially filled, rest cancelled')).toBeInTheDocument();
     expect(partial.getByText('13:39:59.969574414')).toBeInTheDocument();
     expect(within(orders).getByText('Oldest reached')).toBeInTheDocument();
   });

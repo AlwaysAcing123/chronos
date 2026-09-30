@@ -26,9 +26,14 @@ Chronos simulates trading only. It does not place real-money orders.
   totals and the accounting identity checked across every position
 - Shared manual/model paper-order intents with explicit source attribution
 - Structured pre-trade validation, quote-freshness checks, and risk limits
-- Deterministic top-of-book IOC market and limit execution
-- Partial fills, cancellation reasons, account-wide idempotency, and
+- Deterministic top-of-book execution of immediate-or-cancel market and
+  limit orders and of durable good-til-cancelled limit orders, which work
+  across restarts and fill from later quotes in FIFO priority
+- Partial fills, one fee per order, cancellation reasons, idempotent
+  client-requested cancellation, account-wide idempotency, and
   per-account, per-instrument shadow liquidity
+- Server-computed cash and share reservations for working orders, enforced by
+  risk and by commit-time database checks
 - End-to-end order processing that immediately books simulated fills into the
   owned paper account
 - Exact reconciliation from order and fill through cash, position, fees, and
@@ -36,7 +41,8 @@ Chronos simulates trading only. It does not place real-money orders.
 - Optional PostgreSQL persistence with atomic, normalized account, position,
   and execution-state snapshots, commit-time integrity checks, and an
   append-only order, rejection, fill, and portfolio event journal
-- Validated restart recovery, database idempotency, and optimistic concurrency
+- Validated restart recovery, database idempotency, account-row locking with
+  lock timeouts, and optimistic versions as a second defense
 - Reconnection after a lost database connection, reported as a typed
   unavailability error
 - A thread-safe, server-owned market state whose clock timestamps orders, so
@@ -44,8 +50,9 @@ Chronos simulates trading only. It does not place real-money orders.
 - A transport-independent paper-trading application service shared by manual
   and model orders
 - An optional local HTTP API for health, account creation and retrieval,
-  immediate-or-cancel order submission, history, and portfolio valuation, with
-  exact decimal strings and stable machine-readable errors
+  IOC and GTC order submission, working orders, cancellation, per-order
+  fills and lifecycle events, history, and portfolio valuation, with exact
+  decimal strings and stable machine-readable errors
 - Durable order and fill history read from the journal, with stable
   newest-first keyset pagination, an optional per-instrument filter, and
   order lookup for reconciling uncertain submissions
@@ -56,8 +63,9 @@ Chronos simulates trading only. It does not place real-money orders.
 - A local React and TypeScript paper-trading workspace: account creation, a
   watchlist of the configured instruments with the selected symbol's quote,
   portfolio positions and closed ledgers, a manual order ticket with a symbol
-  selector that reconciles uncertain submissions, and durable order and fill
-  history filterable by symbol
+  selector and time in force that reconciles uncertain submissions, working
+  orders with reservations, reconciled cancellation, and each order's
+  lifecycle, and durable order and fill history filterable by symbol
 - Paced historical replay inside the running server: a recording plays by
   receive time at `1x`, `10x`, `100x`, or `max` against an absolute
   steady-clock schedule, with start, pause, and resume controls
@@ -65,8 +73,8 @@ Chronos simulates trading only. It does not place real-money orders.
   vocabulary, and a market-data resource reporting the source, stream, and
   per-instrument quote availability and current quotes
 - Coalesced Server-Sent Events change notices that let the web workspace
-  refresh market-dependent views as the market moves, with polling as the
-  fallback
+  refresh market-dependent views as the market moves, and account views when
+  a working order fills, with polling as the fallback
 - Optional live market data from Alpaca's free IEX stream: one exact,
   fail-closed WebSocket adapter with an explicit connect, authenticate, and
   subscribe lifecycle, reconnection with backoff, and quotes that are never
@@ -236,8 +244,8 @@ limitations.
 
 A local database volume created before a migration existed needs it applied
 once, in order; each file is idempotent. Migration 003 turns single-instrument
-accounts into multi-instrument ones: stop the server and back up the volume
-first, as described in
+accounts into multi-instrument ones, and 004 adds working orders and fills:
+stop the server and back up the volume first, as described in
 [docs/postgresql-persistence.md](docs/postgresql-persistence.md#upgrading-an-existing-volume):
 
 ```sh
@@ -245,6 +253,8 @@ docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
 docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/003_multi_instrument_accounts.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/004_working_orders.sql
 ```
 
 ## Run the web workspace
@@ -344,5 +354,9 @@ Multi-instrument accounts — the scopes of cash, positions, liquidity, and
 timelines, all-or-nothing valuation, and the normalized schema and its
 migration — are recorded in
 [docs/decisions/0010-multi-instrument-accounts.md](docs/decisions/0010-multi-instrument-accounts.md).
+Durable good-til-cancelled working orders — their lifecycle, matching,
+reservations, fees, cancellation, serialization with the market stream, and
+migration 004 — are recorded in
+[docs/decisions/0011-durable-gtc-working-orders.md](docs/decisions/0011-durable-gtc-working-orders.md).
 The record/replay data-job direction is captured in
 [docs/decisions/0003-record-replay-data-jobs.md](docs/decisions/0003-record-replay-data-jobs.md).

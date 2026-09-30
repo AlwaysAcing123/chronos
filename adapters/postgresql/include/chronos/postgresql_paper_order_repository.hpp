@@ -2,6 +2,7 @@
 
 #include "chronos/paper_order_processor.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,8 @@ enum class PaperPersistenceConflictCode {
     AccountNotFound,
     DuplicateClientOrderId,
     VersionConflict,
+    // Another order of the account was already cancelled by this request.
+    DuplicateCancelRequestId,
 };
 
 struct PaperPersistenceConflict {
@@ -84,22 +87,101 @@ using PaperOrderRecordOutcome = std::variant<
     PaperOrderFaultRecord
 >;
 
+// The current state of an order that reached execution. The journal
+// record keeps how its submission ended; this is where the order is now.
+struct PaperOrderState {
+    PaperOrderStatus status;
+    Quantity filled_quantity;
+    Quantity remaining_quantity;
+    // The sum of the booked notionals of its fills.
+    Money filled_notional;
+    std::uint32_t fill_count{0};
+    // The flat fee its first fill pays, and what its fills have paid.
+    Money order_fee;
+    Money cumulative_fee;
+    // What the order holds back while it works; zero once terminal.
+    OrderReservation reservation;
+    std::optional<SimulatedCancellationReason> cancellation_reason;
+    // The request that cancelled it, for a client cancellation.
+    std::optional<std::string> cancel_request_id;
+    // Market time of its latest change.
+    Timestamp updated_at;
+
+    [[nodiscard]] bool fee_charged() const noexcept {
+        return filled_quantity.raw() > 0;
+    }
+
+    friend bool operator==(const PaperOrderState&, const PaperOrderState&) =
+        default;
+};
+
 struct PaperOrderRecord {
     // Journal identity. Within one account it increases in commit order,
     // because every order record is inserted while the account row is locked.
+    // It is also a working order's priority: lower fills first.
     std::int64_t record_id;
     OrderIntent intent;
     TopOfBookEvent market;
     PaperOrderRecordOutcome outcome;
+    // Present exactly when the submission reached execution.
+    std::optional<PaperOrderState> state;
 };
+
+// The record a submission produces when it commits with `record_id`,
+// before any later fill or cancellation changes the order's state. The
+// repository persists exactly this; transports use it to describe an order
+// they have not read back.
+[[nodiscard]] PaperOrderRecord submitted_order_record(
+    std::int64_t record_id,
+    const OrderIntent& intent,
+    const TopOfBookEvent& market,
+    const PaperOrderResult& result,
+    Money account_fee
+);
 
 // A fill that accounting booked, linked to the order that produced it.
 struct PaperFillRecord {
+    // Fill identity. Within one account it increases in commit order. A fill
+    // recorded before migration 004 has its order's journal record ID.
     std::int64_t record_id;
     std::string account_id;
     std::string client_order_id;
     OrderSource source;
     Fill fill;
+    // Its position among its order's fills, from 0.
+    std::uint32_t fill_index{0};
+    // The observation it executed against.
+    std::uint64_t market_ingest_sequence{0};
+};
+
+// What happened to an order, in the order it happened. Names are persisted
+// and public, like the order vocabulary in paper_order_codes.hpp.
+enum class PaperOrderEventType {
+    OrderSubmitted,
+    RiskRejected,
+    ExecutionRejected,
+    OrderCompleted,
+    FillApplied,
+    AccountStateUpdated,
+    ProcessorFaulted,
+    OrderAccepted,
+    OrderFilled,
+    OrderCancelled,
+};
+
+[[nodiscard]] std::optional<std::string_view> canonical_name(
+    PaperOrderEventType type
+) noexcept;
+
+struct PaperOrderEventRecord {
+    // The event's position among its order's events, from 1.
+    std::int64_t sequence;
+    PaperOrderEventType type;
+    // Market time. An event from before migration 004 has its submission's
+    // time, when every event of that order was written.
+    Timestamp occurred_at;
+    // The fill a FillApplied event booked.
+    std::optional<Fill> fill;
 };
 
 // A newest-first page. `before_record_id` excludes that record and every
@@ -117,6 +199,24 @@ struct PaperJournalPage {
     std::vector<Record> records;
     // Present when older records exist; the next request's before_record_id.
     std::optional<std::int64_t> next_before_record_id;
+};
+
+// An oldest-first page, for sequences read in the order they happened: one
+// order's fills or events, and an account's working orders in priority
+// order. `after` excludes that position and every earlier one, so a chain
+// of pages stays stable while the sequence grows.
+struct PaperForwardPageRequest {
+    std::size_t limit;
+    std::optional<std::int64_t> after;
+    // Working orders only: keep one instrument's.
+    std::optional<InstrumentId> instrument;
+};
+
+template <typename Record>
+struct PaperForwardPage {
+    std::vector<Record> records;
+    // Present when later records exist; the next request's `after`.
+    std::optional<std::int64_t> next_after;
 };
 
 enum class PaperJournalReadMiss {
@@ -139,9 +239,95 @@ using PaperOrderLookupResult = std::variant<
     PaperJournalReadMiss
 >;
 
+using PaperWorkingOrderPageResult = std::variant<
+    PaperForwardPage<PaperOrderRecord>,
+    PaperJournalReadMiss
+>;
+
+using PaperOrderFillPageResult = std::variant<
+    PaperForwardPage<PaperFillRecord>,
+    PaperJournalReadMiss
+>;
+
+using PaperOrderEventPageResult = std::variant<
+    PaperForwardPage<PaperOrderEventRecord>,
+    PaperJournalReadMiss
+>;
+
+class PostgresPaperOrderRepository;
+
+// One account's row lock, held by an open transaction, with the account
+// recovered inside it. Every mutation of an account (a submission, a match
+// of its working orders, a cancellation) runs in one of these, so they are
+// serialized per account by PostgreSQL, across connections and processes,
+// and each sees every change committed before it. The row lock is always
+// the transaction's first lock; the account's other rows are written after
+// it, so two such transactions never wait on each other in a cycle.
+//
+// Obtain one from PostgresPaperOrderRepository::lock_account. It must not
+// outlive the repository, and while it exists the repository must not be
+// used for anything else. Destroying it without committing rolls back.
+class PaperAccountLock final {
+public:
+    ~PaperAccountLock();
+    PaperAccountLock(PaperAccountLock&& other) noexcept;
+    PaperAccountLock& operator=(PaperAccountLock&&) = delete;
+    PaperAccountLock(const PaperAccountLock&) = delete;
+    PaperAccountLock& operator=(const PaperAccountLock&) = delete;
+
+    // The account as recovered under the lock. Operate on it, then commit
+    // what changed with exactly one commit call.
+    [[nodiscard]] PaperOrderProcessor& processor() noexcept;
+    [[nodiscard]] std::int64_t version() const noexcept;
+
+    // Reads in the locked transaction.
+    [[nodiscard]] std::optional<PaperOrderRecord> find_order(
+        std::string_view client_order_id
+    );
+    // The order a cancel request ID already cancelled, if any.
+    [[nodiscard]] std::optional<std::string> order_cancelled_by(
+        std::string_view cancel_request_id
+    );
+
+    // Each writes what the processor changed since the lock was taken and
+    // commits. The match is the working orders' fills on the submission's
+    // observation, which precede the new order. On a conflict nothing is
+    // written; the lock is released either way.
+    [[nodiscard]] CommitPaperOrderResult commit_submission(
+        const WorkingOrderMatch& earlier_orders,
+        const OrderIntent& intent,
+        const TopOfBookEvent& market,
+        const PaperOrderResult& result
+    );
+    [[nodiscard]] CommitPaperOrderResult commit_match(
+        const WorkingOrderMatch& match
+    );
+    [[nodiscard]] CommitPaperOrderResult commit_cancellation(
+        const WorkingOrderCancellation& cancellation,
+        std::string_view cancel_request_id
+    );
+
+    // Ends the transaction without writing.
+    void release();
+
+    // Opaque; defined by the repository.
+    struct State;
+
+private:
+    friend class PostgresPaperOrderRepository;
+    explicit PaperAccountLock(std::unique_ptr<State> state);
+    std::unique_ptr<State> state_;
+};
+
 class PostgresPaperOrderRepository final {
 public:
-    explicit PostgresPaperOrderRepository(std::string connection_string);
+    // With a lock timeout, waiting longer than that for another session's
+    // lock fails the operation with PaperPersistenceUnavailable, which
+    // callers already retry, instead of blocking without bound.
+    explicit PostgresPaperOrderRepository(
+        std::string connection_string,
+        std::optional<std::chrono::milliseconds> lock_timeout = std::nullopt
+    );
     ~PostgresPaperOrderRepository();
 
     PostgresPaperOrderRepository(
@@ -185,12 +371,46 @@ public:
         std::string_view client_order_id
     );
 
+    // The account's working orders, in priority order.
+    [[nodiscard]] PaperWorkingOrderPageResult list_working_orders(
+        std::string_view account_id,
+        const PaperForwardPageRequest& request
+    );
+
+    // One order's fills and lifecycle events, oldest first.
+    [[nodiscard]] PaperOrderFillPageResult list_order_fills(
+        std::string_view account_id,
+        std::string_view client_order_id,
+        const PaperForwardPageRequest& request
+    );
+
+    [[nodiscard]] PaperOrderEventPageResult list_order_events(
+        std::string_view account_id,
+        std::string_view client_order_id,
+        const PaperForwardPageRequest& request
+    );
+
+    // Takes the account's row lock and recovers the account under it;
+    // nullopt when the account does not exist.
+    [[nodiscard]] std::optional<PaperAccountLock> lock_account(
+        std::string_view account_id
+    );
+
+    // The healthy accounts on `observation`'s stream with a working order
+    // that the observation could fill: accepted before it, on its
+    // instrument, and marketable at its opposite best. In account order.
+    // A candidate is only a hint; matching decides under the account lock.
+    [[nodiscard]] std::vector<std::string> accounts_to_match(
+        const TopOfBookEvent& observation
+    );
+
     // Probes the connection, reconnecting once if an earlier operation lost
     // it. Returns false only when PostgreSQL is unavailable.
     [[nodiscard]] bool check_availability();
 
 private:
     friend class PersistentPaperOrderSession;
+    friend class PaperAccountLock;
 
     [[nodiscard]] CreatePaperAccountResult create_account(
         const PaperOrderProcessorRecoveryState& state
@@ -198,10 +418,12 @@ private:
 
     // Writes the account row and only the position and execution rows that
     // differ between `state_before`, the state at `expected_version`, and
-    // `state_after`, together with the journal record and its events.
+    // `state_after`, together with the working orders' fills, the journal
+    // record, and their events, in one transaction.
     [[nodiscard]] CommitPaperOrderResult commit_order(
         std::string_view account_id,
         std::int64_t expected_version,
+        const WorkingOrderMatch& earlier_orders,
         const OrderIntent& intent,
         const TopOfBookEvent& market,
         const PaperOrderResult& result,
@@ -216,6 +438,8 @@ private:
 struct PersistentPaperOrderReceipt {
     PaperOrderResult result;
     std::int64_t account_version;
+    // Earlier working orders filled by the order's observation first.
+    WorkingOrderMatch earlier_orders;
 };
 
 using PersistentPaperOrderResult = std::variant<
@@ -269,6 +493,17 @@ public:
 
     [[nodiscard]] std::int64_t version() const noexcept { return version_; }
 
+    [[nodiscard]] const std::vector<WorkingOrder>& working_orders()
+        const noexcept {
+        return processor_.working_orders();
+    }
+
+    [[nodiscard]] const AccountReservations& reservations() const noexcept {
+        return processor_.reservations();
+    }
+
+    // Offers `market` to the working orders first, at the order's
+    // submission time, then processes the order; both commit together.
     [[nodiscard]] PersistentPaperOrderResult submit(
         const OrderIntent& intent,
         const TopOfBookEvent& market

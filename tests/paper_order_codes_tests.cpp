@@ -12,6 +12,7 @@ namespace {
 
 using chronos::OrderSourceKind;
 using chronos::OrderType;
+using chronos::PaperOrderStatus;
 using chronos::PaperOrderProcessingErrorCode;
 using chronos::PreTradeRiskErrorCode;
 using chronos::Side;
@@ -59,6 +60,7 @@ void test_order_intent_names_are_stable() {
     });
     require_names<TimeInForce>({
         {TimeInForce::ImmediateOrCancel, "ioc"},
+        {TimeInForce::GoodTilCancelled, "gtc"},
     });
 }
 
@@ -70,6 +72,8 @@ void test_execution_outcome_names_are_stable() {
             "partially_filled_and_cancelled",
         },
         {SimulatedExecutionStatus::Cancelled, "cancelled"},
+        {SimulatedExecutionStatus::Working, "working"},
+        {SimulatedExecutionStatus::PartiallyFilled, "partially_filled"},
     });
     require_names<SimulatedCancellationReason>({
         {
@@ -80,7 +84,43 @@ void test_execution_outcome_names_are_stable() {
             SimulatedCancellationReason::DisplayedLiquidityExhausted,
             "displayed_liquidity_exhausted",
         },
+        {SimulatedCancellationReason::UserRequested, "user_requested"},
     });
+}
+
+// An order's status reuses the execution statuses' names, so an executed
+// order's status and its submission's outcome never read differently.
+void test_order_status_names_are_stable() {
+    require_names<PaperOrderStatus>({
+        {PaperOrderStatus::Working, "working"},
+        {PaperOrderStatus::PartiallyFilled, "partially_filled"},
+        {PaperOrderStatus::Filled, "filled"},
+        {
+            PaperOrderStatus::PartiallyFilledAndCancelled,
+            "partially_filled_and_cancelled",
+        },
+        {PaperOrderStatus::Cancelled, "cancelled"},
+        {PaperOrderStatus::Rejected, "rejected"},
+        {PaperOrderStatus::Faulted, "faulted"},
+    });
+    for (const SimulatedExecutionStatus status :
+         chronos::declared_values<SimulatedExecutionStatus>()) {
+        const auto order_status = chronos::from_canonical_name<PaperOrderStatus>(
+            *chronos::canonical_name(status)
+        );
+        REQUIRE(order_status.has_value());
+    }
+    REQUIRE(chronos::is_working(PaperOrderStatus::Working));
+    REQUIRE(chronos::is_working(PaperOrderStatus::PartiallyFilled));
+    for (const PaperOrderStatus status : {
+             PaperOrderStatus::Filled,
+             PaperOrderStatus::PartiallyFilledAndCancelled,
+             PaperOrderStatus::Cancelled,
+             PaperOrderStatus::Rejected,
+             PaperOrderStatus::Faulted,
+         }) {
+        REQUIRE(!chronos::is_working(status));
+    }
 }
 
 void test_rejection_and_fault_names_are_stable() {
@@ -121,6 +161,10 @@ void test_rejection_and_fault_names_are_stable() {
         {Risk::InsufficientPosition, "insufficient_position"},
         {Risk::InsufficientCashForFee, "insufficient_cash_for_fee"},
         {Risk::ArithmeticOverflow, "arithmetic_overflow"},
+        {
+            Risk::MarketOrderRequiresImmediateOrCancel,
+            "market_order_requires_ioc",
+        },
     });
 
     using Execution = SimulatedExecutionErrorCode;
@@ -149,6 +193,7 @@ int main() {
     return chronos::test::run_tests({
         {"order intent names", test_order_intent_names_are_stable},
         {"execution outcome names", test_execution_outcome_names_are_stable},
+        {"order status names", test_order_status_names_are_stable},
         {
             "rejection and fault names",
             test_rejection_and_fault_names_are_stable,

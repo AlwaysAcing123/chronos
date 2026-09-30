@@ -2,11 +2,13 @@ import { useEffect, useRef } from 'react';
 
 import { failureCategory } from '../../api/errors';
 import type { Order } from '../../api/schemas';
+import { isWorking } from '../../api/schemas';
 import {
   CANCELLATION_REASON,
   FAILURE,
   ORDER_STATUS,
   recordedOutcomeLabel,
+  TIME_IN_FORCE,
 } from '../../presentation/vocabulary';
 import type { TicketState, UncertainCause } from '../../state/orderTicket';
 import { Alert, Code } from '../ui/Alert';
@@ -29,12 +31,21 @@ interface OutcomeActions {
   readonly onStartOver: () => void;
 }
 
+// A single fill has one price; several fills are described by quantity only.
+function atPrice(order: Order): string {
+  return order.fill !== null && order.fill_count === '1' ? ` at ${order.fill.price}` : '';
+}
+
 function recordedHeadline(order: Order): string {
   switch (order.status) {
+    case 'working':
+      return `Working: ${order.remaining_quantity} rests at limit ${order.limit_price ?? ''}`;
+    case 'partially_filled':
+      return `Partially filled ${order.filled_quantity} of ${order.quantity}${atPrice(order)}; ${order.remaining_quantity} still working`;
     case 'filled':
-      return `Filled ${order.filled_quantity} at ${order.fill?.price ?? ''}`;
+      return `Filled ${order.filled_quantity}${atPrice(order)}`;
     case 'partially_filled_and_cancelled':
-      return `Partially filled ${order.filled_quantity} of ${order.quantity} at ${order.fill?.price ?? ''}; ${order.unfilled_quantity} cancelled`;
+      return `Partially filled ${order.filled_quantity} of ${order.quantity}${atPrice(order)}; ${order.remaining_quantity} cancelled`;
     case 'cancelled':
       return 'Cancelled: nothing was filled';
     case 'rejected':
@@ -57,8 +68,24 @@ function recordedFacts(order: Order): Fact[] {
       { label: 'Fill ID', value: <span className="mono">{order.fill.fill_id}</span> },
     );
   }
-  if (order.unfilled_quantity !== '0') {
-    facts.push({ label: 'Unfilled quantity', value: order.unfilled_quantity });
+  if (order.remaining_quantity !== '0') {
+    facts.push({
+      label: isWorking(order.status) ? 'Working quantity' : 'Unfilled quantity',
+      value: order.remaining_quantity,
+    });
+  }
+  if (order.time_in_force === 'gtc') {
+    facts.push(
+      { label: 'Time in force', value: TIME_IN_FORCE.gtc.label },
+      { label: 'Filled so far', value: `${order.filled_quantity} in ${order.fill_count} fill(s)` },
+      { label: 'Fee charged', value: order.fee_charged ? order.cumulative_fee : 'Not yet (paid with the first fill)' },
+    );
+  }
+  if (isWorking(order.status)) {
+    facts.push({
+      label: 'Reserved while working',
+      value: order.side === 'buy' ? `${order.reserved_cash} cash` : `${order.reserved_quantity} shares, ${order.reserved_cash} cash`,
+    });
   }
   const { bid, ask, ingest_sequence } = order.market;
   facts.push({
@@ -95,6 +122,12 @@ function RecordedOutcome({ order, learnedFrom }: { readonly order: Order; readon
           </p>
         )}
         {rejection !== null && <p>A recorded order consumes its client order ID; a corrected order gets a new one.</p>}
+        {isWorking(order.status) && (
+          <p>
+            The remainder rests as a working order: later quotes at or better than the limit fill it. Cancel it from
+            Working orders.
+          </p>
+        )}
         {learnedFrom === 'lookup' && (
           <p>The first response was inconclusive, so this outcome was confirmed by looking up the client order ID.</p>
         )}

@@ -14,6 +14,10 @@ namespace chronos::market_data {
 struct MarketDataChanged {
     // The latest revision; every earlier change is included in it.
     std::uint64_t revision;
+    // Counts durable paper-account changes (orders recorded, fills,
+    // cancellations). It changes only when some account did, so a view can
+    // re-read account resources on those notices alone.
+    std::uint64_t activity_revision{0};
 };
 
 struct MarketDataHeartbeat {};
@@ -35,7 +39,12 @@ class MarketDataSubscription;
 // only increments a revision. Each subscriber remembers the last revision it
 // delivered, so there is no queue: changes that arrive while a subscriber
 // is throttled merge into one notice. Every event still reaches the market
-// state; only these notices are coalesced.
+// state; only these notices are coalesced, so nothing that must see every
+// event, such as order matching, may depend on them.
+//
+// publish_activity() also advances the activity revision: a paper account
+// recorded an order, a fill, or a cancellation. It shares the throttle, so
+// a burst of fills is one notice.
 class MarketDataNotifier final {
 public:
     struct Options {
@@ -53,7 +62,10 @@ public:
 
     void publish();
 
+    void publish_activity();
+
     [[nodiscard]] std::uint64_t revision() const;
+    [[nodiscard]] std::uint64_t activity_revision() const;
 
     [[nodiscard]] std::size_t maximum_subscribers() const noexcept {
         return options_.maximum_subscribers;
@@ -82,6 +94,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::uint64_t revision_{0};
+    std::uint64_t activity_revision_{0};
     std::size_t subscribers_{0};
     bool closed_{false};
 };

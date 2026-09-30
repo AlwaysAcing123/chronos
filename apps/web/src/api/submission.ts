@@ -6,7 +6,7 @@ import { sameDecimal } from './decimal';
 import type { ApiFailure, FailureCategory } from './errors';
 import { failureCategory } from './errors';
 import type { HttpResponse } from './http';
-import type { Account, ErrorBody, Order, OrderStatus, OrderType, Side } from './schemas';
+import type { Account, ErrorBody, Order, OrderStatus, OrderType, Side, TimeInForce } from './schemas';
 import { ErrorEnvelopeSchema, RecordedSubmissionSchema } from './schemas';
 
 // Exactly what the ticket sends. Decimals are the user's text, unchanged.
@@ -18,7 +18,8 @@ export interface OrderRequest {
   readonly type: OrderType;
   readonly quantity: string;
   readonly limit_price?: string;
-  readonly time_in_force: 'ioc';
+  // A market order is always immediate-or-cancel.
+  readonly time_in_force: TimeInForce;
 }
 
 export type SubmissionResponse =
@@ -39,6 +40,8 @@ export type SubmissionResponse =
 
 // The status a recorded submission of each outcome returns.
 const RECORDED_STATUS: Readonly<Record<OrderStatus, number>> = {
+  working: 201,
+  partially_filled: 201,
   filled: 201,
   partially_filled_and_cancelled: 201,
   cancelled: 201,
@@ -49,6 +52,7 @@ const RECORDED_STATUS: Readonly<Record<OrderStatus, number>> = {
 const TRANSIENT_CATEGORIES: ReadonlySet<FailureCategory> = new Set([
   'account_version_conflict',
   'market_data_unavailable',
+  'order_matching_busy',
 ]);
 
 const DEFINITELY_UNRECORDED: ReadonlySet<FailureCategory> = new Set([
@@ -56,6 +60,7 @@ const DEFINITELY_UNRECORDED: ReadonlySet<FailureCategory> = new Set([
   'account_not_found',
   'account_version_conflict',
   'market_data_unavailable',
+  'order_matching_busy',
 ]);
 
 export function classifySubmission(response: HttpResponse): SubmissionResponse {
@@ -113,6 +118,7 @@ export function orderMatchesRequest(order: Order, request: OrderRequest): boolea
     order.instrument === request.instrument &&
     order.side === request.side &&
     order.type === request.type &&
+    order.time_in_force === request.time_in_force &&
     sameDecimal(order.quantity, request.quantity) &&
     limitPriceMatches
   );

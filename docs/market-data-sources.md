@@ -10,12 +10,16 @@ the provider.
 ```text
 Databento DBN reader --> PacedReplaySource --+
                                              +--> MarketStateFeed --> MarketState
-Alpaca IEX WebSocket --> AlpacaLiveSource ---+          |                  |
-                                                        v                  v
-                                               MarketDataNotifier   execution, risk,
-                                                        |           valuation, API
-                                                        v
-                                               SSE change notices --> browsers
+Alpaca IEX WebSocket --> AlpacaLiveSource ---+     |    |                  |
+                                                   |    v                  v
+                                                   | MarketEventObserver  execution, risk,
+                                                   | (working-order       valuation, API
+                                                   |  matcher)
+                                                   v
+                                          MarketDataNotifier
+                                                   |
+                                                   v
+                                          SSE change notices --> browsers
 ```
 
 The Alpaca adapter is documented in [alpaca-adapter.md](alpaca-adapter.md).
@@ -28,8 +32,25 @@ The Alpaca adapter is documented in [alpaca-adapter.md](alpaca-adapter.md).
   call from any thread.
 - `MarketStateFeed` applies events for every source identically: it counts
   them exactly (failing, not wrapping, at 2⁶⁴ − 1), applies them to
-  `MarketState`, and publishes a change notice. A rejected event fails the
-  source; it is never skipped.
+  `MarketState`, offers each accepted event to its `MarketEventObserver`,
+  and publishes a change notice. A rejected event fails the source; it is
+  never skipped.
+- `MarketEventObserver` is how the paper-trading service's working-order
+  matcher sees every accepted event, on the source's thread, after the event
+  is applied and before the next one is. The source waits for it, so
+  matching applies backpressure instead of queueing or dropping events. An
+  observer that throws fails the source like a rejected event, with the
+  failure as its diagnostic, so no later event is applied unmatched; the
+  feed suspends the market state before it releases the gate, so the
+  half-observed event's quotes are never traded.
+- `MarketEventGate` orders order submissions against applied events. The
+  feed holds it exclusively from applying an event until its observer
+  returns; a submission holds it shared from reading its quote until it
+  commits. A submission therefore never reads a quote whose event is still
+  being matched, and the next event is matched only after the submission is
+  recorded, so a working order can neither miss that event nor be matched
+  against a quote older than its own. A submission that cannot take it
+  within 2 s is refused as `order_matching_busy`.
 - Provider names appear only as descriptive data in the source description.
   Execution, accounting, valuation, and the web client have no
   provider-specific conditionals.
@@ -112,6 +133,9 @@ one source thread
         |
 one server-owned MarketState
         |
+one working-order matcher (one indexed query per top of book,
+        |                  a transaction per account it fills)
+        |
 coalesced SSE change notices (at most 4/s per browser)
         |
 any number of local browser views
@@ -119,7 +143,8 @@ any number of local browser views
 
 Browsers read only Chronos resources. No browser action, poll, or refetch
 reaches a provider, so provider usage does not grow with the number of open
-views.
+views. Matching costs PostgreSQL time per observation, not provider usage,
+and does not depend on how many views are open.
 
 ### Threads and shutdown
 
@@ -127,8 +152,11 @@ Each source owns one thread. It is started in the constructor, stopped by
 `stop()` (idempotent and safe from several threads), and joined in the
 destructor; no thread is detached. Every wait is a condition-variable wait
 whose predicate includes stop, so shutdown is prompt. The server declares the
-market state, notifier, feed, and source before the service and HTTP server,
-so it stops HTTP first and joins the source before destroying what it feeds.
+market state, notifier, matcher, gate, feed, and source before the service
+and HTTP server, so it stops HTTP first and joins the source before
+destroying what it feeds. It stops the matcher before the source, because a
+matcher retrying a lost database connection holds the source's thread;
+stop ends the retry at once.
 
 `std::jthread` and `std::stop_token` are not used because AppleClang's
 standard library still gates them behind an experimental flag.
@@ -138,10 +166,16 @@ standard library still gates them behind an experimental flag.
 A browser learns about market changes from a Server-Sent Events stream
 (`GET /api/v1/market-data/events`), not by polling fast.
 
-- **No market data.** A notice carries only a revision number. The browser
-  refetches its typed resources (market data and portfolio valuation), so no
-  quote, book, or provider payload is redistributed and no arithmetic moves
-  to the browser.
+- **No market data.** A notice carries only two revision numbers. The
+  browser refetches its typed resources (market data and portfolio
+  valuation), so no quote, book, or provider payload is redistributed and no
+  arithmetic moves to the browser.
+- **Account activity.** `MarketDataNotifier` also keeps an activity
+  revision, which `publish_activity()` increments when an account changes:
+  the matcher calls it after an observation fills a working order or halts
+  an account, and the service after each submission and cancellation. It
+  travels in the same coalesced notice, as `activity_revision`, and the
+  browser refetches account resources only when it changes.
 - **Coalesced, never queued.** `MarketDataNotifier` keeps one revision
   counter. `publish()` increments it and wakes idle subscribers; it never
   blocks the source. Each subscriber remembers the last revision it sent and
@@ -161,8 +195,8 @@ A browser learns about market changes from a Server-Sent Events stream
 - **Fallback.** Without an open stream, market-dependent resources are polled
   every 2 s. While the stream is open they are refetched on each notice, and
   polled only every 15 s as a safety net. Durable account and history
-  resources are always polled every 2 s, because other clients can record
-  orders.
+  resources are refetched when the activity revision changes and are always
+  polled every 2 s, because other clients can record orders.
 
 Every underlying event still reaches `MarketState`; only the browser
 invalidations are coalesced.

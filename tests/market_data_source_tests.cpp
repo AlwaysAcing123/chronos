@@ -1,5 +1,7 @@
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_data_source.hpp"
+#include "chronos/market_data/market_event_gate.hpp"
+#include "chronos/market_data/market_event_observer.hpp"
 #include "chronos/market_data/market_state_feed.hpp"
 #include "chronos/market_data/monotonic_utc_clock.hpp"
 #include "chronos/market_data/paced_replay_source.hpp"
@@ -14,6 +16,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,6 +36,7 @@ using chronos::MarketStateUnavailable;
 using chronos::MarketStateUnavailableCode;
 using chronos::ReplaySpeed;
 using chronos::Timestamp;
+using chronos::TopOfBookEvent;
 using chronos::ValidatedMarketEvent;
 using chronos::market_data::MarketDataChanged;
 using chronos::market_data::MarketDataHeartbeat;
@@ -43,6 +47,8 @@ using chronos::market_data::MarketDataNotifierClosed;
 using chronos::market_data::MarketDataSourceDescription;
 using chronos::market_data::MarketDataSourceState;
 using chronos::market_data::MarketDataSubscription;
+using chronos::market_data::MarketEventGate;
+using chronos::market_data::MarketEventObserver;
 using chronos::market_data::MarketStateFeed;
 using chronos::market_data::MonotonicClock;
 using chronos::market_data::MonotonicUtcClock;
@@ -132,6 +138,88 @@ struct Replay {
     std::vector<std::string> log;
     std::unique_ptr<PacedReplaySource> source;
 };
+
+// ---------------------------------------------------------------------------
+// Observation
+
+// Records what the market and the notifier looked like when each event was
+// offered.
+struct RecordingObserver final : MarketEventObserver {
+    RecordingObserver(const MarketState& market, const MarketDataNotifier& notifier)
+        : market(market), notifier(notifier) {}
+
+    void observe(const ValidatedMarketEvent& event) override {
+        observed.push_back(std::get<TopOfBookEvent>(event.value()).header.ingest_sequence);
+        applied_when_observed.push_back(market.status().last_ingest_sequence);
+        revision_when_observed.push_back(notifier.revision());
+    }
+
+    const MarketState& market;
+    const MarketDataNotifier& notifier;
+    std::vector<std::uint64_t> observed;
+    std::vector<std::optional<std::uint64_t>> applied_when_observed;
+    std::vector<std::uint64_t> revision_when_observed;
+};
+
+void test_the_feed_observes_each_event_after_applying_it_and_before_telling_subscribers() {
+    ManualClock clock(ManualClock::Mode::Advance);
+    MarketState market{MarketDataStreamId(std::string(kSourceTestStream))};
+    MarketDataNotifier notifier(clock, MarketDataNotifier::Options{});
+    RecordingObserver observer(market, notifier);
+    MarketEventGate gate;
+    MarketStateFeed feed(market, notifier, 0, &observer, &gate);
+    for (std::uint64_t sequence = 0; sequence < 3; ++sequence) {
+        const std::uint64_t before = notifier.revision();
+        REQUIRE(!feed.apply(recorded_quote(sequence, std::chrono::milliseconds(sequence))));
+        REQUIRE(notifier.revision() > before);
+        REQUIRE(observer.revision_when_observed.back() == before);
+    }
+    REQUIRE(observer.observed == std::vector<std::uint64_t>({0, 1, 2}));
+    REQUIRE(observer.applied_when_observed ==
+            std::vector<std::optional<std::uint64_t>>({0U, 1U, 2U}));
+    // A rejected event is never offered.
+    REQUIRE(feed.apply(recorded_quote(9, 9ms)).has_value());
+    REQUIRE(observer.observed.size() == 3);
+}
+
+// An observer that fails leaves the event applied but not fully observed.
+// Whoever gets the gate next, such as a submission that was waiting for
+// it, must already find the market unusable.
+struct FailingObserver final : MarketEventObserver {
+    FailingObserver(MarketEventGate& gate, const MarketState& market)
+        : gate(gate), market(market) {}
+
+    void observe(const ValidatedMarketEvent&) override {
+        waiter = std::thread([this] {
+            auto held = gate.hold_market(std::chrono::steady_clock::now() + 10s);
+            if (held) {
+                quote_after_gate = market.execution_quote(InstrumentId("AAPL"));
+            }
+        });
+        throw std::runtime_error("database refused the query");
+    }
+
+    MarketEventGate& gate;
+    const MarketState& market;
+    std::thread waiter;
+    std::optional<chronos::ExecutionQuoteResult> quote_after_gate;
+};
+
+void test_a_failing_observer_suspends_the_market_before_releasing_the_gate() {
+    ManualClock clock(ManualClock::Mode::Advance);
+    MarketState market{MarketDataStreamId(std::string(kSourceTestStream))};
+    MarketDataNotifier notifier(clock, MarketDataNotifier::Options{});
+    MarketEventGate gate;
+    FailingObserver observer(gate, market);
+    MarketStateFeed feed(market, notifier, 0, &observer, &gate);
+    const auto failure = feed.apply(recorded_quote(0, 0ms));
+    observer.waiter.join();
+    REQUIRE(failure == "market event observer failed: database refused the query");
+    REQUIRE(feed.events_applied() == 1);
+    REQUIRE(observer.quote_after_gate.has_value());
+    REQUIRE(std::get<MarketStateUnavailable>(*observer.quote_after_gate).code ==
+        MarketStateUnavailableCode::SourceUnavailable);
+}
 
 // ---------------------------------------------------------------------------
 // Pacing
@@ -624,6 +712,10 @@ int main() {
         {"reader errors fail the replay", test_reader_errors_fail_the_replay},
         {"market-state rejections fail the replay", test_market_state_rejections_fail_the_replay},
         {"timing overflow fails the replay", test_timing_overflow_fails_the_replay},
+        {"the feed observes each event before telling subscribers",
+         test_the_feed_observes_each_event_after_applying_it_and_before_telling_subscribers},
+        {"a failing observer suspends the market before releasing the gate",
+         test_a_failing_observer_suspends_the_market_before_releasing_the_gate},
         {"event count overflow fails the replay", test_event_count_overflow_fails_the_replay},
         {"status is consistent under concurrent reads", test_status_is_consistent_under_concurrent_reads},
         {"first notice reports the current revision", test_first_notice_reports_the_current_revision},

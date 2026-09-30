@@ -3,6 +3,7 @@
 #include "chronos/market_data_types.hpp"
 #include "chronos/order_intent.hpp"
 #include "chronos/paper_account.hpp"
+#include "chronos/working_order.hpp"
 
 #include <cstdint>
 #include <string>
@@ -65,6 +66,8 @@ enum class PreTradeRiskErrorCode {
     InsufficientPosition,
     InsufficientCashForFee,
     ArithmeticOverflow,
+    // A market order cannot rest, so it must be immediate-or-cancel.
+    MarketOrderRequiresImmediateOrCancel,
 };
 
 struct PreTradeRiskRejection {
@@ -126,6 +129,12 @@ using PreTradeRiskDecision = std::variant<
 // reduce are the order's instrument's alone. Submission time must not
 // precede the account's latest fill of any instrument, because submission
 // time is the market clock and the account's timeline must not move back.
+//
+// Working orders' reservations are unavailable to every new order: a buy
+// needs unreserved cash, a sale unreserved shares, and a buy's position
+// limit counts the unfilled shares of working buys. An immediate-or-cancel
+// order is sized at the opposite best price it executes at; a
+// good-til-cancelled order at its limit price, the most it can ever pay.
 class PreTradeRiskEngine final {
 public:
     explicit PreTradeRiskEngine(PreTradeRiskLimits limits);
@@ -134,9 +143,17 @@ public:
         return limits_;
     }
 
+    // For an account without working orders.
     [[nodiscard]] PreTradeRiskDecision evaluate(
         const OrderIntent& intent,
         const PaperAccount& account,
+        const TopOfBookEvent& market
+    ) const;
+
+    [[nodiscard]] PreTradeRiskDecision evaluate(
+        const OrderIntent& intent,
+        const PaperAccount& account,
+        const AccountReservations& reservations,
         const TopOfBookEvent& market
     ) const;
 

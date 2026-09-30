@@ -1,11 +1,14 @@
 #pragma once
 
+#include "chronos/market_data/market_event_gate.hpp"
 #include "chronos/market_state.hpp"
 #include "chronos/portfolio_valuation.hpp"
 #include "chronos/postgresql_paper_order_repository.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,6 +33,9 @@ struct PaperTradingServiceConfig {
     // Applied to every new account and persisted with it. Changing the
     // configuration later does not alter existing accounts.
     PreTradeRiskLimits account_risk_limits;
+    // How long a submission waits for the market-event gate while an event
+    // is being applied and matched.
+    std::chrono::milliseconds order_matching_wait{2'000};
 };
 
 // An account holds cash and a position per instrument it has traded, so it
@@ -69,6 +75,14 @@ enum class PaperTradingErrorCode {
     AccountVersionConflict,
     ValuationFailed,
     PersistenceUnavailable,
+    // The order has no working remainder, and this cancel request did not
+    // cancel it.
+    OrderNotCancellable,
+    // The cancel request ID already cancelled another order.
+    DuplicateCancelRequestId,
+    // An event was still being applied and matched when the wait ended;
+    // nothing was recorded.
+    OrderMatchingBusy,
 };
 
 // A request the service did not record. Retrying an order with the same
@@ -87,6 +101,8 @@ struct PaperTradingError {
     // For PositionMarkUnavailable: every open position that cannot be
     // marked, in instrument order, and why.
     std::vector<PositionMarkFailure> instruments{};
+    // For OrderNotCancellable: the order as it is now.
+    std::optional<PaperOrderRecord> order{};
 };
 
 struct PaperAccountView {
@@ -99,6 +115,9 @@ struct PaperAccountView {
     PreTradeRiskLimits risk_limits;
     bool is_healthy;
     std::int64_t version;
+    // What working orders hold back from new orders, and how many there are.
+    AccountReservations reservations;
+    std::size_t working_orders{0};
 };
 
 // A submission committed to the durable journal, whatever its outcome. Its
@@ -108,7 +127,30 @@ struct RecordedPaperOrder {
     TopOfBookEvent market;
     PaperOrderResult result;
     PaperAccountView account;
+    // The order as recorded, read back after the commit.
+    PaperOrderRecord order;
 };
+
+// Cancels the working remainder of one order. The cancel request ID is the
+// request's idempotency key: retrying it returns the order it cancelled.
+struct CancelPaperOrderRequest {
+    std::string account_id;
+    std::string client_order_id;
+    std::string cancel_request_id;
+};
+
+struct CancelledPaperOrder {
+    // The order as it is now.
+    PaperOrderRecord order;
+    PaperAccountView account;
+    // This request had already cancelled the order; nothing was written.
+    bool already_cancelled;
+};
+
+using CancelPaperOrderResult = std::variant<
+    CancelledPaperOrder,
+    PaperTradingError
+>;
 
 using PaperAccountResult = std::variant<PaperAccountView, PaperTradingError>;
 
@@ -172,6 +214,37 @@ using PaperFillHistoryResult = std::variant<
     PaperTradingError
 >;
 
+// An oldest-first page: working orders in priority order, or one order's
+// fills or lifecycle events in the order they happened.
+struct ForwardPageRequest {
+    // Absent means kDefaultHistoryPageLimit.
+    std::optional<std::size_t> limit;
+    // Absent means the first page; otherwise the next_cursor of a previous
+    // page of the same resource.
+    std::optional<std::string> cursor;
+    // Working orders only: keep one instrument's.
+    std::optional<std::string> instrument;
+};
+
+struct WorkingOrderPage {
+    std::vector<PaperOrderRecord> orders;
+    std::optional<std::string> next_cursor;
+};
+
+struct OrderFillPage {
+    std::vector<PaperFillRecord> fills;
+    std::optional<std::string> next_cursor;
+};
+
+struct OrderEventPage {
+    std::vector<PaperOrderEventRecord> events;
+    std::optional<std::string> next_cursor;
+};
+
+using WorkingOrderPageResult = std::variant<WorkingOrderPage, PaperTradingError>;
+using OrderFillPageResult = std::variant<OrderFillPage, PaperTradingError>;
+using OrderEventPageResult = std::variant<OrderEventPage, PaperTradingError>;
+
 // Whether an order for one tradeable instrument could execute now, and
 // against which quote. The quote is a reference for clients: an order
 // executes against the server's quote when it is submitted.
@@ -199,17 +272,29 @@ struct PaperTradingHealth {
 // The application boundary shared by the HTTP API and future transports.
 //
 // The service exclusively owns one PostgreSQL connection and serializes every
-// operation on it. Sessions are request-scoped: each operation loads the
-// account from a consistent database snapshot, so the database is the only
-// source of account truth between requests and optimistic concurrency
-// resolves races with other processes. `market_state` must outlive the
+// operation on it. Sessions are request-scoped: each read loads the account
+// from a consistent database snapshot, so the database is the only source of
+// account truth between requests. A submission or cancellation takes the
+// account's row lock and recovers the account under it, so it is serialized
+// with the working-order matcher, which uses its own connection, and with
+// other processes.
+//
+// With a market-event gate (see MarketEventGate), a submission holds it
+// from before the account lock until its commit, so its quote and every
+// event before it were already matched, and every later event is offered
+// to the order it records. `market_state` and `gate` must outlive the
 // service.
 class PaperTradingService final {
 public:
+    using ActivityCallback = std::function<void()>;
+
+    // `on_activity` runs after a submission or cancellation commits.
     PaperTradingService(
         std::unique_ptr<PostgresPaperOrderRepository> repository,
         const MarketState& market_state,
-        PaperTradingServiceConfig config
+        PaperTradingServiceConfig config,
+        ActivityCallback on_activity = {},
+        market_data::MarketEventGate* gate = nullptr
     );
 
     PaperTradingService(const PaperTradingService&) = delete;
@@ -225,6 +310,13 @@ public:
 
     [[nodiscard]] PaperOrderSubmissionResult submit_order(
         const PaperOrderRequest& request
+    );
+
+    // Needs no market data and works on a halted account. The cancellation
+    // time is the market clock, or the order's latest change if the clock
+    // is behind it or has not started.
+    [[nodiscard]] CancelPaperOrderResult cancel_order(
+        const CancelPaperOrderRequest& request
     );
 
     // Read the durable journal only; nothing is re-evaluated. An order that
@@ -244,6 +336,23 @@ public:
         const HistoryPageRequest& request
     );
 
+    [[nodiscard]] WorkingOrderPageResult list_working_orders(
+        std::string_view account_id,
+        const ForwardPageRequest& request
+    );
+
+    [[nodiscard]] OrderFillPageResult list_order_fills(
+        std::string_view account_id,
+        std::string_view client_order_id,
+        const ForwardPageRequest& request
+    );
+
+    [[nodiscard]] OrderEventPageResult list_order_events(
+        std::string_view account_id,
+        std::string_view client_order_id,
+        const ForwardPageRequest& request
+    );
+
     // Marks every open position at the server's current best bid, read
     // together with the market clock. Only held instruments need a quote;
     // any that cannot be marked fails the whole valuation. Reads only:
@@ -259,10 +368,18 @@ public:
     [[nodiscard]] MarketAvailability market_availability() const;
 
 private:
+    void notify_activity() const;
+
+    // Lock order: submission_mutex_, the market-event gate, mutex_, then an
+    // account row. mutex_ serializes use of the one connection; only
+    // submissions take the other two.
+    std::timed_mutex submission_mutex_;
     std::mutex mutex_;
     std::unique_ptr<PostgresPaperOrderRepository> repository_;
     const MarketState& market_state_;
     PaperTradingServiceConfig config_;
+    ActivityCallback on_activity_;
+    market_data::MarketEventGate* gate_;
 };
 
 }  // namespace chronos::paper_trading

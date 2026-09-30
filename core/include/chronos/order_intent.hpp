@@ -26,6 +26,8 @@ enum class OrderType {
 
 enum class TimeInForce {
     ImmediateOrCancel,
+    // Only limit orders: the remainder rests until it fills or is cancelled.
+    GoodTilCancelled,
 };
 
 struct OrderIntent {

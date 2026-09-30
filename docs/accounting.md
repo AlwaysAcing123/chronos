@@ -23,6 +23,8 @@ validation, risk policy, and execution simulation to this accounting boundary.
 - Gross PnL excludes fees. Fees are tracked separately. Net PnL equals gross PnL minus accumulated fees.
 - Fee allocation: each fill's fee is paid from the shared cash and recorded in the fill instrument's ledger, so every fee belongs to exactly one position. Account fees are the sum over ledgers, including closed ones.
 - Cost basis excludes fees so execution performance and costs remain separately inspectable.
+- A fill's fee is whatever the fill carries. A good-til-cancelled order pays its one fee on its first fill and its later fills carry a zero fee (see [paper-execution.md](paper-execution.md)); the account books each fill the same way.
+- Working-order reservations are not ledger state. The account holds only cash and positions; what working orders reserve is derived from those orders by the order processor, limits what risk lets new orders spend, and never changes cash, cost basis, or PnL.
 - Equal fill timestamps are valid; a timestamp earlier than the instrument's previously applied fill is rejected. Fills for different instruments are not ordered against each other by accounting (the paper-order processor keeps the account's timeline; see `paper-execution.md`).
 - A fill identifier may be applied at most once per account, whatever its instrument.
 - A fill changes only its own instrument's ledger and the shared cash.

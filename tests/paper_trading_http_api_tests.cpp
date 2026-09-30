@@ -538,7 +538,8 @@ void test_malformed_orders_never_reach_the_journal() {
     rejected(with("limit_price", "abc"), "invalid_decimal", "limit_price");
     rejected(with("side", "short"), "unknown_enum_value", "side");
     rejected(with("type", "stop_limit"), "unknown_enum_value", "type");
-    rejected(with("time_in_force", "gtc"), "unknown_enum_value", "time_in_force");
+    rejected(with("time_in_force", "fok"), "unknown_enum_value", "time_in_force");
+    rejected(with("time_in_force", "GTC"), "unknown_enum_value", "time_in_force");
     rejected(
         with("source", Json{{"kind", "broker"}, {"id", "x"}}),
         "unknown_enum_value",
@@ -595,7 +596,10 @@ void test_duplicate_client_order_id_returns_409_without_recording() {
     ) == "1");
 }
 
-void test_version_conflict_returns_409_and_the_same_id_can_retry() {
+// The submission waits for another writer's account lock and then records
+// against that writer's committed state, rather than failing with a
+// version conflict.
+void test_a_concurrent_writer_is_serialized_before_the_order() {
     const std::string application = unique_test_id("http-conflict");
     TestApi api(with_application_name(connection_string, application));
     apply(*api.market, quote(0, 0));
@@ -628,20 +632,11 @@ void test_version_conflict_returns_409_and_the_same_id_can_retry() {
     submitter.join();
 
     REQUIRE(contended.has_value());
-    REQUIRE(contended->status == 409);
-    const Json conflict = Json::parse(contended->body);
-    require_no_json_numbers(conflict);
-    REQUIRE(conflict.at("error").at("code") == "account_version_conflict");
-    REQUIRE(!conflict.contains("order"));
-    REQUIRE(recorded_orders(account_id) == 0);
-
-    const ApiResponse retried = submit(
-        api,
-        account_id,
-        order("contended", "buy", "1")
-    );
-    REQUIRE(retried.status == 201);
-    REQUIRE(retried.body.at("account").at("version") == "2");
+    REQUIRE(contended->status == 201);
+    const Json recorded = Json::parse(contended->body);
+    require_no_json_numbers(recorded);
+    REQUIRE(recorded.at("account").at("version") == "2");
+    REQUIRE(recorded_orders(account_id) == 1);
 }
 
 void test_routing_and_media_type_errors_are_json() {
@@ -1032,6 +1027,7 @@ void test_fill_history_returns_only_booked_fills() {
         {"notional", "151.5"},
         {"fee", "0.01"},
         {"filled_at", "2026-09-25T13:30:00.000000000Z"},
+        {"fill_index", "0"},
     }));
     const ApiResponse rest = call(
         api,
@@ -1832,13 +1828,18 @@ void test_socket_server_streams_change_notices() {
                 published = true;
                 api.notifier.publish();
             }
-            return received.find(R"(data: {"revision":"1"})") == std::string::npos;
+            return received.find(
+                R"(data: {"revision":"1","activity_revision":"0"})"
+            ) == std::string::npos;
         }
     );
     // The client stops reading once it has both notices.
     REQUIRE(result.error() == httplib::Error::Canceled);
     REQUIRE(received.starts_with("retry: 3000\n\n"));
-    REQUIRE(received.find("event: market-data\ndata: {\"revision\":\"0\"}\n\n") != std::string::npos);
+    REQUIRE(received.find(
+        "event: market-data\ndata: {\"revision\":\"0\","
+        "\"activity_revision\":\"0\"}\n\n"
+    ) != std::string::npos);
     const auto header = [&](std::string_view name) {
         const auto found = headers.find(std::string(name));
         return found == headers.end() ? std::string() : found->second;
@@ -2070,8 +2071,8 @@ int main() {
             test_duplicate_client_order_id_returns_409_without_recording,
         },
         {
-            "version conflict returns 409 and retry succeeds",
-            test_version_conflict_returns_409_and_the_same_id_can_retry,
+            "a concurrent writer is serialized before the order",
+            test_a_concurrent_writer_is_serialized_before_the_order,
         },
         {
             "routing and media type errors are JSON",

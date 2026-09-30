@@ -12,15 +12,25 @@
 
 namespace chronos {
 
+// How an order ended when it was executed at submission. An
+// immediate-or-cancel order always ends Filled, PartiallyFilledAndCancelled,
+// or Cancelled. A good-til-cancelled order ends Filled, or rests with its
+// remainder as Working (nothing filled) or PartiallyFilled.
 enum class SimulatedExecutionStatus {
     Filled,
     PartiallyFilledAndCancelled,
     Cancelled,
+    Working,
+    PartiallyFilled,
 };
 
+// Why an order's remainder was cancelled. The simulator produces only the
+// immediate-or-cancel reasons; UserRequested ends a working order whose
+// remainder a client cancelled.
 enum class SimulatedCancellationReason {
     LimitNotMarketable,
     DisplayedLiquidityExhausted,
+    UserRequested,
 };
 
 struct SimulatedExecutionReport {
@@ -139,8 +149,34 @@ public:
         TopOfBookExecutionRecoveryState recovery_state
     );
 
+    // Executes an approved order against its observation. An
+    // immediate-or-cancel order's unfilled remainder is cancelled; a
+    // good-til-cancelled order's remainder rests, and at most
+    // `maximum_fill_quantity` of it fills now when that is given. An order
+    // that fills nothing takes no displayed liquidity.
     [[nodiscard]] SimulatedExecutionResult execute(
-        const ApprovedOrderIntent& approved
+        const ApprovedOrderIntent& approved,
+        std::optional<Quantity> maximum_fill_quantity = std::nullopt
+    );
+
+    // The displayed quantity an order of `side` could take from `market`:
+    // the opposite level, less what this account's orders already took from
+    // the same observation. A newer observation than the instrument's
+    // latest has nothing taken yet. `market` must continue the account's
+    // market lineage (see market_lineage_violation).
+    [[nodiscard]] Quantity available_liquidity(
+        const TopOfBookEvent& market,
+        Side side
+    ) const;
+
+    // Records that a resting order of `side` took `quantity` from `market`,
+    // which becomes the instrument's latest observation. Throws
+    // std::invalid_argument when `market` breaks the lineage or the
+    // quantity is not displayed.
+    void take_liquidity(
+        const TopOfBookEvent& market,
+        Side side,
+        Quantity quantity
     );
 
 private:

@@ -15,6 +15,7 @@
   grid-template-areas:
     'portfolio ticket'
     'market ticket'
+    'working working'
     'orders orders'
     'fills fills';
   gap: var(--space-4);
@@ -23,6 +24,7 @@
 
 .market { grid-area: market; }
 .portfolio { grid-area: portfolio; }
+.working { grid-area: working; }
 .orders { grid-area: orders; }
 .fills { grid-area: fills; }
 
@@ -170,7 +172,7 @@
 
   .grid {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: 'portfolio' 'ticket' 'market' 'orders' 'fills';
+    grid-template-areas: 'portfolio' 'ticket' 'market' 'working' 'orders' 'fills';
   }
 
 

@@ -3,7 +3,7 @@
 import type { InfiniteData } from '@tanstack/react-query';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 
-import type { FillPage, OrderPage } from '../api/schemas';
+import type { FillPage, OrderEventPage, OrderPage, WorkingOrderPage } from '../api/schemas';
 import { isAccountNotFound } from '../api/errors';
 import type { RefreshPolicy } from './refreshPolicy';
 import { useChronosServices } from './services';
@@ -21,7 +21,16 @@ export const queryKeys = {
     [...queryKeys.account(accountId), 'orders', instrument ?? '*'] as const,
   fills: (accountId: string, instrument: string | null) =>
     [...queryKeys.account(accountId), 'fills', instrument ?? '*'] as const,
+  workingOrders: (accountId: string) => [...queryKeys.account(accountId), 'working-orders'] as const,
+  orderEvents: (accountId: string, clientOrderId: string) =>
+    [...queryKeys.account(accountId), 'order-events', clientOrderId] as const,
 };
+
+// Durable account resources, refreshed when the change stream reports
+// account activity: orders recorded, fills booked, cancellations.
+export function isAccountQuery(key: readonly unknown[]): boolean {
+  return key[0] === queryKeys.all[0] && key[1] === 'accounts';
+}
 
 // Resources whose value depends on the current market, refreshed by the
 // change stream: the portfolio valuations. Market data has its own key.
@@ -97,6 +106,37 @@ export function useFillHistory(accountId: string, instrument: string | null) {
   return useInfiniteQuery<FillPage, Error, InfiniteData<FillPage, string | null>, readonly unknown[], string | null>({
     queryKey: queryKeys.fills(accountId, instrument),
     queryFn: ({ pageParam, signal }) => client.listFills(accountId, instrument, pageParam, signal),
+    initialPageParam: null,
+    getNextPageParam: (page) => page.next_cursor,
+    refetchInterval: accountInterval(refresh.accountMs),
+  });
+}
+
+// Oldest first, in priority order. Polling refetches every loaded page from
+// the first, so a filled or cancelled order leaves no gap.
+export function useWorkingOrders(accountId: string) {
+  const { client, refresh } = useChronosServices();
+  return useInfiniteQuery<
+    WorkingOrderPage,
+    Error,
+    InfiniteData<WorkingOrderPage, string | null>,
+    readonly unknown[],
+    string | null
+  >({
+    queryKey: queryKeys.workingOrders(accountId),
+    queryFn: ({ pageParam, signal }) => client.listWorkingOrders(accountId, pageParam, signal),
+    initialPageParam: null,
+    getNextPageParam: (page) => page.next_cursor,
+    refetchInterval: accountInterval(refresh.accountMs),
+  });
+}
+
+// One order's lifecycle, oldest first; read only while it is shown.
+export function useOrderEvents(accountId: string, clientOrderId: string) {
+  const { client, refresh } = useChronosServices();
+  return useInfiniteQuery<OrderEventPage, Error, InfiniteData<OrderEventPage, string | null>, readonly unknown[], string | null>({
+    queryKey: queryKeys.orderEvents(accountId, clientOrderId),
+    queryFn: ({ pageParam, signal }) => client.listOrderEvents(accountId, clientOrderId, pageParam, signal),
     initialPageParam: null,
     getNextPageParam: (page) => page.next_cursor,
     refetchInterval: accountInterval(refresh.accountMs),

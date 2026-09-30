@@ -62,11 +62,13 @@ export function serveAccount(
     portfolio = portfolioJson(),
     orders = [partialOrderJson()],
     fills = [fillJson()],
-  }: { account?: Json; portfolio?: Json; orders?: Json[]; fills?: Json[] } = {},
+    workingOrders = [],
+  }: { account?: Json; portfolio?: Json; orders?: Json[]; fills?: Json[]; workingOrders?: Json[] } = {},
 ) {
   serveServer(api);
   api.on('GET', accountPath, { status: 200, body: { account } });
   api.on('GET', `${accountPath}/portfolio`, { status: 200, body: { portfolio } });
   api.on('GET', `${accountPath}/orders`, { status: 200, body: { orders, next_cursor: null } });
   api.on('GET', `${accountPath}/fills`, { status: 200, body: { fills, next_cursor: null } });
+  api.on('GET', `${accountPath}/working-orders`, { status: 200, body: { orders: workingOrders, next_cursor: null } });
 }

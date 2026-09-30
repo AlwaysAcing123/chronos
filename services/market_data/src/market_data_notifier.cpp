@@ -34,9 +34,27 @@ void MarketDataNotifier::publish() {
     changed_.notify_all();
 }
 
+void MarketDataNotifier::publish_activity() {
+    {
+        const std::lock_guard lock(mutex_);
+        if (revision_ != std::numeric_limits<std::uint64_t>::max()) {
+            ++revision_;
+        }
+        if (activity_revision_ != std::numeric_limits<std::uint64_t>::max()) {
+            ++activity_revision_;
+        }
+    }
+    changed_.notify_all();
+}
+
 std::uint64_t MarketDataNotifier::revision() const {
     const std::lock_guard lock(mutex_);
     return revision_;
+}
+
+std::uint64_t MarketDataNotifier::activity_revision() const {
+    const std::lock_guard lock(mutex_);
+    return activity_revision_;
 }
 
 std::variant<MarketDataSubscription, MarketDataNotifier::SubscribeError>
@@ -78,7 +96,10 @@ MarketDataNotice MarketDataNotifier::next(MarketDataSubscription& subscriber) {
             subscriber.delivered_revision_ = revision_;
             subscriber.next_change_allowed_ = now + options_.minimum_interval;
             subscriber.next_heartbeat_ = now + options_.heartbeat_interval;
-            return MarketDataChanged{.revision = revision_};
+            return MarketDataChanged{
+                .revision = revision_,
+                .activity_revision = activity_revision_,
+            };
         }
         if (now >= subscriber.next_heartbeat_) {
             subscriber.next_heartbeat_ = now + options_.heartbeat_interval;

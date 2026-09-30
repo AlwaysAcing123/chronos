@@ -668,14 +668,19 @@ ResponseJson market_stream_id_json(
 }
 
 // An open position's ledger. Average entry price is defined because the
-// position is open.
+// position is open. Shares held back for working sells are reserved; the
+// rest are available to new sell orders.
 ResponseJson open_position_json(
     const InstrumentId& instrument,
-    const PositionState& position
+    const PositionState& position,
+    const AccountReservations& reservations
 ) {
+    const Quantity reserved = reservations.reserved_sell_quantity(instrument);
     ResponseJson json = ResponseJson::object();
     json["instrument"] = instrument.value();
     json["quantity"] = position.quantity.to_string();
+    json["reserved_quantity"] = reserved.to_string();
+    json["available_quantity"] = (position.quantity - reserved).to_string();
     json["open_cost_basis"] = position.open_cost_basis.to_string();
     json["average_entry_price"] = position.average_entry_price().to_string();
     json["gross_realized_pnl"] = position.gross_realized_pnl.to_string();
@@ -708,13 +713,26 @@ ResponseJson closed_positions_json(const AccountState& state) {
     return closed;
 }
 
+// Cash that working orders hold back is reserved; the rest is available
+// to new orders. Reservations never exceed cash in a consistent account.
+Money available_cash(const PaperAccountView& account) {
+    const Money available =
+        account.state.cash - account.reservations.reserved_cash;
+    if (available.raw() < 0) {
+        throw std::logic_error("reservations exceed the account's cash");
+    }
+    return available;
+}
+
 // Account totals are sums over every ledger, open or closed.
 ResponseJson account_json(const PaperAccountView& account) {
     const AccountState& state = account.state;
     ResponseJson positions = ResponseJson::array();
     for (const auto& [instrument, position] : state.positions) {
         if (position.is_open()) {
-            positions.push_back(open_position_json(instrument, position));
+            positions.push_back(
+                open_position_json(instrument, position, account.reservations)
+            );
         }
     }
     ResponseJson json = ResponseJson::object();
@@ -725,6 +743,9 @@ ResponseJson account_json(const PaperAccountView& account) {
     json["market_stream_id"] = market_stream_id_json(account.market_stream);
     json["starting_cash"] = state.starting_cash.to_string();
     json["cash"] = state.cash.to_string();
+    json["reserved_cash"] = account.reservations.reserved_cash.to_string();
+    json["available_cash"] = available_cash(account).to_string();
+    json["working_order_count"] = std::to_string(account.working_orders);
     json["open_cost_basis"] = state.open_cost_basis().to_string();
     json["gross_realized_pnl"] = state.gross_realized_pnl().to_string();
     json["fees_paid"] = state.fees_paid().to_string();
@@ -992,10 +1013,15 @@ void write_fill_fields(ResponseJson& json, const Fill& fill, Money notional) {
     json["filled_at"] = format_timestamp(fill.timestamp);
 }
 
+// An order resource. `state` is the order's current state when it reached
+// execution; without it the order ended when it was submitted. `priority`
+// is the durable acceptance sequence of a good-til-cancelled order.
 ResponseJson order_json(
     const OrderIntent& intent,
     const TopOfBookEvent& market,
-    const OrderOutcome& outcome
+    const OrderOutcome& outcome,
+    const std::optional<PaperOrderState>& state = std::nullopt,
+    std::optional<std::int64_t> priority = std::nullopt
 ) {
     ResponseJson json = ResponseJson::object();
     json["trading_mode"] = "paper";
@@ -1011,12 +1037,45 @@ ResponseJson order_json(
         : ResponseJson(nullptr);
     json["time_in_force"] = name_of(intent.time_in_force);
     json["submitted_at"] = format_timestamp(intent.submitted_at);
-    json["status"] = outcome.status;
-    json["filled_quantity"] = outcome.filled_quantity.to_string();
-    json["unfilled_quantity"] = outcome.unfilled_quantity.to_string();
-    json["cancellation_reason"] = outcome.cancellation_reason
-        ? ResponseJson(name_of(*outcome.cancellation_reason))
-        : ResponseJson(nullptr);
+    if (state) {
+        json["status"] = name_of(state->status);
+        json["filled_quantity"] = state->filled_quantity.to_string();
+        json["remaining_quantity"] = state->remaining_quantity.to_string();
+        json["unfilled_quantity"] = state->remaining_quantity.to_string();
+        json["filled_notional"] = state->filled_notional.to_string();
+        json["fill_count"] = std::to_string(state->fill_count);
+        json["fee_charged"] = state->fee_charged();
+        json["cumulative_fee"] = state->cumulative_fee.to_string();
+        json["reserved_cash"] = state->reservation.cash.to_string();
+        json["reserved_quantity"] = state->reservation.quantity.to_string();
+        json["priority"] = priority
+            ? ResponseJson(std::to_string(*priority))
+            : ResponseJson(nullptr);
+        json["updated_at"] = format_timestamp(state->updated_at);
+        json["cancellation_reason"] = state->cancellation_reason
+            ? ResponseJson(name_of(*state->cancellation_reason))
+            : ResponseJson(nullptr);
+        json["cancel_request_id"] = nullable(state->cancel_request_id);
+    } else {
+        const auto& booked = outcome.booked_fill;
+        json["status"] = outcome.status;
+        json["filled_quantity"] = outcome.filled_quantity.to_string();
+        json["remaining_quantity"] = outcome.unfilled_quantity.to_string();
+        json["unfilled_quantity"] = outcome.unfilled_quantity.to_string();
+        json["filled_notional"] =
+            (booked ? booked->notional : Money{}).to_string();
+        json["fill_count"] = booked ? "1" : "0";
+        json["fee_charged"] = booked.has_value();
+        json["cumulative_fee"] = (booked ? booked->fill.fee : Money{}).to_string();
+        json["reserved_cash"] = Money{}.to_string();
+        json["reserved_quantity"] = Quantity{}.to_string();
+        json["priority"] = nullptr;
+        json["updated_at"] = format_timestamp(intent.submitted_at);
+        json["cancellation_reason"] = outcome.cancellation_reason
+            ? ResponseJson(name_of(*outcome.cancellation_reason))
+            : ResponseJson(nullptr);
+        json["cancel_request_id"] = nullptr;
+    }
     ResponseJson fill = nullptr;
     if (outcome.booked_fill) {
         fill = ResponseJson::object();
@@ -1035,10 +1094,15 @@ ResponseJson order_json(
 }
 
 ResponseJson order_record_json(const PaperOrderRecord& record) {
+    const bool rests =
+        record.intent.time_in_force == TimeInForce::GoodTilCancelled;
     return order_json(
         record.intent,
         record.market,
-        order_outcome(record.intent, record.outcome)
+        order_outcome(record.intent, record.outcome),
+        record.state,
+        rests && record.state ? std::optional<std::int64_t>(record.record_id)
+                              : std::nullopt
     );
 }
 
@@ -1050,6 +1114,21 @@ ResponseJson fill_record_json(const PaperFillRecord& record) {
     json["source"] = source_json(record.source);
     json["instrument"] = record.fill.instrument.value();
     write_fill_fields(json, record.fill, booked_notional(record.fill));
+    json["fill_index"] = std::to_string(record.fill_index);
+    return json;
+}
+
+ResponseJson order_event_json(const PaperOrderEventRecord& event) {
+    ResponseJson json = ResponseJson::object();
+    json["sequence"] = std::to_string(event.sequence);
+    json["type"] = name_of(event.type);
+    json["occurred_at"] = format_timestamp(event.occurred_at);
+    ResponseJson fill = nullptr;
+    if (event.fill) {
+        fill = ResponseJson::object();
+        write_fill_fields(fill, *event.fill, booked_notional(*event.fill));
+    }
+    json["fill"] = std::move(fill);
     return json;
 }
 
@@ -1078,7 +1157,8 @@ ResponseJson portfolio_json(const PaperPortfolioView& portfolio) {
     for (const PositionSnapshot& position : snapshot.open_positions) {
         ResponseJson item = open_position_json(
             position.instrument,
-            position.position
+            position.position,
+            account.reservations
         );
         item["mark_price"] = position.mark_price.to_string();
         item["market"] = market_json(valuation.marks.at(position.instrument));
@@ -1097,6 +1177,8 @@ ResponseJson portfolio_json(const PaperPortfolioView& portfolio) {
     json["mark_policy"] = "best_bid";
     json["starting_cash"] = state.starting_cash.to_string();
     json["cash"] = state.cash.to_string();
+    json["reserved_cash"] = account.reservations.reserved_cash.to_string();
+    json["available_cash"] = available_cash(account).to_string();
     json["open_cost_basis"] = snapshot.open_cost_basis.to_string();
     json["market_value"] = snapshot.market_value.to_string();
     json["unrealized_pnl"] = snapshot.gross_unrealized_pnl.to_string();
@@ -1292,8 +1374,39 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 503,
                 "persistence_unavailable",
                 "paper-trading persistence is unavailable; if this request "
-                "writes data, it may or may not have completed, so retry the "
-                "same request with the same identifiers"
+                "writes data, it may or may not have completed, so read the "
+                "resource and retry the same request with the same "
+                "identifiers"
+            );
+        case PaperTradingErrorCode::OrderNotCancellable: {
+            // The order as it is, so a client that lost a race with a fill
+            // or another cancellation sees why.
+            ResponseJson body = ResponseJson::object();
+            body["error"] = error_json(
+                "order_not_cancellable",
+                failure.message,
+                nonempty(failure.field)
+            );
+            body["order"] = failure.order
+                ? order_record_json(*failure.order)
+                : ResponseJson(nullptr);
+            return json_response(409, body);
+        }
+        case PaperTradingErrorCode::OrderMatchingBusy:
+            return error_response(
+                503,
+                "order_matching_busy",
+                "working orders are still being matched against the latest "
+                "market event; nothing was recorded, so retry the same "
+                "request with the same identifiers"
+            );
+        case PaperTradingErrorCode::DuplicateCancelRequestId:
+            return error_response(
+                409,
+                "duplicate_cancel_request_id",
+                "cancel_request_id already cancelled another order of this "
+                "account",
+                nonempty(failure.field)
             );
     }
     throw std::logic_error("unknown paper-trading error");
@@ -1482,7 +1595,8 @@ std::string format_timestamp(Timestamp timestamp) {
 
 HttpResponse render_health(
     const PaperTradingHealth& health,
-    const std::optional<market_data::MarketDataSourceStatus>& source
+    const std::optional<market_data::MarketDataSourceStatus>& source,
+    const std::optional<WorkingOrderMatcherStatus>& matching
 ) {
     ResponseJson instruments = ResponseJson::array();
     for (const InstrumentId& instrument : health.tradeable_instruments) {
@@ -1502,6 +1616,21 @@ HttpResponse render_health(
         summary["label"] = source->description.label;
         summary["state"] = market_data::state_name(source->state);
         body["market_data_source"] = std::move(summary);
+    }
+    if (matching) {
+        ResponseJson summary = ResponseJson::object();
+        summary["state"] = state_name(matching->state);
+        summary["observations"] = std::to_string(matching->observations);
+        summary["account_matches"] = std::to_string(matching->account_matches);
+        summary["fills"] = std::to_string(matching->fills);
+        summary["retries"] = std::to_string(matching->retries);
+        summary["failed_account_matches"] =
+            std::to_string(matching->failed_account_matches);
+        summary["total_matching_ns"] =
+            std::to_string(matching->total_matching_time.count());
+        summary["longest_matching_ns"] =
+            std::to_string(matching->longest_matching_time.count());
+        body["order_matching"] = std::move(summary);
     }
     return json_response(health.persistence_available ? 200 : 503, body);
 }
@@ -1580,9 +1709,11 @@ std::optional<std::string> event_stream_text(
 ) {
     if (const auto* changed =
             std::get_if<market_data::MarketDataChanged>(&notice)) {
-        // The revision is a string, like every integer in the API.
+        // Revisions are strings, like every integer in the API.
         return "event: market-data\ndata: {\"revision\":\"" +
-            std::to_string(changed->revision) + "\"}\n\n";
+            std::to_string(changed->revision) +
+            "\",\"activity_revision\":\"" +
+            std::to_string(changed->activity_revision) + "\"}\n\n";
     }
     if (std::holds_alternative<market_data::MarketDataHeartbeat>(notice)) {
         return std::string(": heartbeat\n\n");
@@ -1609,13 +1740,15 @@ HttpResponse render_order_submission(
         return render_service_error(*failure);
     }
     const auto& recorded = std::get<RecordedPaperOrder>(result);
+    // The status follows how the submission ended; the order is rendered
+    // as recorded, exactly as a later lookup returns it.
     const OrderOutcome outcome =
         order_outcome(recorded.intent, recorded.result);
     ResponseJson body = ResponseJson::object();
     if (outcome.rejection) {
         body["error"] = rejection_json(*outcome.rejection);
     }
-    body["order"] = order_json(recorded.intent, recorded.market, outcome);
+    body["order"] = order_record_json(recorded.order);
     body["account"] = account_json(recorded.account);
     return json_response(outcome.submission_status, body);
 }
@@ -1684,6 +1817,124 @@ HttpResponse render_error(
     std::string_view message
 ) {
     return error_response(status, code, message);
+}
+
+std::variant<CancelPaperOrderRequest, MalformedRequest> parse_cancel_request(
+    std::string account_id,
+    std::string client_order_id,
+    std::string_view body
+) {
+    auto document = parse_json_object(body);
+    if (const auto* invalid = std::get_if<MalformedRequest>(&document)) {
+        return *invalid;
+    }
+    std::optional<MalformedRequest> error;
+    FieldReader fields(
+        std::get<RequestJson>(document),
+        "",
+        {"cancel_request_id"},
+        error
+    );
+    auto cancel_request_id = fields.string("cancel_request_id");
+    if (error) {
+        return *error;
+    }
+    return CancelPaperOrderRequest{
+        .account_id = std::move(account_id),
+        .client_order_id = std::move(client_order_id),
+        .cancel_request_id = std::move(*cancel_request_id),
+    };
+}
+
+std::variant<ForwardPageRequest, MalformedRequest> parse_forward_query(
+    std::string_view query,
+    bool allow_instrument
+) {
+    auto parsed = allow_instrument
+        ? parse_query(query, {"limit", "cursor", "instrument"})
+        : parse_query(query, {"limit", "cursor"});
+    if (auto* invalid = std::get_if<MalformedRequest>(&parsed)) {
+        return std::move(*invalid);
+    }
+    ForwardPageRequest request;
+    for (QueryParameter& parameter :
+         std::get<std::vector<QueryParameter>>(parsed)) {
+        if (parameter.name == "cursor") {
+            request.cursor = std::move(parameter.value);
+            continue;
+        }
+        if (parameter.name == "instrument") {
+            request.instrument = std::move(parameter.value);
+            continue;
+        }
+        request.limit = parse_limit(parameter.value);
+        if (!request.limit) {
+            return malformed(
+                MalformedRequestReason::InvalidLimit,
+                "limit",
+                "limit must be an integer from 1 to " +
+                    std::to_string(kMaximumHistoryPageLimit)
+            );
+        }
+    }
+    return request;
+}
+
+HttpResponse render_cancellation(const CancelPaperOrderResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& cancelled = std::get<CancelledPaperOrder>(result);
+    ResponseJson body = ResponseJson::object();
+    body["order"] = order_record_json(cancelled.order);
+    body["account"] = account_json(cancelled.account);
+    body["already_cancelled"] = cancelled.already_cancelled;
+    return json_response(200, body);
+}
+
+HttpResponse render_working_orders(const WorkingOrderPageResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& page = std::get<WorkingOrderPage>(result);
+    ResponseJson orders = ResponseJson::array();
+    for (const PaperOrderRecord& record : page.orders) {
+        orders.push_back(order_record_json(record));
+    }
+    ResponseJson body = ResponseJson::object();
+    body["orders"] = std::move(orders);
+    body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
+}
+
+HttpResponse render_order_fills(const OrderFillPageResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& page = std::get<OrderFillPage>(result);
+    ResponseJson fills = ResponseJson::array();
+    for (const PaperFillRecord& record : page.fills) {
+        fills.push_back(fill_record_json(record));
+    }
+    ResponseJson body = ResponseJson::object();
+    body["fills"] = std::move(fills);
+    body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
+}
+
+HttpResponse render_order_events(const OrderEventPageResult& result) {
+    if (const auto* failure = std::get_if<PaperTradingError>(&result)) {
+        return render_service_error(*failure);
+    }
+    const auto& page = std::get<OrderEventPage>(result);
+    ResponseJson events = ResponseJson::array();
+    for (const PaperOrderEventRecord& event : page.events) {
+        events.push_back(order_event_json(event));
+    }
+    ResponseJson body = ResponseJson::object();
+    body["events"] = std::move(events);
+    body["next_cursor"] = nullable(page.next_cursor);
+    return json_response(200, body);
 }
 
 }  // namespace chronos::paper_trading

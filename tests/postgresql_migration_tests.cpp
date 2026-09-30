@@ -3,6 +3,7 @@
 #include "test_support.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -16,9 +17,11 @@
 #include <variant>
 #include <vector>
 
-// Migration 003 turns single-instrument accounts into multi-instrument ones.
-// Each test builds its own database in a scratch schema of the shared test
-// database, so it can start empty or from rows in the old format.
+// Migration 003 turns single-instrument accounts into multi-instrument ones;
+// migration 004 adds durable order state, fills, and reservations for
+// good-til-cancelled working orders. Each test builds its own database in a
+// scratch schema of the shared test database, so it can start empty or from
+// rows in an old format.
 
 namespace {
 
@@ -355,7 +358,7 @@ void test_a_fresh_database_gets_the_multi_instrument_schema() {
     REQUIRE(inspector.scalar(
         "SELECT string_agg(version::text, ',' ORDER BY version) "
         "FROM chronos_schema_migrations"
-    ) == "1,2,3");
+    ) == "1,2,3,4");
     REQUIRE(inspector.scalar(
         "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) "
         "FROM information_schema.columns "
@@ -462,6 +465,9 @@ void test_single_instrument_accounts_upgrade_without_loss() {
          "sell-2:SPY:SPY:0:0:-400000000:2000000:220,"
          "passive:AAPL:AAPL:0:0:0:0:-");
 
+    // The current release reads version 4, which copies all of this.
+    apply(store, "004_working_orders.sql");
+
     // Recovery restores every account exactly.
     const auto open = PersistentPaperOrderSession::load(store, "legacy-open");
     REQUIRE(open.has_value());
@@ -516,6 +522,7 @@ void test_an_upgraded_account_trades_several_instruments() {
     PostgresTestConnection inspector(schema.connection());
     inspector.run_script(kSingleInstrumentRows);
     apply(store, "003_multi_instrument_accounts.sql");
+    apply(store, "004_working_orders.sql");
 
     auto session = PersistentPaperOrderSession::load(store, "legacy-open");
     REQUIRE(session.has_value());
@@ -604,6 +611,7 @@ void test_the_migration_applies_once() {
     PostgresTestConnection inspector(schema.connection());
     inspector.run_script(kSingleInstrumentRows);
     apply(store, "003_multi_instrument_accounts.sql");
+    apply(store, "004_working_orders.sql");
     const auto everything = [&] {
         return inspector.scalar(kJournalChecksum) + "/" + inspector.scalar(
             "SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM ("
@@ -611,8 +619,14 @@ void test_the_migration_applies_once() {
             "  UNION ALL SELECT paper_positions::text FROM paper_positions"
             "  UNION ALL SELECT paper_execution_states::text"
             "    FROM paper_execution_states"
+            "  UNION ALL SELECT paper_orders::text FROM paper_orders"
+            "  UNION ALL SELECT paper_fills::text FROM paper_fills"
+            "  UNION ALL SELECT paper_events::text FROM paper_events"
             "  UNION ALL SELECT chronos_schema_migrations::text"
             "    FROM chronos_schema_migrations) AS all_rows"
+        ) + "/" + inspector.scalar(
+            "SELECT nextval(pg_get_serial_sequence('paper_fills', "
+            "'fill_record_id'))"
         );
     };
     const std::string migrated = everything();
@@ -620,10 +634,23 @@ void test_the_migration_applies_once() {
     // As the integration tests and a Compose volume apply them: every file.
     store.apply_migration(all_migrations_sql());
     apply(store, "003_multi_instrument_accounts.sql");
-    REQUIRE(everything() == migrated);
+    apply(store, "004_working_orders.sql");
+    // Reading the identity advanced it once.
+    const std::string rerun = everything();
+    REQUIRE(rerun.substr(0, rerun.rfind('/')) ==
+        migrated.substr(0, migrated.rfind('/')));
+    REQUIRE(std::stoll(rerun.substr(rerun.rfind('/') + 1)) ==
+        std::stoll(migrated.substr(migrated.rfind('/') + 1)) + 1);
 }
 
 // Two servers starting together each apply every migration.
+//
+// Migration 003, which cannot change, locks paper_order_records before
+// paper_events, while a rerun of 001 takes its index locks in the other
+// order, so the two can deadlock. PostgreSQL then aborts one transaction and
+// its client runs the files again, as each applier here does; the other
+// commits. Migration 004 cannot take part in such a cycle (see "migration
+// 004 cannot deadlock with a rerun of 001").
 void test_concurrent_upgrades_apply_the_migration_once() {
     const ScratchSchema schema;
     {
@@ -636,25 +663,42 @@ void test_concurrent_upgrades_apply_the_migration_once() {
     std::vector<std::thread> appliers;
     for (std::size_t index = 0; index < outcomes.size(); ++index) {
         appliers.emplace_back([&, index] {
-            try {
-                PostgresPaperOrderRepository store(schema.connection());
-                store.apply_migration(all_migrations_sql());
-                outcomes[index] = "applied";
-            } catch (const std::exception& error) {
-                outcomes[index] = error.what();
+            for (int attempt = 1;; ++attempt) {
+                try {
+                    PostgresPaperOrderRepository store(schema.connection());
+                    store.apply_migration(all_migrations_sql());
+                    outcomes[index] = "applied";
+                    return;
+                } catch (const std::exception& error) {
+                    const bool deadlock_victim =
+                        std::string_view(error.what()).find("deadlock detected") !=
+                        std::string_view::npos;
+                    if (!deadlock_victim || attempt == 3) {
+                        outcomes[index] = error.what();
+                        return;
+                    }
+                }
             }
         });
     }
     for (auto& applier : appliers) {
         applier.join();
     }
-    REQUIRE(outcomes[0] == "applied");
-    REQUIRE(outcomes[1] == "applied");
+    for (const std::string& outcome : outcomes) {
+        if (outcome != "applied") {
+            throw chronos::test::TestFailure("a concurrent upgrade failed: " + outcome);
+        }
+    }
     PostgresTestConnection inspector(schema.connection());
     REQUIRE(inspector.scalar(
         "SELECT count(*) FROM chronos_schema_migrations WHERE version = 3"
     ) == "1");
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM chronos_schema_migrations WHERE version = 4"
+    ) == "1");
     REQUIRE(inspector.scalar("SELECT count(*) FROM paper_positions") == "2");
+    REQUIRE(inspector.scalar("SELECT count(*) FROM paper_orders") == "5");
+    REQUIRE(inspector.scalar("SELECT count(*) FROM paper_fills") == "4");
 }
 
 // Nothing is changed unless everything can be: the old schema, rows, and
@@ -764,8 +808,402 @@ void test_an_account_that_cannot_migrate_rolls_everything_back() {
             "DELETE FROM paper_accounts WHERE account_id NOT LIKE 'legacy-%'"
         ));
         apply(store, "003_multi_instrument_accounts.sql");
+        apply(store, "004_working_orders.sql");
         REQUIRE(PersistentPaperOrderSession::load(store, "legacy-open").has_value());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Migration 004: working orders
+
+// The legacy accounts as the multi-instrument release left them.
+void apply_multi_instrument_rows(
+    PostgresPaperOrderRepository& store,
+    PostgresTestConnection& inspector
+) {
+    apply_single_instrument_schema(store);
+    inspector.run_script(kSingleInstrumentRows);
+    apply(store, "003_multi_instrument_accounts.sql");
+}
+
+// Every version 3 row, which migration 004 must not change.
+constexpr std::string_view kVersion3Checksum = R"SQL(
+SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM (
+    SELECT paper_accounts::text AS row_text FROM paper_accounts
+    UNION ALL SELECT paper_positions::text FROM paper_positions
+    UNION ALL SELECT paper_execution_states::text FROM paper_execution_states
+    UNION ALL SELECT paper_order_records::text FROM paper_order_records
+    UNION ALL SELECT concat_ws('|', event_sequence, account_id,
+        order_record_id, client_order_id, event_order, event_type, created_at)
+        FROM paper_events
+) AS all_rows
+)SQL";
+
+// Whether a PostgreSQL backend of the schema's database waits for a lock on
+// `table`, polled for up to ten seconds.
+bool waits_for_lock_on(PostgresTestConnection& inspector, std::string_view table) {
+    for (int poll = 0; poll < 1'000; ++poll) {
+        if (inspector.scalar(
+                "SELECT count(*) FROM pg_locks WHERE NOT granted "
+                "AND locktype = 'relation' AND relation = $1::regclass",
+                {std::string(table)}
+            ) != "0") {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+// Rerunning migration 001, as every test and a fresh Compose volume do,
+// takes index locks in SHARE mode on paper_events and then on
+// paper_order_records. Migration 004 locks paper_accounts first and those
+// two in the same order, so it cannot complete a cycle with such a rerun:
+// waiting for paper_events, it holds no lock the rerun needs next.
+void test_migration_004_cannot_deadlock_with_a_rerun_of_001() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_multi_instrument_rows(store, inspector);
+
+    PostgresTestConnection rerun(schema.connection());
+    rerun.run_script("BEGIN; LOCK TABLE paper_events IN SHARE MODE");
+    std::string upgrade = "running";
+    std::thread upgrader([&schema, &upgrade] {
+        try {
+            PostgresPaperOrderRepository upgrading(schema.connection());
+            apply(upgrading, "004_working_orders.sql");
+            upgrade = "applied";
+        } catch (const std::exception& error) {
+            upgrade = error.what();
+        }
+    });
+    const bool upgrade_waited = waits_for_lock_on(inspector, "paper_events");
+    // The rerun's next index lock: granted at once unless the upgrade
+    // already holds paper_order_records.
+    std::string next_lock = "granted";
+    try {
+        rerun.run_script("LOCK TABLE paper_order_records IN SHARE MODE NOWAIT");
+    } catch (const std::exception& error) {
+        next_lock = error.what();
+    }
+    rerun.run_script("COMMIT");
+    upgrader.join();
+    REQUIRE(upgrade_waited);
+    REQUIRE(next_lock == "granted");
+    REQUIRE(upgrade == "applied");
+}
+
+void test_version_3_orders_become_order_state_without_loss() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_multi_instrument_rows(store, inspector);
+    const std::string version_3 = inspector.scalar(kVersion3Checksum);
+    const std::string journal_before = inspector.scalar(kJournalChecksum);
+
+    apply(store, "004_working_orders.sql");
+
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(version::text, ',' ORDER BY version) "
+        "FROM chronos_schema_migrations"
+    ) == "1,2,3,4");
+    REQUIRE(inspector.scalar(kVersion3Checksum) == version_3);
+    REQUIRE(inspector.scalar(kJournalChecksum) == journal_before);
+    // Every executed order has its state; the rejection has none.
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(concat_ws(':', order_record_id, client_order_id, "
+        "status, time_in_force, filled_quantity_raw, remaining_quantity_raw, "
+        "filled_notional_raw, fill_count, order_fee_raw, cumulative_fee_raw, "
+        "fee_charged, coalesce(cancellation_reason, '-'), reserved_cash_raw, "
+        "reserved_quantity_raw, accepted_market_ingest_sequence, "
+        "submitted_at_ns, updated_at_ns), ',' ORDER BY order_record_id) "
+        "FROM paper_orders"
+    ) == "1:buy-1:filled:ioc:300000000:0:30300000000:1:1000000:1000000:t:-:"
+         "0:0:10:110:110,"
+         "2:sell-1:filled:ioc:100000000:0:10200000000:1:1000000:1000000:t:-:"
+         "0:0:11:120:120,"
+         "4:buy-2:filled:ioc:200000000:0:20200000000:1:1000000:1000000:t:-:"
+         "0:0:20:210:210,"
+         "5:sell-2:filled:ioc:200000000:0:19800000000:1:1000000:1000000:t:-:"
+         "0:0:21:220:220,"
+         "6:passive:cancelled:ioc:0:100000000:0:0:1000000:0:f:"
+         "limit_not_marketable:0:0:30:310:310");
+    // Each booked fill keeps its ID and gets its journal record's identity.
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(concat_ws('|', fill_record_id, order_record_id, "
+        "fill_id, fill_index, side, price_raw, quantity_raw, fee_raw, "
+        "notional_raw, filled_at_ns, market_ingest_sequence), ',' "
+        "ORDER BY fill_record_id) FROM paper_fills"
+    ) == "1|1|buy-1:fill:0|0|buy|101000000000|300000000|1000000|30300000000|110|10,"
+         "2|2|sell-1:fill:0|0|sell|102000000000|100000000|1000000|10200000000|120|11,"
+         "4|4|buy-2:fill:0|0|buy|101000000000|200000000|1000000|20200000000|210|20,"
+         "5|5|sell-2:fill:0|0|sell|99000000000|200000000|1000000|19800000000|220|21");
+    // Later fills are numbered after them.
+    REQUIRE(inspector.scalar(
+        "SELECT nextval(pg_get_serial_sequence('paper_fills', "
+        "'fill_record_id'))"
+    ) == "6");
+    // Events are dated at their submission, and a fill event names its fill.
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(concat_ws(':', client_order_id, event_order, "
+        "event_type, occurred_at_ns, coalesce(fill_id, '-')), ',' "
+        "ORDER BY event_sequence) FROM paper_events "
+        "WHERE client_order_id IN ('buy-1', 'wrong-symbol', 'passive')"
+    ) == "buy-1:1:order_submitted:110:-,buy-1:2:order_completed:110:-,"
+         "buy-1:3:fill_applied:110:buy-1:fill:0,"
+         "buy-1:4:account_state_updated:110:-,"
+         "wrong-symbol:1:order_submitted:121:-,"
+         "wrong-symbol:2:risk_rejected:121:-,"
+         "passive:1:order_submitted:310:-,passive:2:order_completed:310:-,"
+         "passive:3:account_state_updated:310:-");
+
+    // The read model returns the same history, now with current state.
+    const auto buy = std::get<PaperOrderRecord>(store.find_order("legacy-open", "buy-1"));
+    REQUIRE(buy.state.has_value());
+    REQUIRE(buy.state->status == chronos::PaperOrderStatus::Filled);
+    REQUIRE(buy.state->filled_quantity == quantity("3"));
+    REQUIRE(buy.state->remaining_quantity == Quantity{});
+    REQUIRE(buy.state->filled_notional == money("303"));
+    REQUIRE(buy.state->cumulative_fee == money("0.01"));
+    REQUIRE(buy.state->reservation == chronos::OrderReservation{});
+    const auto rejected =
+        std::get<PaperOrderRecord>(store.find_order("legacy-open", "wrong-symbol"));
+    REQUIRE(!rejected.state.has_value());
+    const auto passive =
+        std::get<PaperOrderRecord>(store.find_order("legacy-cancelled", "passive"));
+    REQUIRE(passive.state->status == chronos::PaperOrderStatus::Cancelled);
+    REQUIRE(passive.state->cancellation_reason ==
+        chronos::SimulatedCancellationReason::LimitNotMarketable);
+    const auto events = std::get<chronos::PaperForwardPage<chronos::PaperOrderEventRecord>>(
+        store.list_order_events("legacy-open", "buy-1", chronos::PaperForwardPageRequest{
+            .limit = 10,
+            .after = {},
+            .instrument = {},
+        })
+    );
+    REQUIRE(events.records.size() == 4);
+    REQUIRE(events.records[2].type == chronos::PaperOrderEventType::FillApplied);
+    REQUIRE(events.records[2].fill->fill_id == "buy-1:fill:0");
+    REQUIRE(events.records[2].fill->price == price("101"));
+
+    // An upgraded account can rest a good-til-cancelled order.
+    auto session = PersistentPaperOrderSession::load(store, "legacy-open");
+    REQUIRE(session.has_value());
+    OrderIntent resting = market_order("legacy-open", kAapl, "rest-1", Side::Buy, "1", 130);
+    resting.type = OrderType::Limit;
+    resting.limit_price = price("100");
+    resting.time_in_force = TimeInForce::GoodTilCancelled;
+    const auto accepted = session->submit(resting, quote(kAapl, 50, 125, "99", "101"));
+    REQUIRE(std::holds_alternative<PersistentPaperOrderReceipt>(accepted));
+    REQUIRE(session->working_orders().size() == 1);
+    const auto recovered = PersistentPaperOrderSession::load(store, "legacy-open");
+    REQUIRE(recovered->working_orders() == session->working_orders());
+    REQUIRE(recovered->reservations().reserved_cash == money("100.01"));
+}
+
+// Nothing is changed unless everything can be: version 3 survives a
+// migration 004 that refuses its data.
+void require_version_3_unchanged(
+    PostgresTestConnection& inspector,
+    const std::string& version_3,
+    const std::string& journal
+) {
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(version::text, ',' ORDER BY version) "
+        "FROM chronos_schema_migrations"
+    ) == "1,2,3");
+    REQUIRE(inspector.scalar(
+        "SELECT (to_regclass('paper_orders') IS NULL AND "
+        "        to_regclass('paper_fills') IS NULL AND "
+        "        to_regprocedure('paper_order_fills_reconcile()') IS NULL)::text"
+    ) == "true");
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(column_name || ' ' || data_type, ',' "
+        "ORDER BY ordinal_position) FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = 'paper_events'"
+    ) == "event_sequence bigint,account_id text,order_record_id bigint,"
+         "client_order_id text,event_order smallint,event_type text,"
+         "created_at timestamp with time zone");
+    REQUIRE(!contains(
+        inspector.scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = 'paper_order_records_execution_status_check' "
+            "  AND connamespace = current_schema()::regnamespace"
+        ),
+        "working"
+    ));
+    // The reconcile function is still version 3's.
+    REQUIRE(!contains(
+        inspector.scalar(
+            "SELECT prosrc FROM pg_proc WHERE oid = "
+            "'paper_account_reconciles()'::regprocedure"
+        ),
+        "reserves"
+    ));
+    REQUIRE(inspector.scalar(kVersion3Checksum) == version_3);
+    REQUIRE(inspector.scalar(kJournalChecksum) == journal);
+}
+
+void test_corrupt_version_3_rows_roll_migration_004_back() {
+    struct Case {
+        std::string_view description;
+        std::string_view corrupt;
+        std::string_view repair;
+        std::string_view error;
+    };
+    const std::vector<Case> cases{
+        {
+            "an undeclared side on an executed order",
+            "UPDATE paper_order_records SET side = 'unknown:1' "
+            "WHERE client_order_id = 'sell-1'",
+            "UPDATE paper_order_records SET side = 'sell' "
+            "WHERE client_order_id = 'sell-1'",
+            "are not declared immediate-or-cancel orders",
+        },
+        {
+            "an executed order that claims to be good-til-cancelled",
+            "UPDATE paper_order_records SET time_in_force = 'gtc' "
+            "WHERE client_order_id = 'passive'",
+            "UPDATE paper_order_records SET time_in_force = 'ioc' "
+            "WHERE client_order_id = 'passive'",
+            "are not declared immediate-or-cancel orders",
+        },
+        {
+            "quantities that do not add up",
+            "UPDATE paper_order_records SET unfilled_quantity_raw = 1 "
+            "WHERE client_order_id = 'buy-1'",
+            "UPDATE paper_order_records SET unfilled_quantity_raw = 0 "
+            "WHERE client_order_id = 'buy-1'",
+            "have an inconsistent outcome, quantity, or fill",
+        },
+        {
+            "a receipt that carries a rejection code",
+            "UPDATE paper_order_records SET outcome_code = 'insufficient_cash' "
+            "WHERE client_order_id = 'buy-2'",
+            "UPDATE paper_order_records SET outcome_code = NULL "
+            "WHERE client_order_id = 'buy-2'",
+            "have an inconsistent outcome, quantity, or fill",
+        },
+        {
+            "an execution on another observation",
+            "UPDATE paper_order_records SET execution_market_ingest_sequence "
+            "= 11 WHERE client_order_id = 'buy-1'",
+            "UPDATE paper_order_records SET execution_market_ingest_sequence "
+            "= 10 WHERE client_order_id = 'buy-1'",
+            "have an inconsistent outcome, quantity, or fill",
+        },
+        {
+            "a fill event for an order that booked none",
+            "INSERT INTO paper_events (account_id, order_record_id, "
+            "client_order_id, event_order, event_type) SELECT account_id, "
+            "order_record_id, client_order_id, 9, 'fill_applied' "
+            "FROM paper_order_records WHERE client_order_id = 'passive'",
+            "DELETE FROM paper_events WHERE event_order = 9",
+            "fill event(s) have no booked fill",
+        },
+    };
+    for (const Case& failing : cases) {
+        const ScratchSchema schema;
+        PostgresPaperOrderRepository store(schema.connection());
+        PostgresTestConnection inspector(schema.connection());
+        apply_multi_instrument_rows(store, inspector);
+        static_cast<void>(inspector.query(failing.corrupt));
+        const std::string version_3 = inspector.scalar(kVersion3Checksum);
+        const std::string journal = inspector.scalar(kJournalChecksum);
+
+        const std::string error =
+            required_migration_error(store, "004_working_orders.sql");
+        if (!contains(error, failing.error)) {
+            throw chronos::test::TestFailure(
+                std::string(failing.description) + ": unexpected error: " +
+                error
+            );
+        }
+        require_version_3_unchanged(inspector, version_3, journal);
+        // The connection is still usable, and the migration applies once
+        // the data is repaired.
+        static_cast<void>(inspector.query(failing.repair));
+        apply(store, "004_working_orders.sql");
+        REQUIRE(inspector.scalar("SELECT count(*) FROM paper_orders") == "5");
+        REQUIRE(PersistentPaperOrderSession::load(store, "legacy-open").has_value());
+    }
+}
+
+// Version 4 refuses rows that could not have been written together, even
+// when each value alone is valid.
+void test_order_state_constraints_hold() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_multi_instrument_rows(store, inspector);
+    apply(store, "004_working_orders.sql");
+    const auto rejects = [&](std::string_view statement, std::string_view constraint) {
+        try {
+            inspector.run_script(
+                "BEGIN; " + std::string(statement) + "; COMMIT;"
+            );
+        } catch (const std::exception& error) {
+            static_cast<void>(inspector.query("ROLLBACK"));
+            if (!contains(error.what(), constraint)) {
+                throw chronos::test::TestFailure(
+                    std::string(statement) + ": unexpected error: " + error.what()
+                );
+            }
+            return;
+        }
+        throw chronos::test::TestFailure(std::string(statement) + ": accepted");
+    };
+    // An immediate-or-cancel order cannot become working.
+    rejects(
+        "UPDATE paper_orders SET status = 'working', filled_quantity_raw = 0, "
+        "remaining_quantity_raw = 300000000, filled_notional_raw = 0, "
+        "fill_count = 0 WHERE client_order_id = 'buy-1'",
+        "paper_orders_status_is_consistent"
+    );
+    // Quantities must add up.
+    rejects(
+        "UPDATE paper_orders SET remaining_quantity_raw = 1 "
+        "WHERE client_order_id = 'buy-1'",
+        "paper_orders_quantities_add_up"
+    );
+    // An order and its fills must agree, checked at commit.
+    rejects(
+        "UPDATE paper_orders SET filled_notional_raw = 30300000001 "
+        "WHERE client_order_id = 'buy-1'",
+        "disagrees with its fills"
+    );
+    // Only the first fill pays the fee, and a fill's notional is exact.
+    rejects(
+        "UPDATE paper_fills SET fill_index = 1, fill_id = 'buy-1:fill:1' "
+        "WHERE fill_id = 'buy-1:fill:0'",
+        "paper_fills_only_first_fill_pays_fee"
+    );
+    rejects(
+        "UPDATE paper_fills SET notional_raw = notional_raw + 1 "
+        "WHERE fill_id = 'buy-1:fill:0'",
+        "paper_fills_notional_is_exact"
+    );
+    // A fill cannot name another order's side or instrument.
+    rejects(
+        "UPDATE paper_fills SET side = 'sell' WHERE fill_id = 'buy-1:fill:0'",
+        "paper_fills_match_their_order"
+    );
+    // Reserved cash must be held: a working buy for more than the account
+    // has fails at commit.
+    rejects(
+        "UPDATE paper_orders SET time_in_force = 'gtc', order_type = 'limit', "
+        "limit_price_raw = 1000000000000000, status = 'working', "
+        "cancellation_reason = NULL "
+        "WHERE client_order_id = 'passive'",
+        "reserves more cash than it holds"
+    );
+    // A user cancellation records its request, and only for a GTC order.
+    rejects(
+        "UPDATE paper_orders SET cancellation_reason = 'user_requested', "
+        "cancel_request_id = 'cancel-1' WHERE client_order_id = 'passive'",
+        "paper_orders_cancellation_matches_time_in_force"
+    );
 }
 
 }  // namespace
@@ -802,5 +1240,18 @@ int main() {
             "an account that cannot migrate rolls everything back",
             test_an_account_that_cannot_migrate_rolls_everything_back,
         },
+        {
+            "version 3 orders become order state without loss",
+            test_version_3_orders_become_order_state_without_loss,
+        },
+        {
+            "migration 004 cannot deadlock with a rerun of 001",
+            test_migration_004_cannot_deadlock_with_a_rerun_of_001,
+        },
+        {
+            "corrupt version 3 rows roll migration 004 back",
+            test_corrupt_version_3_rows_roll_migration_004_back,
+        },
+        {"order state constraints hold", test_order_state_constraints_hold},
     });
 }

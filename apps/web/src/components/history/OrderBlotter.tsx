@@ -1,9 +1,11 @@
 import { useState } from 'react';
 
 import type { Order } from '../../api/schemas';
-import { CANCELLATION_REASON, ORDER_STATUS, ORDER_TYPE } from '../../presentation/vocabulary';
+import { CANCELLATION_REASON, ORDER_STATUS, ORDER_TYPE, TIME_IN_FORCE } from '../../presentation/vocabulary';
 import { useOrderHistory } from '../../state/queries';
+import { OrderLifecycle } from '../orders/OrderLifecycle';
 import { Badge } from '../ui/Badge';
+import { Button } from '../ui/Button';
 import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
 import { ReasonText } from '../ui/ReasonText';
@@ -28,12 +30,19 @@ const ORDER_COLUMNS: readonly Column<Order>[] = [
   { header: 'Type', cell: (order) => ORDER_TYPE[order.type] },
   { header: 'Quantity', numeric: true, cell: (order) => order.quantity },
   { header: 'Limit', numeric: true, cell: (order) => order.limit_price ?? '—' },
+  { header: 'TIF', cell: (order) => TIME_IN_FORCE[order.time_in_force].short },
   {
     header: 'Status',
     cell: (order) => <Badge tone={ORDER_STATUS[order.status].tone}>{ORDER_STATUS[order.status].label}</Badge>,
   },
   { header: 'Filled', numeric: true, cell: (order) => order.filled_quantity },
-  { header: 'Fill price', numeric: true, cell: (order) => order.fill?.price ?? '—' },
+  { header: 'Remaining', numeric: true, cell: (order) => order.remaining_quantity },
+  // One price only when there is one fill; several fills have several.
+  {
+    header: 'Fill price',
+    numeric: true,
+    cell: (order) => (order.fill !== null && order.fill_count === '1' ? order.fill.price : order.fill_count === '0' ? '—' : `${order.fill_count} fills`),
+  },
   { header: 'Detail', wraps: true, cell: (order) => <OrderDetail order={order} /> },
 ];
 
@@ -50,8 +59,27 @@ export function OrderBlotter({
   readonly symbols: readonly string[];
 }) {
   const [symbol, setSymbol] = useState<string | null>(null);
+  const [shown, setShown] = useState<string | null>(null);
   const history = useOrderHistory(accountId, symbol);
   const orders = history.data?.pages.flatMap((page) => page.orders) ?? [];
+  const columns: readonly Column<Order>[] = [
+    ...ORDER_COLUMNS,
+    {
+      header: 'Lifecycle',
+      cell: (order) => (
+        <Button
+          variant="quiet"
+          onClick={() => {
+            setShown(shown === order.client_order_id ? null : order.client_order_id);
+          }}
+          aria-expanded={shown === order.client_order_id}
+          aria-label={`Lifecycle of ${order.client_order_id}`}
+        >
+          Events
+        </Button>
+      ),
+    },
+  ];
   return (
     <Panel id={id} className={className} title="Orders" meta="Durable journal · manual and model share one path">
       <div className={styles.stack}>
@@ -67,11 +95,20 @@ export function OrderBlotter({
           <HistoryTable
             label="Order history"
             caption={`Recorded paper orders${symbol === null ? '' : ` for ${symbol}`}, newest first`}
-            columns={ORDER_COLUMNS}
+            columns={columns}
             rows={orders}
             rowKey={(order) => order.client_order_id}
           />
         </HistoryView>
+        {shown !== null && (
+          <OrderLifecycle
+            accountId={accountId}
+            clientOrderId={shown}
+            onClose={() => {
+              setShown(null);
+            }}
+          />
+        )}
       </div>
     </Panel>
   );

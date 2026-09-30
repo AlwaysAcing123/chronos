@@ -55,7 +55,7 @@ export function OrderTicket({
   }
 
   return (
-    <Panel id={id} title="Order ticket" meta="Paper · immediate or cancel">
+    <Panel id={id} title="Order ticket" meta="Paper · immediate or good til cancelled">
       <div className={styles.ticket}>
         {state.step === 'editing' && selected !== null && (
           <SelectField
