@@ -13,9 +13,11 @@ resource carries `"trading_mode": "paper"`, and every response carries the
 `X-Chronos-Trading-Mode: paper` header.
 
 The decision records are
-[decisions/0004-paper-trading-http-api.md](decisions/0004-paper-trading-http-api.md)
-and, for portfolio valuation,
-[decisions/0006-portfolio-valuation.md](decisions/0006-portfolio-valuation.md).
+[decisions/0004-paper-trading-http-api.md](decisions/0004-paper-trading-http-api.md),
+for portfolio valuation,
+[decisions/0006-portfolio-valuation.md](decisions/0006-portfolio-valuation.md),
+and, for working orders,
+[decisions/0011-durable-gtc-working-orders.md](decisions/0011-durable-gtc-working-orders.md).
 
 ## Architecture
 
@@ -31,6 +33,11 @@ HTTP client
 
 market-data source (paced replay
   or Alpaca IEX live)              -> MarketStateFeed -> MarketState
+                                                     -> WorkingOrderMatcher
+                                                          (own connection;
+                                                           each account with a
+                                                           marketable working
+                                                           order, one transaction)
                                                      -> MarketDataNotifier -> SSE
 MarketState -> PaperTradingService
 
@@ -99,7 +106,7 @@ Server options and their defaults:
 | `--max-order-notional` | `1000000` | Risk limit applied to new accounts |
 | `--max-position-quantity` | `10000` | Risk limit applied to new accounts |
 | `--max-quote-age-ms` | `5000` | Maximum quote age in market time |
-| `--fee-per-fill` | `0` | Flat fee per non-empty fill |
+| `--fee-per-fill` | `0` | Flat fee per order, paid by its first fill |
 | `--replay-dbn` | none | Local Databento EQUS.MINI MBP-1 recording to replay (Databento builds) |
 | `--replay-speed` | `1x` | `1x`, `10x`, `100x`, or `max`; requires `--replay-dbn` |
 | `--replay-autostart` | off | Start playing at once instead of waiting for Start; requires `--replay-dbn` |
@@ -135,6 +142,16 @@ curl -s -X POST localhost:8080/api/v1/accounts/demo-1/orders \
        "instrument":"SPY","side":"buy","type":"market","quantity":"2",
        "time_in_force":"ioc"}'
 
+curl -s -X POST localhost:8080/api/v1/accounts/demo-1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"client_order_id":"rest-1","source":{"kind":"manual","id":"me"},
+       "instrument":"AAPL","side":"buy","type":"limit","quantity":"10",
+       "limit_price":"330","time_in_force":"gtc"}'
+curl -s localhost:8080/api/v1/accounts/demo-1/working-orders
+curl -s localhost:8080/api/v1/accounts/demo-1/orders/rest-1/events
+curl -s -X POST localhost:8080/api/v1/accounts/demo-1/orders/rest-1/cancel \
+  -H 'Content-Type: application/json' -d '{"cancel_request_id":"cancel-1"}'
+
 curl -s localhost:8080/api/v1/accounts/demo-1
 curl -s 'localhost:8080/api/v1/accounts/demo-1/orders?limit=20'
 curl -s 'localhost:8080/api/v1/accounts/demo-1/orders?instrument=SPY'
@@ -149,12 +166,13 @@ curl -s -N localhost:8080/api/v1/market-data/events
 ```
 
 The history endpoints read indexes added by
-`migrations/002_paper_order_read_indexes.sql` and
-`migrations/003_multi_instrument_accounts.sql`, and every account endpoint
-needs the multi-instrument schema of 003. PostgreSQL runs the mounted
-migrations only when it initializes an empty volume, so an existing volume
-needs each newer file applied once, in order. Each is idempotent. Stop the
-server and back up the volume before applying 003 (see
+`migrations/002_paper_order_read_indexes.sql`,
+`migrations/003_multi_instrument_accounts.sql`, and
+`migrations/004_working_orders.sql`, and every account endpoint needs the
+working-order schema of 004. PostgreSQL runs the mounted migrations only
+when it initializes an empty volume, so an existing volume needs each newer
+file applied once, in order. Each is idempotent. Stop the server and back up
+the volume before applying 003 or 004 (see
 [postgresql-persistence.md](postgresql-persistence.md#upgrading-an-existing-volume)):
 
 ```sh
@@ -162,6 +180,8 @@ docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/002_paper_order_read_indexes.sql
 docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/003_multi_instrument_accounts.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/004_working_orders.sql
 ```
 
 The file is sent on standard input rather than read from the container's
@@ -186,9 +206,10 @@ then scan far more of the journal.
 - Optional fields are omitted when absent. `null` is not accepted.
 - Clients never send a quote, price source, submission time, account ID in
   the body, or risk limit.
-- Query strings are strict on every route. The history lists accept only
-  `limit` and `cursor`, each at most once; every other route accepts no query
-  parameters. Unknown, repeated, or malformed parameters return `400` rather
+- Query strings are strict on every route. The account-wide lists (orders,
+  fills, and working orders) accept only `limit`, `cursor`, and
+  `instrument`, and one order's fills and events only `limit` and `cursor`,
+  each at most once; every other route accepts no query parameters. Unknown, repeated, or malformed parameters return `400` rather
   than being ignored. Names and values are percent-decoded; `+` is not a
   space.
 
@@ -237,7 +258,8 @@ have at most 8 fractional digits and prices at most 9. The portfolio's
 
 ### Identifiers
 
-`account_id`, `client_order_id`, `source.id`, and `instrument` must be 1 to 64
+`account_id`, `client_order_id`, `cancel_request_id`, `source.id`, and
+`instrument` must be 1 to 64
 characters from `[A-Za-z0-9._-]` and start with a letter or digit. The rule
 keeps identifiers safe in URL paths, logs, and PostgreSQL text parameters. A
 violation returns `400 malformed_request` with reason `invalid_identifier`
@@ -268,6 +290,16 @@ make the server unhealthy, but it does block orders.
     "mode": "historical_replay",
     "label": "Databento EQUS.MINI MBP-1 replay",
     "state": "running"
+  },
+  "order_matching": {
+    "state": "running",
+    "observations": "119282",
+    "account_matches": "2",
+    "fills": "2",
+    "retries": "0",
+    "failed_account_matches": "0",
+    "total_matching_ns": "60410914902",
+    "longest_matching_ns": "85042125"
   }
 }
 ```
@@ -281,6 +313,19 @@ in `/api/v1/market-data`.
 `tradeable_instruments` lists the instruments every account may trade, in the
 order the server was configured with (`--instrument`), so a client can offer
 them without hard-coding server configuration.
+
+`order_matching` reports the working-order matcher (see
+[Working orders](#working-orders)); it is absent from a server without one.
+`state` is `running`, `retrying` (the matcher lost PostgreSQL and is
+retrying the same observation, so the source is held), or `stopped`.
+`observations` counts the top-of-book observations offered to working
+orders, `account_matches` the accounts matched against one (each in its own
+transaction), `fills` the fills booked, `retries` the attempts repeated
+because PostgreSQL was unavailable, and `failed_account_matches` the account
+matches abandoned because the account's stored state could not be recovered
+or written; each such account is logged once and left unchanged. The two
+durations are wall-clock nanoseconds spent matching, in total and for the
+slowest observation. None of them affects health.
 
 ### `POST /api/v1/accounts`
 
@@ -304,6 +349,9 @@ positive. Success returns `201` with an account:
     "market_stream_id": null,
     "starting_cash": "100000",
     "cash": "100000",
+    "reserved_cash": "0",
+    "available_cash": "100000",
+    "working_order_count": "0",
     "open_cost_basis": "0",
     "gross_realized_pnl": "0",
     "fees_paid": "0",
@@ -324,14 +372,16 @@ positive. Success returns `201` with an account:
 `status` becomes `halted` if the account's processor faulted after an
 accounting invariant violation. `maximum_position_quantity` applies to each
 instrument separately; the order quantity and notional limits apply to each
-order.
+order. `fee_per_fill` keeps its name, but is paid once per order, by its
+first fill; an immediate-or-cancel order fills at most once, so nothing
+changes for one.
 
 ### `GET /api/v1/accounts/{account_id}`
 
 Returns `200` with the same account resource, read from a consistent database
 snapshot. It holds no market-dependent values; mark-to-market valuation is the
 portfolio resource below. This account, from a replay of the AAPL/SPY
-recording with a 0.35 fee per fill, bought 5 AAPL at 336.04 and 3 SPY at
+recording with `fee_per_fill` 0.35, bought 5 AAPL at 336.04 and 3 SPY at
 768.23, then sold the 5 AAPL at 336.33:
 
 ```json
@@ -344,6 +394,9 @@ recording with a 0.35 fee per fill, bought 5 AAPL at 336.04 and 3 SPY at
     "market_stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
     "starting_cash": "100000",
     "cash": "97695.71",
+    "reserved_cash": "0",
+    "available_cash": "97695.71",
+    "working_order_count": "0",
     "open_cost_basis": "2304.69",
     "gross_realized_pnl": "1.45",
     "fees_paid": "1.05",
@@ -352,6 +405,8 @@ recording with a 0.35 fee per fill, bought 5 AAPL at 336.04 and 3 SPY at
       {
         "instrument": "SPY",
         "quantity": "3",
+        "reserved_quantity": "0",
+        "available_quantity": "3",
         "open_cost_basis": "2304.69",
         "average_entry_price": "768.23",
         "gross_realized_pnl": "0",
@@ -385,6 +440,13 @@ recording with a 0.35 fee per fill, bought 5 AAPL at 336.04 and 3 SPY at
   gross_realized_pnl − fees_paid` exactly.
 - `market_stream_id` is the market-data stream the account executes on,
   fixed by its first executed order, or `null` before one.
+- `reserved_cash` is what the account's working orders hold back (see
+  [Reservations](#reservations)), `available_cash = cash − reserved_cash`
+  is what a new order may spend, and `working_order_count` counts the
+  working orders. Per position, `reserved_quantity` is the shares its
+  working sells hold, and `available_quantity = quantity −
+  reserved_quantity` is what a new sell may sell. Every value is the
+  server's; clients never compute them.
 
 ### `GET /api/v1/accounts/{account_id}/portfolio`
 
@@ -395,7 +457,7 @@ other method. The client cannot supply or influence a mark.
 
 This is the response for the recording's final AAPL quote after a 10-share
 market buy that filled 4 at 337 and a model sell of 1.5 at 335.82, with a
-0.35 fee per fill:
+`fee_per_fill` of 0.35:
 
 ```json
 {
@@ -409,6 +471,8 @@ market buy that filled 4 at 337 and a model sell of 1.5 at 335.82, with a
     "mark_policy": "best_bid",
     "starting_cash": "100000",
     "cash": "99155.03",
+    "reserved_cash": "0",
+    "available_cash": "99155.03",
     "open_cost_basis": "842.5",
     "market_value": "839.55",
     "unrealized_pnl": "-2.95",
@@ -471,9 +535,11 @@ to the same instant. `valued_at` is the market clock: the receive timestamp
 of the latest event accepted on the stream, which may be later than a
 position's `market.receive_timestamp` when other instruments updated since;
 it is `null` only before the stream's first event, when nothing can be held.
-`account_version` is the durable version valued. The ledger fields have the
-account resource's meaning; `status` is `halted` for a faulted account, which
-can still be valued.
+`account_version` is the durable version valued. The ledger fields, and
+`reserved_cash` and `available_cash`, have the account resource's meaning;
+`status` is `halted` for a faulted account, which can still be valued.
+Reservations do not change valuation: reserved cash is still cash, and a
+position a working sell reserves is still held and marked.
 
 **Formulas.** All values are exact fixed-point decimals computed with checked
 arithmetic:
@@ -523,10 +589,13 @@ continue that instrument's execution timeline (see
 | `source.kind` | `manual`, `model` |
 | `side` | `buy`, `sell` |
 | `type` | `market`, `limit` |
-| `time_in_force` | `ioc` |
+| `time_in_force` | `ioc` (immediate or cancel), `gtc` (good til cancelled) |
 | `limit_price` | required for `limit`, must be omitted for `market` |
 
-Enumerations are case-sensitive and closed.
+Enumerations are case-sensitive and closed. Only a limit order can be
+`gtc`; a market order with `gtc` is recorded as `422 risk_rejected` /
+`market_order_requires_ioc` with `field: "time_in_force"`, and consumes its
+client order ID like any recorded rejection.
 
 `instrument` must be one of the server's `tradeable_instruments`; any other
 returns `422 unsupported_instrument` and records nothing. The server executes
@@ -551,8 +620,18 @@ quote, where only 4 shares were displayed:
     "submitted_at": "2026-09-25T13:39:59.969574414Z",
     "status": "partially_filled_and_cancelled",
     "filled_quantity": "4",
+    "remaining_quantity": "6",
     "unfilled_quantity": "6",
+    "filled_notional": "1348",
+    "fill_count": "1",
+    "fee_charged": true,
+    "cumulative_fee": "0.35",
+    "reserved_cash": "0",
+    "reserved_quantity": "0",
+    "priority": null,
+    "updated_at": "2026-09-25T13:39:59.969574414Z",
     "cancellation_reason": "displayed_liquidity_exhausted",
+    "cancel_request_id": null,
     "fill": {
       "fill_id": "buy-1:fill:0",
       "side": "buy",
@@ -578,10 +657,100 @@ quote, where only 4 shares were displayed:
 }
 ```
 
-`status` is `filled`, `partially_filled_and_cancelled`, or `cancelled` for an
-executed order. A cancelled order has `cancellation_reason`
-`limit_not_marketable` or `displayed_liquidity_exhausted` and `fill: null`.
-`market` is the exact observation the server used, including its lineage.
+An immediate-or-cancel order's `status` is `filled`,
+`partially_filled_and_cancelled`, or `cancelled` once executed. A cancelled
+order has `cancellation_reason` `limit_not_marketable` or
+`displayed_liquidity_exhausted` and `fill: null`. `market` is the exact
+observation the server used, including its lineage.
+
+A good-til-cancelled order also executes at once against the current quote
+as far as it can, and the rest **works**: it stays open and is filled by
+later quotes (see [Working orders](#working-orders)). Its submission also
+returns `201`, with `status` `filled`, `partially_filled` (some filled, the
+rest working), or `working` (nothing filled yet). This limit buy of 200
+filled the 15 shares displayed at 334.92 and rests for 185:
+
+```json
+{
+  "order": {
+    "trading_mode": "paper",
+    "account_id": "smoke-gtc-1",
+    "client_order_id": "gtc-buy-1",
+    "source": {"kind": "manual", "id": "smoke"},
+    "instrument": "AAPL",
+    "side": "buy",
+    "type": "limit",
+    "quantity": "200",
+    "limit_price": "336.3",
+    "time_in_force": "gtc",
+    "submitted_at": "2026-09-25T13:31:49.322049622Z",
+    "status": "partially_filled",
+    "filled_quantity": "15",
+    "remaining_quantity": "185",
+    "unfilled_quantity": "185",
+    "filled_notional": "5023.8",
+    "fill_count": "1",
+    "fee_charged": true,
+    "cumulative_fee": "0.35",
+    "reserved_cash": "62215.5",
+    "reserved_quantity": "0",
+    "priority": "1",
+    "updated_at": "2026-09-25T13:31:49.322049622Z",
+    "cancellation_reason": null,
+    "cancel_request_id": null,
+    "fill": {
+      "fill_id": "gtc-buy-1:fill:0",
+      "side": "buy",
+      "price": "334.92",
+      "quantity": "15",
+      "notional": "5023.8",
+      "fee": "0.35",
+      "filled_at": "2026-09-25T13:31:49.322049622Z"
+    },
+    "rejection": null,
+    "market": {"...": "the observation it was accepted on, ingest_sequence 32933"}
+  },
+  "account": {
+    "...": "...",
+    "cash": "94975.85",
+    "reserved_cash": "62215.5",
+    "available_cash": "32760.35",
+    "working_order_count": "1"
+  }
+}
+```
+
+The order fields are the order's **current** state wherever an order
+appears, not its state at submission:
+
+- `filled_quantity + remaining_quantity = quantity` always.
+  `unfilled_quantity` repeats `remaining_quantity` for older clients.
+- `filled_notional`, `fill_count`, and `cumulative_fee` sum the order's
+  fills. `fee_charged` says whether its one fee has been paid.
+- `reserved_cash` and `reserved_quantity` are what the order holds back now
+  ([Reservations](#reservations)); both are `0` once it is terminal.
+- `priority` is the order's place among the account's working orders, an
+  opaque string that sorts as an integer: lower was accepted earlier. It is
+  `null` for an immediate-or-cancel order.
+- `updated_at` is the market time of the order's latest change: its
+  submission, latest fill, or cancellation.
+- `cancel_request_id` is the request that cancelled it, or `null`.
+- `fill` is the fill booked at submission, if any; every fill is at
+  [`/orders/{client_order_id}/fills`](#get-apiv1accountsaccount_idordersclient_order_idfills).
+- `market` is the observation it was accepted on. Later fills name their
+  own observations only through their fill IDs and times.
+
+Order `status` values:
+
+| `status` | Terminal | Meaning |
+|---|:---:|---|
+| `working` | no | GTC; nothing filled; the whole quantity works |
+| `partially_filled` | no | GTC; some filled; the rest works |
+| `filled` | yes | Everything filled |
+| `partially_filled_and_cancelled` | yes | Some filled; the rest was cancelled (`displayed_liquidity_exhausted`, or `user_requested` for a GTC order) |
+| `cancelled` | yes | Nothing filled; cancelled (`limit_not_marketable`, `displayed_liquidity_exhausted`, or `user_requested`) |
+| `rejected` | yes | Recorded risk or execution rejection |
+| `faulted` | yes | Recorded processing fault; the account is halted |
 
 A recorded rejection returns `422` with the same `order` and `account`
 objects, `order.status` set to `rejected`, and an `error` object. A recorded
@@ -595,8 +764,9 @@ rejected.
 
 ### `GET /api/v1/accounts/{account_id}/orders`
 
-Lists the account's recorded submissions, newest first: filled, partially
-filled, cancelled, risk-rejected, execution-rejected, and faulted orders.
+Lists the account's recorded submissions, newest first by submission:
+working, filled, partially filled, cancelled, risk-rejected,
+execution-rejected, and faulted orders, each in its current state.
 Every item is the order resource described above, read from the journal
 without re-running risk, execution, or accounting. `?instrument=SPY` lists
 only the orders for that instrument (see [Pagination](#pagination)).
@@ -616,16 +786,19 @@ null}`; an unknown account returns `404 account_not_found`.
 
 ### `GET /api/v1/accounts/{account_id}/orders/{client_order_id}`
 
-Returns `{"order": ...}`, the complete persisted outcome of one submission,
-with exactly the `order` object its submission returned. An existing account
-without that order returns `404 order_not_found`; an unknown account returns
+Returns `{"order": ...}`, the order's persisted submission and current
+state. For an order that can no longer change (every immediate-or-cancel
+order, and a terminal GTC order), it is exactly the `order` object its
+submission or cancellation returned. An existing account without that order
+returns `404 order_not_found`; an unknown account returns
 `404 account_not_found`.
 
 ### `GET /api/v1/accounts/{account_id}/fills`
 
 Lists the fills accounting booked, newest first, with the same pagination
-and the same optional `instrument` filter. Only executed orders book fills; a
-faulted order's rejected simulated fill is never listed.
+and the same optional `instrument` filter, including every fill of a
+working order. Only executed orders book fills; a faulted order's rejected
+simulated fill is never listed.
 
 ```json
 {
@@ -642,7 +815,8 @@ faulted order's rejected simulated fill is never listed.
       "quantity": "4",
       "notional": "1348",
       "fee": "0.35",
-      "filled_at": "2026-09-25T13:39:59.969574414Z"
+      "filled_at": "2026-09-25T13:39:59.969574414Z",
+      "fill_index": "0"
     }
   ],
   "next_cursor": null
@@ -650,32 +824,162 @@ faulted order's rejected simulated fill is never listed.
 ```
 
 `notional` is the accounting contract's value, price times quantity rounded
-half away from zero to `0.00000001`. The journal stores the price and
-quantity it was computed from, and the read side derives it with the same
-function the account used.
+half away from zero to `0.00000001`, stored with the fill and checked against
+its price and quantity when read. `fill_index` numbers the order's fills
+from `0`, and `fill_id` is `{client_order_id}:fill:{fill_index}`. Only fill
+`0` pays a fee.
+
+### `GET /api/v1/accounts/{account_id}/working-orders`
+
+Lists the account's working orders (`working` and `partially_filled`) in
+priority order, oldest accepted first, as order resources in their current
+state. It pages forward: `limit`, `cursor`, and the optional `instrument`
+filter behave as in [Pagination](#pagination), and `next_cursor` continues
+after the last order returned.
+
+```json
+{
+  "orders": [
+    {"client_order_id": "gtc-spy-1", "status": "working", "priority": "4",
+     "remaining_quantity": "5", "reserved_cash": "3835.35", "...": "..."},
+    {"client_order_id": "gtc-sell-1", "status": "working", "priority": "5",
+     "remaining_quantity": "50", "reserved_cash": "0.35",
+     "reserved_quantity": "50", "...": "..."}
+  ],
+  "next_cursor": null
+}
+```
+
+An order that fills or is cancelled leaves the list, so a cursor chain read
+while orders change may skip an order that became terminal, but never
+repeats one or returns one out of priority order. Restart the chain to see
+the list as it is now.
+
+### `POST /api/v1/accounts/{account_id}/orders/{client_order_id}/cancel`
+
+Cancels a working order's remainder. The body is exactly:
+
+```json
+{"cancel_request_id": "cancel-1"}
+```
+
+`cancel_request_id` is an [identifier](#identifiers) the client chooses for
+this cancellation. Success returns `200` with the order after cancellation,
+the account after it, and whether this request had already cancelled it:
+
+```json
+{
+  "order": {
+    "client_order_id": "gtc-buy-2",
+    "status": "cancelled",
+    "filled_quantity": "0",
+    "remaining_quantity": "10",
+    "reserved_cash": "0",
+    "reserved_quantity": "0",
+    "updated_at": "2026-09-25T13:35:42.946522062Z",
+    "cancellation_reason": "user_requested",
+    "cancel_request_id": "cancel-2a",
+    "...": "..."
+  },
+  "account": {"...": "the account resource after cancellation"},
+  "already_cancelled": false
+}
+```
+
+- The order's fills and its fee stand; only the remainder is cancelled, and
+  its reservation is released in the same transaction. A partially filled
+  order becomes `partially_filled_and_cancelled`, an unfilled one
+  `cancelled`, both with `cancellation_reason: "user_requested"`.
+- **Idempotent.** Repeating the request with the same `cancel_request_id`
+  for the same order returns `200` with the order as that cancellation left
+  it and `already_cancelled: true`, whatever happened since. A
+  `cancel_request_id` cancels at most one order: using it for another order
+  of the account returns `409 duplicate_cancel_request_id`.
+- **Nothing to cancel.** An order that is already terminal (filled,
+  cancelled, rejected, or faulted, including cancelled by another request)
+  returns `409 order_not_cancellable` with the order as it is, so a client
+  that lost a race with a fill sees what happened:
+  `{"error": {"code": "order_not_cancellable", "field": "client_order_id",
+  ...}, "order": {...}}`. Nothing is recorded.
+- It needs no market data, and works while the market is unavailable,
+  stale, or interrupted, and on a halted account, whose working orders never
+  fill. `updated_at` is the market time when a market clock exists, and
+  never earlier than the order's latest change.
+- It is serialized with matching and submissions under the account's lock:
+  a cancel that commits first stops every later fill, and a fill that
+  commits first stands.
+
+After `503 persistence_unavailable` or `500 internal_error`, the
+cancellation may or may not have committed. Resend the same request with
+the same `cancel_request_id`: it either cancels, or returns `200` with
+`already_cancelled: true`, or returns `409 order_not_cancellable` if the
+order filled or was cancelled otherwise first. Reading the order also
+settles it: `cancel_request_id` names the request that cancelled it.
+
+### `GET /api/v1/accounts/{account_id}/orders/{client_order_id}/fills`
+
+Lists one order's fills, oldest first by `fill_index`, as fill resources.
+It pages forward with `limit` and `cursor`; `next_cursor` continues after
+the last fill returned. An immediate-or-cancel order has at most one fill.
+
+### `GET /api/v1/accounts/{account_id}/orders/{client_order_id}/events`
+
+Lists one order's audit events in the order they happened, with `limit` and
+`cursor` paging forward. Each event has its number within the order, its
+type, its market time, and, for `fill_applied`, the fill it booked:
+
+```json
+{
+  "events": [
+    {"sequence": "1", "type": "order_submitted", "occurred_at": "2026-09-25T13:31:49.322053489Z", "fill": null},
+    {"sequence": "2", "type": "order_accepted", "occurred_at": "2026-09-25T13:31:49.322053489Z", "fill": null},
+    {"sequence": "3", "type": "account_state_updated", "occurred_at": "2026-09-25T13:31:49.322053489Z", "fill": null},
+    {"sequence": "4", "type": "order_cancelled", "occurred_at": "2026-09-25T13:35:42.946522062Z", "fill": null},
+    {"sequence": "5", "type": "account_state_updated", "occurred_at": "2026-09-25T13:35:42.946522062Z", "fill": null}
+  ],
+  "next_cursor": null
+}
+```
+
+Event types are `order_submitted`, `risk_rejected`, `execution_rejected`,
+`order_completed` (an immediate-or-cancel order executed), `order_accepted`
+(a GTC order was accepted), `fill_applied`, `order_filled` (a GTC order has
+nothing left), `order_cancelled`, `account_state_updated`, and
+`processor_faulted`. Events recorded before migration 004 carry their
+submission's time.
+
+For each per-order list, an existing account without that order returns
+`404 order_not_found`, and an unknown account `404 account_not_found`.
 
 ### Pagination
 
-- Both lists are newest first, ordered by the journal's record identity.
-  Within one account it increases in commit order, because every order record
-  is inserted while the account row is locked.
+- The account-wide orders and fills lists are newest first, ordered by
+  record identity: the journal's for orders, the fill table's for fills.
+  Within one account each increases in commit order, because every order
+  and fill is inserted while the account row is locked.
+- The working-orders list and the per-order fills and events lists are
+  oldest first and page forward: `next_cursor` continues after the last item
+  returned, and is `null` when nothing followed it when the page was read.
 - `limit` is an integer from 1 to 200; the default is 50.
 - `instrument` is optional. Present, it keeps only that instrument's records;
   it must be a valid identifier (`400 malformed_request` /
   `invalid_identifier` otherwise) but need not be tradeable now, so the
   history of an instrument no longer configured stays readable. An instrument
   the account never traded has an empty history.
-- `next_cursor` is an opaque string, or `null` when no older item exists.
-  Pass it back unchanged as `cursor` with the same account, list, and
-  `instrument` filter. A cursor is rejected (`invalid_cursor`) by the other
-  list, by other accounts, and under a different filter, including no filter.
+- `next_cursor` is an opaque string, or `null` when no further item exists.
+  Pass it back unchanged as `cursor` with the same account, list, order, and
+  `instrument` filter. A cursor is rejected (`invalid_cursor`) by any other
+  list, by other accounts and orders, and under a different filter,
+  including no filter.
   Cursors for unfiltered lists keep their original encoding, so ones issued
   before filters existed remain valid.
 - Following a cursor chain never repeats an item, even while new orders are
   recorded: new orders are newer than the first page and appear only when a
   chain is restarted without a cursor.
-- A non-null `next_cursor` means an older item existed when the page was read.
-  The journal is append-only, so the next page is not empty.
+- A non-null `next_cursor` from an orders or fills list means an older item
+  existed when the page was read. Both are append-only, so the next page is
+  not empty. A working-orders page can be followed by an empty one, when
+  the orders after it stopped working.
 
 ### Reconciling an uncertain submission
 
@@ -683,8 +987,8 @@ After `503 persistence_unavailable` or `500 internal_error` from a submission,
 the order may or may not have been recorded:
 
 1. `GET /api/v1/accounts/{account_id}/orders/{client_order_id}`.
-2. `200` means it was recorded; the resource is its final outcome. Do not
-   resubmit.
+2. `200` means it was recorded. Do not resubmit. The resource is its current
+   state: for a GTC order, fills may have followed since.
 3. `404 order_not_found` means it was not recorded when read. Resubmitting
    the same `client_order_id` is safe.
 4. If that resubmission returns `409 duplicate_client_order_id`, the original
@@ -692,7 +996,9 @@ the order may or may not have been recorded:
 
 The database accepts each client order ID at most once per account, so this
 procedure can never record an order twice. It does not change the submission
-contract.
+contract. `503 order_matching_busy` is different: it is returned before
+anything is written, so the order was certainly not recorded and the same
+request can be retried at once.
 
 ### `GET /api/v1/market-data`
 
@@ -842,11 +1148,18 @@ the client refetches the resources it shows.
 retry: 3000
 
 event: market-data
-data: {"revision":"4817"}
+data: {"revision":"4817","activity_revision":"10"}
 
 : heartbeat
 ```
 
+- `revision` changes whenever the market or source changes.
+  `activity_revision` changes whenever an account changed without a request
+  from this client: a working order filled, or matching halted an account.
+  It also changes after every submission and cancellation. A client refetches
+  account resources only when `activity_revision` changes, and market
+  resources when `revision` does, so a busy market does not make it reload
+  every account view.
 - The first notice is sent at once, so a reconnecting view refreshes.
 - Notices are coalesced: at most one per 250 ms per connection, carrying the
   latest revision. Every market event still reaches the market state; only
@@ -911,7 +1224,9 @@ with the same ID.
 | 405 | `method_not_allowed` | no | Wrong method; `Allow` names the right one |
 | 409 | `account_already_exists` | no | The account ID is taken; the original is unchanged |
 | 409 | `duplicate_client_order_id` | no | This account already recorded the ID; nothing new was recorded |
-| 409 | `account_version_conflict` | no | Another writer changed the account first; retry with the same ID |
+| 409 | `account_version_conflict` | no | Another writer changed the account first; retry with the same ID. The server's own writers serialize on the account lock instead, so only a writer outside it can cause this |
+| 409 | `order_not_cancellable` | no | The order is terminal; the body carries it as it is |
+| 409 | `duplicate_cancel_request_id` | no | This `cancel_request_id` already cancelled another order of the account |
 | 413 | `payload_too_large` | no | Body exceeds 16 KiB |
 | 415 | `unsupported_media_type` | no | `Content-Type` is not JSON |
 | 422 | `unsupported_instrument` | no | An order for an instrument the server does not trade; retry with a tradeable one and the same ID |
@@ -926,7 +1241,8 @@ with the same ID.
 | 409 | `replay_control_unavailable` | no | The server's source is not a replay; `reason` is the source mode |
 | 503 | `event_stream_unavailable` | no | Too many change streams are open, or the server is stopping |
 | 503 | `market_data_unavailable` | no | No usable market for the order's instrument, or for the account's open positions; `reason` is below |
-| 503 | `persistence_unavailable` | unknown | PostgreSQL was unreachable; retry the identical request with the same identifiers |
+| 503 | `persistence_unavailable` | unknown | PostgreSQL was unreachable, or the account stayed locked longer than the server's lock timeout; read the resource and retry the identical request with the same identifiers |
+| 503 | `order_matching_busy` | no | Working orders were still being matched against the latest market event after 2 s; retry the same request |
 
 `market_data_unavailable` reasons:
 
@@ -961,6 +1277,7 @@ Risk reasons are the persisted risk codes, such as `insufficient_cash`,
 `unexpected_limit_price`, and `suspect_market_state`. `instrument_mismatch`
 appears only in orders recorded before accounts held several instruments,
 when an order named an instrument other than its account's single one.
+`market_order_requires_ioc` rejects a market order sent as `gtc`.
 Execution reasons include `market_stream_mismatch`, `stale_market_approval`,
 and `market_snapshot_mismatch`. All names are defined once in
 `chronos/paper_order_codes.hpp` and shared with the journal.
@@ -972,7 +1289,11 @@ identifier at most once, so an order retry either records the order or returns
 `duplicate_client_order_id`. Reads can be retried unchanged. Internal details,
 including libpq messages, go to the server log and never to clients.
 
-The Recorded column describes submissions. Reads never record anything. A
+The Recorded column describes submissions. A cancellation records only its
+`200`; after `503 persistence_unavailable` or `500 internal_error` it may or
+may not have committed, and the same request settles it (see
+[the cancel endpoint](#post-apiv1accountsaccount_idordersclient_order_idcancel)).
+Reads never record anything. A
 read of a journal row that could not have been written fails closed with
 `500 internal_error` rather than returning a misleading resource; so does a
 record whose values the v1 contract cannot represent, such as a malformed
@@ -1058,49 +1379,143 @@ listed as `incompatible_market_timeline` under `position_mark_unavailable`.
 An account that has never executed has no timeline yet and can be valued
 against any stream.
 
+## Working orders
+
+A good-til-cancelled limit order works until it fills or is cancelled.
+There is no expiry, no end of day, and no cancellation by the server:
+nothing but a fill or a cancel request ends it, across restarts.
+
+**Acceptance.** A GTC order needs a usable quote to be accepted, exactly as
+an IOC order: the same risk checks run against it (with the reservations
+below), and an unusable market is rejected or refused in the same way. It
+then executes at once against that quote, as far as the displayed
+liquidity the account has not already taken allows, and the remainder
+rests. An order that fills nothing at once takes no liquidity.
+
+**Matching.** Each later top-of-book observation of the order's instrument
+is offered to the account's working orders on that instrument, in priority
+order, before the next market event is applied. An observation fills an
+order only if:
+
+- the account is active (not halted) and on the observation's stream;
+- the observation is a valid top of book without a suspect quality flag
+  (it is matched as it arrives, so it is always current);
+- it is later than the observation the order was accepted on, and later
+  than the instrument's latest execution in the account, so an observation
+  fills at most once and never after a newer one;
+- the order is marketable against it: the best ask is at or below a buy's
+  limit, or the best bid at or above a sell's.
+
+The fill is at the opposite best price, for at most the displayed size less
+what the account's earlier orders took from the same observation: accounts
+never share liquidity, and within an account the earlier order fills first.
+There is no depth sweep, queue position, or trade-driven fill. Its time is
+the observation's receive time. An observation that does not qualify is
+skipped: the order keeps working and a later observation can still fill it.
+Three edge cases also skip an observation rather than cancel: a fill whose
+notional rounds to zero, one whose arithmetic would overflow, and a partial
+buy fill whose rounding would leave the order's reservation a unit short.
+The remaining displayed liquidity on that side is then unavailable to newer
+orders of the account for that observation, preserving FIFO priority.
+
+Every fill is one transaction per account, committed before the next market
+event is applied, and every view reads it from PostgreSQL. Matching does
+not depend on the change stream or any client being connected.
+
+**Fees.** An order pays one fee, `fee_per_fill`, with its first fill; later
+fills pay nothing. An order that never fills pays nothing.
+
+### Reservations
+
+Each working order holds back what it could still spend, so no two orders,
+and no immediate-or-cancel order, can spend the same cash or shares:
+
+| Order | `reserved_cash` | `reserved_quantity` |
+|---|---|---|
+| Buy | `limit × remaining`, rounded half away from zero to `0.00000001`, plus the fee until it is paid | `0` |
+| Sell | the fee until it is paid | `remaining` |
+
+An account's `reserved_cash` sums its orders', and a position's
+`reserved_quantity` sums its working sells'. Risk checks a new order, of
+either time in force, against what is not reserved: a buy's notional and
+fee against `available_cash`, a sell's quantity against the position's
+`available_quantity`, and its fee against `available_cash`. The order
+notional limit uses `quantity × limit_price` for a GTC order, since it may
+fill at its limit; the position limit counts the shares working buys could
+still add. A reservation that cannot be represented fails the order closed
+as a risk rejection. A fill at a better price than the limit releases the
+difference; cancellation and a full fill release everything.
+
 ## Persistence and concurrency
 
 - `PaperTradingService` exclusively owns one PostgreSQL connection and
   serializes every operation. HTTP worker threads may handle connections
-  concurrently, but service calls run one at a time.
-- Sessions are request-scoped. Each operation loads the account from a
-  repeatable-read snapshot, processes one order, commits the snapshot and
-  journal atomically, and discards the session. The process keeps no account
-  state between requests.
-- Optimistic concurrency protects against other processes: if another writer
-  commits first, the losing request records nothing and returns
-  `account_version_conflict`.
+  concurrently, but service calls run one at a time. The working-order
+  matcher owns a second connection, so API reads never wait for matching.
+- Sessions are request-scoped. A submission or cancellation locks the
+  account row, recovers the account inside that transaction, processes one
+  request, commits its state, order rows, and journal atomically, and
+  discards the session. The matcher does the same for each account it
+  matches. The process keeps no account state between requests.
+- Changes of one account are therefore serialized, across connections and
+  processes, in the order they take the lock. A lock waited on longer than
+  5 s (1 s for the matcher) fails with `persistence_unavailable` and records
+  nothing; the matcher retries.
+- A submission also waits, up to 2 s, for matching of the market event
+  being applied to finish, then holds the market until it has committed and
+  read its order back. It therefore executes against the market working
+  orders have already been matched against, the next event is matched after
+  the order is recorded, and its response shows the order and account at
+  the same instant. Submissions wait one at a time, within the same 2 s,
+  and without holding the connection, so reads, cancellations, and
+  `/health` never wait for matching. A longer wait returns
+  `503 order_matching_busy`.
+- Optimistic versions remain a second line of defense: a writer that does
+  not take the lock and commits first makes the other return
+  `account_version_conflict`, and nothing is recorded.
 - A lost connection surfaces as `persistence_unavailable` for the request that
-  observes it. The next operation reconnects automatically.
+  observes it. The next operation reconnects automatically. A matcher that
+  loses its connection retries the same observation, holding the source,
+  until it succeeds or the server stops; `/health` shows `retrying`.
 - A portfolio read loads the account the same way, in a repeatable-read,
   read-only transaction, then reads every held instrument's quote from
   `MarketState` in one consistent read while holding the service lock. No
   order can commit between the two within one server process.
 - Each history read runs in one repeatable-read, read-only transaction that
-  checks the account and fetches at most `limit + 1` rows through an index on
-  `(account_id, order_record_id)`, or `(account_id, instrument,
-  order_record_id)` with an instrument filter, so an empty history is reliably
-  distinguished from a missing account and no read loads the whole journal.
+  checks the account (and the order, for a per-order list) and fetches at
+  most `limit + 1` rows through an index: the journal's on `(account_id,
+  order_record_id)`, or `(account_id, instrument, order_record_id)` with an
+  instrument filter, for orders; the fill table's matching pair for fills;
+  the partial working-order index for working orders; and per-order unique
+  keys for one order's fills and events. An empty list is therefore reliably
+  distinguished from a missing account or order, and no read loads the
+  whole journal.
 - One user's orders never consume another account's shadow liquidity. Within
   one account, orders against the same instrument snapshot cannot reuse
   liquidity that earlier orders consumed, including across restarts, and
   consuming one instrument's liquidity never reduces another's.
 - Cash is shared by an account's instruments, so two concurrent orders for
-  different instruments on one account race for the same account version:
-  one commits and the other returns `account_version_conflict`. Retrying it
-  re-checks risk against the cash that is left, so cash can never be spent
-  twice.
+  different instruments on one account serialize on the account lock: the
+  second is checked against the cash and reservations the first left, so
+  cash can never be spent twice.
+- Shutdown stops the HTTP server, then the matcher, which ends any retry,
+  then the source. Each account match either commits or rolls back as a
+  whole; a restart recovers every working order from PostgreSQL and matches
+  it against the events that follow.
 
 ## Execution assumptions
 
 The simulator is deliberately simple and is not a realistic exchange:
 
-- Immediate-or-cancel orders against the displayed top of book only; no
-  Level-2 sweep, queue position, market impact, or resting orders.
-- No latency: an order executes at market time against the latest quote.
+- Immediate-or-cancel and good-til-cancelled orders against the displayed
+  top of book only; no Level-2 sweep, queue position, market impact, or
+  trade-driven fills. A working order is not part of any book and never
+  provides liquidity.
+- No latency: an order executes at market time against the latest quote,
+  and a working order against each later quote as it arrives.
 - A limit order fills at the opposite best price when marketable; no price
-  improvement.
-- One flat fee per non-empty fill.
+  improvement beyond that.
+- One flat fee per order, paid by its first fill.
 - Long-only accounts holding any number of instruments from one USD cash
   balance, all on one market-data stream.
 
@@ -1118,7 +1533,11 @@ These are intentionally not implemented in this slice:
 - **Live updates.** A WebSocket endpoint can publish `MarketState` updates and
   journal events. The journal already assigns `paper_events` a database
   sequence for ordered consumers.
-- **Cancel/replace** needs a resting-order state machine.
+- **Replace** (amending a working order's quantity or price) can build on
+  the working-order state machine and its priority; it would need a rule
+  for when an amendment keeps priority.
+- **Other time-in-force values** such as day or good-til-date need a
+  session calendar or expiry clock.
 - **Other valuations.** Size-aware liquidation value needs Level-2 depth; an
   equity curve needs a valuation history, which could be derived from the
   journal and market recording without changing this endpoint.
@@ -1129,9 +1548,15 @@ These are intentionally not implemented in this slice:
 
 - Local development only: no authentication, authorization, TLS, CORS, or
   rate limiting.
-- One database connection per server process; a slow database operation
-  delays every request, and there is no statement or lock timeout.
-- Loading an account per request costs time proportional to its journal.
+- One database connection for requests and one for matching; a slow
+  database operation delays every request, and there is no statement
+  timeout (lock waits time out).
+- Loading an account per request, and per matched account, costs time
+  proportional to its history.
+- Matching is synchronous with the source: each top-of-book observation
+  costs at least one query, and a fill several round trips, so a replay at
+  `max` runs at the database's pace (about 60 s for the 10-minute recording
+  locally) and a busy live feed could fall behind.
 - A replay cannot be rewound or restarted in place; restart the server, and
   use new accounts, to replay again.
 - An interrupted market stream recovers only by restarting the server. A live
@@ -1143,12 +1568,14 @@ These are intentionally not implemented in this slice:
   balance; there are no per-instrument cash sub-accounts or currencies.
 - An account's instruments must all come from one market-data stream, so a
   replay of one recording and a live session cannot share an account.
-- No cancel/replace endpoints yet.
+- Working orders can be cancelled but not replaced or amended, and the
+  only time in force besides immediate-or-cancel is good-til-cancelled.
 - The portfolio is a point-in-time value at the current best bid; there is no
   valuation history, equity curve, or alternative mark policy. The mark
   ignores displayed size, so it overstates what a position larger than the
   displayed bid could be sold for.
-- History lists page backward from the newest item only; there is no time
-  range filter or ascending order.
+- Order and fill history pages backward from the newest item only; there is
+  no time range filter or ascending order. Working orders and one order's
+  fills and events page forward only.
 - The top-of-book simulator's assumptions above make simulated PnL optimistic
   or pessimistic in ways not yet measured.

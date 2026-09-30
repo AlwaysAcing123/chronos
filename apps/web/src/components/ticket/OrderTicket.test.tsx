@@ -15,6 +15,7 @@ import {
   PERSISTENCE_UNAVAILABLE_MESSAGE,
   rejectedOrderJson,
   riskRejectionJson,
+  workingOrderJson,
 } from '../../test/fixtures';
 import {
   accountPath,
@@ -43,6 +44,7 @@ function recordedFor(request: RecordedRequest, fixture: Json): Json {
     type: body.type,
     quantity: body.quantity,
     limit_price: body.limit_price ?? null,
+    time_in_force: body.time_in_force,
   };
 }
 
@@ -59,6 +61,67 @@ async function reviewMarketBuy(user: ReturnType<typeof renderWithServices>['user
   await user.type(within(ticket).getByLabelText('Quantity (AAPL)'), quantity);
   await user.click(within(ticket).getByRole('button', { name: 'Review order' }));
 }
+
+describe('time in force', () => {
+  it('offers IOC and GTC for a limit order and forces a market order to IOC', async () => {
+    const { user, ticket } = await openTicket();
+    expect(within(ticket).queryByRole('group', { name: 'Time in force' })).not.toBeInTheDocument();
+    expect(within(ticket).getByText('Immediate or cancel (IOC). A market order cannot rest.')).toBeInTheDocument();
+    await user.click(within(ticket).getByRole('radio', { name: 'Limit' }));
+    const choice = within(ticket).getByRole('group', { name: 'Time in force' });
+    expect(within(choice).getByRole('radio', { name: 'Immediate or cancel (IOC)' })).toBeChecked();
+    await user.click(within(choice).getByRole('radio', { name: 'Good til cancelled (GTC)' }));
+    expect(choice).toHaveAccessibleDescription(expect.stringContaining('rests as a working order'));
+    await user.click(within(ticket).getByRole('radio', { name: 'Market' }));
+    expect(within(ticket).queryByRole('group', { name: 'Time in force' })).not.toBeInTheDocument();
+  });
+
+  it('explains the difference at review and sends the chosen time in force', async () => {
+    const api = createFakeApi();
+    const { user, ticket } = await openTicket(api);
+    api.on('POST', ordersPath, (request) => ({
+      status: 201,
+      body: { order: recordedFor(request, workingOrderJson()), account: accountJson() },
+    }));
+    await user.click(within(ticket).getByRole('radio', { name: 'Limit' }));
+    await user.click(within(ticket).getByRole('radio', { name: 'Good til cancelled (GTC)' }));
+    await user.type(within(ticket).getByLabelText('Quantity (AAPL)'), '10');
+    await user.type(within(ticket).getByLabelText('Limit price'), '336');
+    await user.click(within(ticket).getByRole('button', { name: 'Review order' }));
+    const review = within(ticket).getByRole('region', { name: 'Review paper order' });
+    expect(within(review).getByText('Good til cancelled (GTC)')).toBeInTheDocument();
+    expect(within(review).getByText(/rests as a working order/)).toBeInTheDocument();
+    expect(within(review).getByText(/reserves cash for the limit price times the unfilled quantity/)).toBeInTheDocument();
+    await user.click(within(review).getByRole('button', { name: 'Submit paper order' }));
+
+    expect(await within(ticket).findByText('Working: 10 rests at limit 336')).toBeInTheDocument();
+    expect(within(ticket).getByText('3360.35 cash')).toBeInTheDocument();
+    expect(sentBody(api.requestsTo('POST', ordersPath)[0])).toMatchObject({
+      type: 'limit',
+      limit_price: '336',
+      time_in_force: 'gtc',
+    });
+  });
+
+  it('explains immediate-or-cancel at review', async () => {
+    const { user, ticket } = await openTicket();
+    await reviewMarketBuy(user, ticket);
+    const review = within(ticket).getByRole('region', { name: 'Review paper order' });
+    expect(within(review).getByText('Immediate or cancel (IOC)')).toBeInTheDocument();
+    expect(within(review).getByText(/any unfilled quantity is cancelled/)).toBeInTheDocument();
+  });
+
+  it('shows what working orders already reserve before review', async () => {
+    const api = createFakeApi();
+    rememberSelectedAccount();
+    serveAccount(api, { account: accountJson({ reserved_cash: '3360.35', available_cash: '95794.68', working_order_count: '1' }) });
+    renderWithServices(<App />, { api });
+    const ticket = await screen.findByRole('region', { name: 'Order ticket' });
+    const context = await within(ticket).findByRole('group', { name: 'Position and account limits' });
+    expect(within(context).getByText('95794.68')).toBeInTheDocument();
+    expect(within(context).getByText('3360.35')).toBeInTheDocument();
+  });
+});
 
 describe('order ticket form', () => {
   it('asks for a limit price only for limit orders', async () => {
@@ -339,7 +402,14 @@ describe('unrecorded and uncertain submissions', () => {
     api.on('POST', ordersPath, (request) => {
       api.on('GET', `${ordersPath}/${String(sentBody(request).client_order_id)}`, {
         status: 200,
-        body: { order: { ...recordedFor(request, partialOrderJson()), quantity: '11', unfilled_quantity: '7' } },
+        body: {
+          order: {
+            ...recordedFor(request, partialOrderJson()),
+            quantity: '11',
+            remaining_quantity: '7',
+            unfilled_quantity: '7',
+          },
+        },
       });
       return { status: 503, body: errorJson('persistence_unavailable', PERSISTENCE_UNAVAILABLE_MESSAGE) };
     });

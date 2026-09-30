@@ -198,8 +198,61 @@ TopOfBookExecutionSimulator TopOfBookExecutionSimulator::restore(
     return simulator;
 }
 
+Quantity TopOfBookExecutionSimulator::available_liquidity(
+    const TopOfBookEvent& market,
+    Side side
+) const {
+    const std::optional<BookLevel>& level =
+        side == Side::Buy ? market.ask : market.bid;
+    if (!level) {
+        return Quantity{};
+    }
+    const auto existing = instruments_.find(market.header.instrument);
+    if (existing == instruments_.end() ||
+        market.header.ingest_sequence !=
+            existing->second.active_market.header.ingest_sequence) {
+        return level->quantity;
+    }
+    const Quantity consumed = side == Side::Buy
+        ? existing->second.consumed_ask_quantity
+        : existing->second.consumed_bid_quantity;
+    return level->quantity - consumed;
+}
+
+void TopOfBookExecutionSimulator::take_liquidity(
+    const TopOfBookEvent& market,
+    Side side,
+    Quantity quantity
+) {
+    if (market_lineage_violation(instruments_, market)) {
+        throw std::invalid_argument(
+            "resting orders must follow the account's market lineage"
+        );
+    }
+    if (quantity.raw() <= 0 || quantity > available_liquidity(market, side)) {
+        throw std::invalid_argument(
+            "a resting order can take only displayed, untaken liquidity"
+        );
+    }
+    const auto existing = instruments_.find(market.header.instrument);
+    InstrumentExecutionState state = existing != instruments_.end() &&
+            market.header.ingest_sequence ==
+                existing->second.active_market.header.ingest_sequence
+        ? existing->second
+        : InstrumentExecutionState{
+              .active_market = market,
+              .consumed_bid_quantity = Quantity{},
+              .consumed_ask_quantity = Quantity{},
+          };
+    Quantity& consumed = side == Side::Buy ? state.consumed_ask_quantity
+                                           : state.consumed_bid_quantity;
+    consumed = consumed + quantity;
+    instruments_.insert_or_assign(market.header.instrument, std::move(state));
+}
+
 SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
-    const ApprovedOrderIntent& approved
+    const ApprovedOrderIntent& approved,
+    std::optional<Quantity> maximum_fill_quantity
 ) {
     const auto& intent = approved.intent();
     const auto& market = approved.market();
@@ -244,7 +297,23 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
         return report;
     };
 
+    const bool rests =
+        intent.time_in_force == TimeInForce::GoodTilCancelled;
+    const auto rest_unfilled = [&] {
+        return finish(SimulatedExecutionReport{
+            .intent = intent,
+            .status = SimulatedExecutionStatus::Working,
+            .fill = std::nullopt,
+            .unfilled_quantity = intent.quantity,
+            .cancellation_reason = std::nullopt,
+            .market_ingest_sequence = market.header.ingest_sequence,
+        });
+    };
+
     if (!is_marketable(approved)) {
+        if (rests) {
+            return rest_unfilled();
+        }
         return finish(SimulatedExecutionReport{
             .intent = intent,
             .status = SimulatedExecutionStatus::Cancelled,
@@ -262,9 +331,19 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
     Quantity& consumed_quantity = intent.side == Side::Buy
         ? state.consumed_ask_quantity
         : state.consumed_bid_quantity;
-    const Quantity available_quantity =
-        displayed_level.quantity - consumed_quantity;
+    Quantity available_quantity = displayed_level.quantity - consumed_quantity;
+    if (maximum_fill_quantity) {
+        if (maximum_fill_quantity->raw() < 0) {
+            throw std::invalid_argument(
+                "maximum fill quantity must not be negative"
+            );
+        }
+        available_quantity = std::min(available_quantity, *maximum_fill_quantity);
+    }
     if (available_quantity.raw() == 0) {
+        if (rests) {
+            return rest_unfilled();
+        }
         return finish(SimulatedExecutionReport{
             .intent = intent,
             .status = SimulatedExecutionStatus::Cancelled,
@@ -292,14 +371,17 @@ SimulatedExecutionResult TopOfBookExecutionSimulator::execute(
         .timestamp = intent.submitted_at,
     };
     const bool is_complete = unfilled_quantity.raw() == 0;
+    SimulatedExecutionStatus status = SimulatedExecutionStatus::Filled;
+    if (!is_complete) {
+        status = rests ? SimulatedExecutionStatus::PartiallyFilled
+                       : SimulatedExecutionStatus::PartiallyFilledAndCancelled;
+    }
     return finish(SimulatedExecutionReport{
         .intent = intent,
-        .status = is_complete
-            ? SimulatedExecutionStatus::Filled
-            : SimulatedExecutionStatus::PartiallyFilledAndCancelled,
+        .status = status,
         .fill = fill,
         .unfilled_quantity = unfilled_quantity,
-        .cancellation_reason = is_complete
+        .cancellation_reason = is_complete || rests
             ? std::nullopt
             : std::optional<SimulatedCancellationReason>(
                   SimulatedCancellationReason::DisplayedLiquidityExhausted

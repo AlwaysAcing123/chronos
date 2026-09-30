@@ -1,5 +1,6 @@
 // The one boundary between the application and the Chronos HTTP API. Every
 // response is runtime-decoded before it reaches application state.
+import type { ApiFailure, FailureCategory } from './errors';
 import { ChronosApiError, failureCategory } from './errors';
 import type { HttpResponse, TransportOptions } from './http';
 import { decodeBody, failureOf, sendRequest } from './http';
@@ -12,17 +13,25 @@ import type {
   Health,
   MarketData,
   Order,
+  OrderEventPage,
   OrderPage,
   Portfolio,
+  WorkingOrderPage,
 } from './schemas';
 import {
   AccountEnvelopeSchema,
+  CancellationSchema,
+  ErrorEnvelopeSchema,
   FillPageSchema,
   HealthSchema,
   MarketDataEnvelopeSchema,
+  NotCancellableSchema,
   OrderEnvelopeSchema,
+  OrderEventPageSchema,
   OrderPageSchema,
   PortfolioEnvelopeSchema,
+  WorkingOrderPageSchema,
+  isWorking,
 } from './schemas';
 
 // An account trades every instrument the server offers, so it is not
@@ -48,6 +57,23 @@ export type OrderLookup =
 
 export type ReplayCommand = 'start' | 'pause' | 'resume';
 
+// What a cancel request proves about the order.
+export type CancelResponse =
+  // Cancelled by this request, now or by an earlier try of the same ID.
+  | {
+      readonly kind: 'cancelled';
+      readonly order: Order;
+      readonly account: Account;
+      readonly alreadyCancelled: boolean;
+    }
+  // Nothing was left to cancel; the order is shown as it is.
+  | { readonly kind: 'not_cancellable'; readonly order: Order; readonly error: ErrorBody }
+  // Definitely not cancelled by this request, and sending it again would not
+  // change that.
+  | { readonly kind: 'refused'; readonly error: ErrorBody; readonly category: FailureCategory }
+  // The cancellation may or may not have been recorded.
+  | { readonly kind: 'uncertain'; readonly failure: ApiFailure };
+
 export interface ChronosClient {
   getHealth(signal?: AbortSignal): Promise<Health>;
   createAccount(request: CreateAccountRequest): Promise<Account>;
@@ -71,6 +97,16 @@ export interface ChronosClient {
   // order, only hide the outcome.
   submitOrder(accountId: string, request: OrderRequest): Promise<SubmissionResponse>;
   lookupOrder(accountId: string, clientOrderId: string, signal?: AbortSignal): Promise<OrderLookup>;
+  // Never cancellable, like a submission. Every retry reuses the ID.
+  cancelOrder(accountId: string, clientOrderId: string, cancelRequestId: string): Promise<CancelResponse>;
+  // In priority order, oldest first.
+  listWorkingOrders(accountId: string, cursor: string | null, signal?: AbortSignal): Promise<WorkingOrderPage>;
+  listOrderEvents(
+    accountId: string,
+    clientOrderId: string,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<OrderEventPage>;
   getMarketData(signal?: AbortSignal): Promise<MarketData>;
   // Returns the market data after the command, or throws its typed error.
   controlReplay(command: ReplayCommand): Promise<MarketData>;
@@ -78,6 +114,8 @@ export interface ChronosClient {
 
 // Items per history page; "Load older" follows the server's keyset cursor.
 export const HISTORY_PAGE_SIZE = 25;
+// Working orders and one order's events page forward, oldest first.
+export const FORWARD_PAGE_SIZE = 50;
 
 export const DEFAULT_TRANSPORT: TransportOptions = {
   fetch: (input, init) => fetch(input, init),
@@ -103,6 +141,88 @@ function historyPath(
     query.set('cursor', cursor);
   }
   return `${accountPath(accountId)}/${list}?${query.toString()}`;
+}
+
+function forwardPath(path: string, cursor: string | null): string {
+  const query = new URLSearchParams({ limit: String(FORWARD_PAGE_SIZE) });
+  if (cursor !== null) {
+    query.set('cursor', cursor);
+  }
+  return `${path}?${query.toString()}`;
+}
+
+// Categories that prove a cancel request changed nothing.
+const CANCEL_REFUSED: ReadonlySet<FailureCategory> = new Set([
+  'malformed_request',
+  'account_not_found',
+  'order_not_found',
+  'duplicate_cancel_request_id',
+]);
+
+interface ExpectedCancellation {
+  readonly accountId: string;
+  readonly clientOrderId: string;
+  readonly cancelRequestId: string;
+}
+
+function cancellationMatchesRequest(order: Order, expected: ExpectedCancellation): boolean {
+  return (
+    order.account_id === expected.accountId &&
+    order.client_order_id === expected.clientOrderId &&
+    order.cancellation_reason === 'user_requested' &&
+    order.cancel_request_id === expected.cancelRequestId
+  );
+}
+
+export function classifyCancellation(
+  response: HttpResponse,
+  expected: ExpectedCancellation,
+): CancelResponse {
+  if (response.status === 200) {
+    const cancelled = CancellationSchema.safeParse(response.body);
+    if (
+      cancelled.success &&
+      cancelled.data.account.account_id === expected.accountId &&
+      cancellationMatchesRequest(cancelled.data.order, expected)
+    ) {
+      return {
+        kind: 'cancelled',
+        order: cancelled.data.order,
+        account: cancelled.data.account,
+        alreadyCancelled: cancelled.data.already_cancelled,
+      };
+    }
+    return uncertainCancel(response.status, 'the cancellation does not match the API contract');
+  }
+  const envelope = ErrorEnvelopeSchema.safeParse(response.body);
+  if (!envelope.success) {
+    return uncertainCancel(response.status, 'the response matches neither a cancellation nor an error');
+  }
+  const failure: ApiFailure = { kind: 'api_error', status: response.status, error: envelope.data.error };
+  const category = failureCategory(failure);
+  if (category === 'order_not_cancellable') {
+    const terminal = NotCancellableSchema.safeParse(response.body);
+    return response.status === 409 &&
+      terminal.success &&
+      terminal.data.order.account_id === expected.accountId &&
+      terminal.data.order.client_order_id === expected.clientOrderId &&
+      !isWorking(terminal.data.order.status)
+      ? { kind: 'not_cancellable', order: terminal.data.order, error: terminal.data.error }
+      : uncertainCancel(response.status, 'the order that cannot be cancelled does not match the API contract');
+  }
+  const refusalStatusMatches =
+    (category === 'malformed_request' && response.status === 400) ||
+    ((category === 'account_not_found' || category === 'order_not_found') && response.status === 404) ||
+    (category === 'duplicate_cancel_request_id' && response.status === 409);
+  if (CANCEL_REFUSED.has(category) && refusalStatusMatches) {
+    return { kind: 'refused', error: envelope.data.error, category };
+  }
+  // persistence_unavailable, internal_error, and anything unrecognised.
+  return { kind: 'uncertain', failure };
+}
+
+function uncertainCancel(status: number, detail: string): CancelResponse {
+  return { kind: 'uncertain', failure: { kind: 'unexpected_response', status, detail } };
 }
 
 function requireStatus(response: HttpResponse, status: number): HttpResponse {
@@ -194,6 +314,39 @@ export function createChronosClient(transport: TransportOptions = DEFAULT_TRANSP
         body: {},
       });
       return decodeBody(MarketDataEnvelopeSchema, requireStatus(response, 200)).market_data;
+    },
+
+    async cancelOrder(accountId, clientOrderId, cancelRequestId) {
+      try {
+        const response = await sendRequest(transport, {
+          method: 'POST',
+          path: `${accountPath(accountId)}/orders/${encodeURIComponent(clientOrderId)}/cancel`,
+          body: { cancel_request_id: cancelRequestId },
+        });
+        return classifyCancellation(response, {
+          accountId,
+          clientOrderId,
+          cancelRequestId,
+        });
+      } catch (error) {
+        if (error instanceof ChronosApiError) {
+          return { kind: 'uncertain', failure: error.failure };
+        }
+        throw error;
+      }
+    },
+
+    async listWorkingOrders(accountId, cursor, signal) {
+      const response = await get(forwardPath(`${accountPath(accountId)}/working-orders`, cursor), signal);
+      return decodeBody(WorkingOrderPageSchema, requireStatus(response, 200));
+    },
+
+    async listOrderEvents(accountId, clientOrderId, cursor, signal) {
+      const response = await get(
+        forwardPath(`${accountPath(accountId)}/orders/${encodeURIComponent(clientOrderId)}/events`, cursor),
+        signal,
+      );
+      return decodeBody(OrderEventPageSchema, requireStatus(response, 200));
     },
 
     async lookupOrder(accountId, clientOrderId, signal) {

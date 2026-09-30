@@ -17,8 +17,22 @@ constexpr std::string_view kUnfilteredVersion = "v1";
 constexpr std::string_view kFilteredVersion = "v2";
 constexpr char kSeparator = '|';
 
+constexpr std::string_view kOrderVersion = "o1";
+
 std::string_view kind_name(HistoryCursorKind kind) {
-    return kind == HistoryCursorKind::Orders ? "orders" : "fills";
+    switch (kind) {
+        case HistoryCursorKind::Orders:
+            return "orders";
+        case HistoryCursorKind::Fills:
+            return "fills";
+        case HistoryCursorKind::WorkingOrders:
+            return "working-orders";
+    }
+    return "";
+}
+
+std::string_view kind_name(OrderCursorKind kind) {
+    return kind == OrderCursorKind::Fills ? "order-fills" : "order-events";
 }
 
 std::string base64url_encode(std::string_view bytes) {
@@ -84,6 +98,14 @@ std::optional<std::int64_t> parse_record_id(std::string_view text) {
     return record_id;
 }
 
+// A position that may be zero, written without sign or leading zeros.
+std::optional<std::int64_t> parse_position(std::string_view text) {
+    if (text == "0") {
+        return 0;
+    }
+    return parse_record_id(text);
+}
+
 // Removes and returns the text before the next separator.
 std::optional<std::string_view> take_field(std::string_view& remaining) {
     const std::size_t separator = remaining.find(kSeparator);
@@ -143,6 +165,47 @@ std::optional<std::int64_t> decode_history_cursor(
         return std::nullopt;
     }
     return parse_record_id(remaining);
+}
+
+std::string encode_order_cursor(
+    OrderCursorKind kind,
+    std::string_view account_id,
+    std::string_view client_order_id,
+    std::int64_t after
+) {
+    std::string payload(kOrderVersion);
+    payload += kSeparator;
+    payload += kind_name(kind);
+    payload += kSeparator;
+    payload += account_id;
+    payload += kSeparator;
+    payload += client_order_id;
+    payload += kSeparator;
+    payload += std::to_string(after);
+    return base64url_encode(payload);
+}
+
+std::optional<std::int64_t> decode_order_cursor(
+    std::string_view cursor,
+    OrderCursorKind kind,
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (cursor.empty() || cursor.size() > kMaximumHistoryCursorLength) {
+        return std::nullopt;
+    }
+    const std::optional<std::string> payload = base64url_decode(cursor);
+    if (!payload) {
+        return std::nullopt;
+    }
+    std::string_view remaining(*payload);
+    if (take_field(remaining) != kOrderVersion ||
+        take_field(remaining) != kind_name(kind) ||
+        take_field(remaining) != account_id ||
+        take_field(remaining) != client_order_id) {
+        return std::nullopt;
+    }
+    return parse_position(remaining);
 }
 
 }  // namespace chronos::paper_trading

@@ -41,6 +41,8 @@ std::optional<std::string_view> canonical_name(
     switch (time_in_force) {
         case TimeInForce::ImmediateOrCancel:
             return "ioc";
+        case TimeInForce::GoodTilCancelled:
+            return "gtc";
     }
     return std::nullopt;
 }
@@ -55,6 +57,10 @@ std::optional<std::string_view> canonical_name(
             return "partially_filled_and_cancelled";
         case SimulatedExecutionStatus::Cancelled:
             return "cancelled";
+        case SimulatedExecutionStatus::Working:
+            return "working";
+        case SimulatedExecutionStatus::PartiallyFilled:
+            return "partially_filled";
     }
     return std::nullopt;
 }
@@ -67,6 +73,8 @@ std::optional<std::string_view> canonical_name(
             return "limit_not_marketable";
         case SimulatedCancellationReason::DisplayedLiquidityExhausted:
             return "displayed_liquidity_exhausted";
+        case SimulatedCancellationReason::UserRequested:
+            return "user_requested";
     }
     return std::nullopt;
 }
@@ -133,6 +141,8 @@ std::optional<std::string_view> canonical_name(
             return "insufficient_cash_for_fee";
         case PreTradeRiskErrorCode::ArithmeticOverflow:
             return "arithmetic_overflow";
+        case PreTradeRiskErrorCode::MarketOrderRequiresImmediateOrCancel:
+            return "market_order_requires_ioc";
     }
     return std::nullopt;
 }
@@ -165,6 +175,28 @@ std::optional<std::string_view> canonical_name(
             return "processor_faulted";
         case PaperOrderProcessingErrorCode::AccountingInvariantViolation:
             return "accounting_invariant_violation";
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string_view> canonical_name(
+    PaperOrderStatus status
+) noexcept {
+    switch (status) {
+        case PaperOrderStatus::Working:
+            return "working";
+        case PaperOrderStatus::PartiallyFilled:
+            return "partially_filled";
+        case PaperOrderStatus::Filled:
+            return "filled";
+        case PaperOrderStatus::PartiallyFilledAndCancelled:
+            return "partially_filled_and_cancelled";
+        case PaperOrderStatus::Cancelled:
+            return "cancelled";
+        case PaperOrderStatus::Rejected:
+            return "rejected";
+        case PaperOrderStatus::Faulted:
+            return "faulted";
     }
     return std::nullopt;
 }

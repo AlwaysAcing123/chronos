@@ -26,6 +26,10 @@ using DiagnosticLog = std::function<void(std::string_view line)>;
 //   POST /api/v1/accounts/{account_id}/orders
 //   GET  /api/v1/accounts/{account_id}/orders
 //   GET  /api/v1/accounts/{account_id}/orders/{client_order_id}
+//   POST /api/v1/accounts/{account_id}/orders/{client_order_id}/cancel
+//   GET  /api/v1/accounts/{account_id}/orders/{client_order_id}/fills
+//   GET  /api/v1/accounts/{account_id}/orders/{client_order_id}/events
+//   GET  /api/v1/accounts/{account_id}/working-orders
 //   GET  /api/v1/accounts/{account_id}/fills
 //   GET  /api/v1/accounts/{account_id}/portfolio
 //   GET  /api/v1/market-data
@@ -35,14 +39,16 @@ using DiagnosticLog = std::function<void(std::string_view line)>;
 // The router holds no trading logic: it checks the method, query string, and
 // media type, parses the request through the JSON contract, calls the
 // service or market-data source, and renders the typed result. Every
-// dependency must outlive the router.
+// dependency must outlive the router. With a matcher, the health route also
+// reports the working-order matcher.
 class PaperTradingHttpApi final {
 public:
     PaperTradingHttpApi(
         PaperTradingService& service,
         market_data::MarketDataSource& source,
         market_data::MarketDataNotifier& notifier,
-        DiagnosticLog log
+        DiagnosticLog log,
+        const WorkingOrderMatcher* matcher = nullptr
     );
 
     // Never throws for request content. An unexpected exception becomes a
@@ -76,6 +82,7 @@ private:
     market_data::MarketDataSource& source_;
     market_data::MarketDataNotifier& notifier_;
     DiagnosticLog log_;
+    const WorkingOrderMatcher* matcher_;
 };
 
 }  // namespace chronos::paper_trading

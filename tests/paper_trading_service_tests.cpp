@@ -461,7 +461,10 @@ void test_duplicate_client_order_id_is_not_recorded_twice() {
     REQUIRE(recorded_orders(account_id) == 1);
 }
 
-void test_concurrent_writer_causes_a_version_conflict_that_records_nothing() {
+// A submission takes the account's row lock before it recovers the account,
+// so a concurrent writer is waited for, not overwritten or reported as a
+// conflict: the submission then sees that writer's committed change.
+void test_concurrent_writer_is_serialized_before_the_submission() {
     const auto market = market_state();
     apply(*market, quote(0, 0));
     const std::string application = unique_test_id("service-conflict");
@@ -501,16 +504,9 @@ void test_concurrent_writer_causes_a_version_conflict_that_records_nothing() {
 
     REQUIRE(submitter_failure.empty());
     REQUIRE(contended.has_value());
-    require_error(
-        std::move(*contended),
-        PaperTradingErrorCode::AccountVersionConflict
-    );
-    REQUIRE(recorded_orders(account_id) == 0);
-
-    const RecordedPaperOrder retried = require_recorded(service->submit_order(
-        order_request(account_id, "contended", Side::Buy, "1")
-    ));
-    REQUIRE(retried.account.version == 2);
+    const RecordedPaperOrder recorded = require_recorded(std::move(*contended));
+    // The other writer's change to version 1 came first.
+    REQUIRE(recorded.account.version == 2);
     REQUIRE(recorded_orders(account_id) == 1);
 }
 
@@ -1716,8 +1712,8 @@ int main() {
             test_duplicate_client_order_id_is_not_recorded_twice,
         },
         {
-            "version conflict records nothing",
-            test_concurrent_writer_causes_a_version_conflict_that_records_nothing,
+            "a concurrent writer is serialized",
+            test_concurrent_writer_is_serialized_before_the_submission,
         },
         {
             "durable state survives a new service",

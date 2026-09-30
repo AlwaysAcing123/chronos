@@ -6,6 +6,7 @@ import { useAccount, useHealth, useMarketData, usePortfolio } from '../../state/
 import accountStyles from '../account/account.module.css';
 import { FillHistory } from '../history/FillHistory';
 import { OrderBlotter } from '../history/OrderBlotter';
+import { WorkingOrders } from '../orders/WorkingOrders';
 import { OrderTicket } from '../ticket/OrderTicket';
 import { Alert } from '../ui/Alert';
 import { Button } from '../ui/Button';
@@ -19,6 +20,7 @@ const SECTIONS = [
   { id: 'portfolio', label: 'Portfolio' },
   { id: 'ticket', label: 'Trade' },
   { id: 'market', label: 'Market' },
+  { id: 'working', label: 'Working' },
   { id: 'orders', label: 'Orders' },
   { id: 'fills', label: 'Fills' },
 ] as const;
@@ -131,6 +133,7 @@ export function Workspace({
             quotes={marketData.status === 'success' ? marketData.data.instruments : null}
           />
         </div>
+        <WorkingOrders id="working" className={styles.working} accountId={accountId} />
         <OrderBlotter
           id="orders"
           className={styles.orders}

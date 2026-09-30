@@ -14,12 +14,25 @@ import {
   marketDataJson,
   MARKET_TIME,
   openPositionJson,
+  orderEventJson,
   partialOrderJson,
+  partiallyFilledWorkingOrderJson,
   portfolioJson,
   replaySourceJson,
   spyMarketJson,
+  userCancelledOrderJson,
   valuedPositionJson,
+  workingOrderJson,
 } from '../src/test/fixtures';
+
+// One good-til-cancelled order per account: a buy of 10 AAPL at 336, below
+// the 337 ask, which a later ask of 336 × 4 partially fills.
+interface MockWorkingOrder {
+  clientOrderId: string;
+  source: Json;
+  stage: 'working' | 'partially_filled' | 'cancelled';
+  cancelRequestId: string | null;
+}
 
 interface MockAccount {
   accountId: string;
@@ -27,6 +40,7 @@ interface MockAccount {
   holds: { aapl: boolean; spy: boolean };
   orders: Json[];
   fills: Json[];
+  gtc: MockWorkingOrder | null;
 }
 
 export interface MockOptions {
@@ -53,7 +67,125 @@ const TOTALS: Readonly<Record<string, Json>> = {
   'aapl+spy': { cash: '97111.74', open_cost_basis: '2887.56', fees_paid: '0.7', market_value: '2882.68', unrealized_pnl: '-4.88', total_pnl: '-5.58', equity: '99994.42', return_percent: '-0.00558' },
 };
 
+const GTC_FILLED_AT = '2026-09-25T13:40:00.000000000Z';
+
+// The working order's resource at each stage, from the shared fixtures.
+function gtcOrder(accountId: string, gtc: MockWorkingOrder): Json {
+  const common = { account_id: accountId, client_order_id: gtc.clientOrderId, source: gtc.source };
+  switch (gtc.stage) {
+    case 'working':
+      return workingOrderJson(common);
+    case 'partially_filled':
+      return partiallyFilledWorkingOrderJson(common);
+    case 'cancelled':
+      return userCancelledOrderJson({ ...common, cancel_request_id: gtc.cancelRequestId });
+  }
+}
+
+function gtcFill(accountId: string, gtc: MockWorkingOrder): Json {
+  return fillJson({
+    account_id: accountId,
+    client_order_id: gtc.clientOrderId,
+    source: gtc.source,
+    fill_id: `${gtc.clientOrderId}:fill:0`,
+    price: '336',
+    quantity: '4',
+    notional: '1344',
+    fee: '0.35',
+    filled_at: GTC_FILLED_AT,
+  });
+}
+
+function gtcEvents(gtc: MockWorkingOrder): Json[] {
+  const events = [
+    orderEventJson({ sequence: '1', type: 'order_submitted' }),
+    orderEventJson({ sequence: '2', type: 'order_accepted' }),
+    orderEventJson({ sequence: '3', type: 'account_state_updated' }),
+  ];
+  if (gtc.stage !== 'working') {
+    events.push(
+      orderEventJson({
+        sequence: '4',
+        type: 'fill_applied',
+        occurred_at: GTC_FILLED_AT,
+        fill: {
+          fill_id: `${gtc.clientOrderId}:fill:0`,
+          side: 'buy',
+          price: '336',
+          quantity: '4',
+          notional: '1344',
+          fee: '0.35',
+          filled_at: GTC_FILLED_AT,
+        },
+      }),
+      orderEventJson({ sequence: '5', type: 'account_state_updated', occurred_at: GTC_FILLED_AT }),
+    );
+  }
+  if (gtc.stage === 'cancelled') {
+    events.push(
+      orderEventJson({ sequence: '6', type: 'order_cancelled', occurred_at: '2026-09-25T13:40:01.000000000Z' }),
+      orderEventJson({ sequence: '7', type: 'account_state_updated', occurred_at: '2026-09-25T13:40:01.000000000Z' }),
+    );
+  }
+  return events;
+}
+
+// The account while its one GTC order works, fills 4 at 336 with a 0.35
+// fee, and has its remainder cancelled. Reservation 336 × 10 + 0.35, then
+// 336 × 6, then nothing; the 4 shares are marked at the 335.82 bid. Worked
+// out by hand; the mock does no arithmetic.
+function gtcResources(state: MockAccount, gtc: MockWorkingOrder): { account: Json; portfolio: Json } {
+  const version = String(state.orders.length + (gtc.stage === 'working' ? 0 : 1) + (gtc.stage === 'cancelled' ? 1 : 0));
+  if (gtc.stage === 'working') {
+    const reservation = { reserved_cash: '3360.35', available_cash: '96639.65' };
+    return {
+      account: flatAccountJson({ account_id: state.accountId, version, market_stream_id: portfolioJson().market_stream_id, working_order_count: '1', ...reservation }),
+      portfolio: flatPortfolioJson({ account_id: state.accountId, account_version: version, market_stream_id: portfolioJson().market_stream_id, ...reservation }),
+    };
+  }
+  const position = { quantity: '4', open_cost_basis: '1344', average_entry_price: '336', gross_realized_pnl: '0', fees_paid: '0.35' };
+  const reservation =
+    gtc.stage === 'partially_filled'
+      ? { reserved_cash: '2016', available_cash: '96639.65', working_order_count: '1' }
+      : { reserved_cash: '0', available_cash: '98655.65', working_order_count: '0' };
+  const { working_order_count, ...cash } = reservation;
+  const ledger = {
+    account_id: state.accountId,
+    cash: '98655.65',
+    open_cost_basis: '1344',
+    gross_realized_pnl: '0',
+    fees_paid: '0.35',
+    last_fill_at: GTC_FILLED_AT,
+    market_stream_id: portfolioJson().market_stream_id,
+  };
+  return {
+    account: flatAccountJson({
+      ...ledger,
+      ...cash,
+      version,
+      working_order_count,
+      positions: [openPositionJson({ ...position, last_fill_at: GTC_FILLED_AT })],
+    }),
+    portfolio: portfolioJson({
+      ...ledger,
+      ...cash,
+      account_version: version,
+      market_value: '1343.28',
+      unrealized_pnl: '-0.72',
+      total_pnl: '-1.07',
+      equity: '99998.93',
+      return_percent: '-0.00107',
+      positions: [
+        valuedPositionJson({ ...position, last_fill_at: GTC_FILLED_AT, mark_price: '335.82', market_value: '1343.28', unrealized_pnl: '-0.72' }),
+      ],
+    }),
+  };
+}
+
 function resources(state: MockAccount): { account: Json; portfolio: Json } {
+  if (state.gtc !== null) {
+    return gtcResources(state, state.gtc);
+  }
   const key = [state.holds.aapl && 'aapl', state.holds.spy && 'spy'].filter(Boolean).join('+');
   const version = String(state.orders.length);
   if (key === '') {
@@ -99,7 +231,9 @@ function recordedOrder(accountId: string, body: { client_order_id: string; sourc
     quantity: '2',
     status: 'filled',
     filled_quantity: '2',
+    remaining_quantity: '0',
     unfilled_quantity: '0',
+    filled_notional: '1539.56',
     cancellation_reason: null,
     fill: {
       fill_id: `${body.client_order_id}:fill:0`,
@@ -137,6 +271,8 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
   let submissions = 0;
   let replayState = 'ready';
   let revision = 0;
+  // Advances when an account records an order, a fill, or a cancellation.
+  let activity = 0;
   let liveState = 'live';
   const marketData = () =>
     options.liveSource === true
@@ -163,7 +299,7 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
         status: 200,
         contentType: 'text/event-stream',
         headers: { 'Cache-Control': 'no-store', 'X-Chronos-Trading-Mode': 'paper' },
-        body: `retry: 3000\n\nevent: market-data\ndata: {"revision":"${String(revision)}"}\n\n`,
+        body: `retry: 3000\n\nevent: market-data\ndata: {"revision":"${String(revision)}","activity_revision":"${String(activity)}"}\n\n`,
       });
     }
     const command = path.split('/').at(-1) ?? '';
@@ -190,7 +326,7 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
   await page.route('**/api/v1/accounts**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
-    const [accountId, resource, clientOrderId] = url.pathname.split('/').slice(4);
+    const [accountId, resource, clientOrderId, orderResource] = url.pathname.split('/').slice(4);
     const method = request.method();
     // History filtered to one symbol, as the server filters it.
     const symbol = url.searchParams.get('instrument');
@@ -201,7 +337,13 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
       if (accounts.has(body.account_id)) {
         return reply(route, 409, errorJson('account_already_exists', 'paper account already exists'));
       }
-      const state: MockAccount = { accountId: body.account_id, holds: { aapl: false, spy: false }, orders: [], fills: [] };
+      const state: MockAccount = {
+        accountId: body.account_id,
+        holds: { aapl: false, spy: false },
+        orders: [],
+        fills: [],
+        gtc: null,
+      };
       accounts.set(body.account_id, state);
       return reply(route, 201, { account: resources(state).account });
     }
@@ -219,6 +361,31 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
     if (resource === 'fills') {
       return reply(route, 200, { fills: bySymbol(state.fills), next_cursor: null });
     }
+    if (resource === 'working-orders') {
+      const working = state.gtc !== null && state.gtc.stage !== 'cancelled' ? [gtcOrder(accountId, state.gtc)] : [];
+      return reply(route, 200, { orders: working, next_cursor: null });
+    }
+    const gtc = state.gtc;
+    if (gtc !== null && clientOrderId === gtc.clientOrderId && orderResource === 'events') {
+      return reply(route, 200, { events: gtcEvents(gtc), next_cursor: null });
+    }
+    if (gtc !== null && clientOrderId === gtc.clientOrderId && orderResource === 'cancel' && method === 'POST') {
+      const { cancel_request_id: requestId } = request.postDataJSON() as { cancel_request_id: string };
+      if (gtc.stage === 'cancelled') {
+        return requestId === gtc.cancelRequestId
+          ? reply(route, 200, { order: gtcOrder(accountId, gtc), account: resources(state).account, already_cancelled: true })
+          : reply(route, 409, {
+              ...errorJson('order_not_cancellable', 'the order has no working remainder to cancel', { field: 'client_order_id' }),
+              order: gtcOrder(accountId, gtc),
+            });
+      }
+      gtc.stage = 'cancelled';
+      gtc.cancelRequestId = requestId;
+      state.orders = state.orders.map((order) => (order.client_order_id === gtc.clientOrderId ? gtcOrder(accountId, gtc) : order));
+      activity += 1;
+      revision += 1;
+      return reply(route, 200, { order: gtcOrder(accountId, gtc), account: resources(state).account, already_cancelled: false });
+    }
     if (method === 'GET' && clientOrderId !== undefined) {
       const order = state.orders.find((candidate) => candidate.client_order_id === clientOrderId);
       return order === undefined
@@ -230,7 +397,19 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
     }
 
     submissions += 1;
-    const body = request.postDataJSON() as { client_order_id: string; source: Json; instrument: string };
+    const body = request.postDataJSON() as {
+      client_order_id: string;
+      source: Json;
+      instrument: string;
+      time_in_force: string;
+    };
+    if (body.time_in_force === 'gtc') {
+      state.gtc = { clientOrderId: body.client_order_id, source: body.source, stage: 'working', cancelRequestId: null };
+      const order = gtcOrder(accountId, state.gtc);
+      state.orders.unshift(order);
+      activity += 1;
+      return reply(route, 201, { order, account: resources(state).account });
+    }
     const order = recordedOrder(accountId, body);
     const fill = order.fill as Json;
     state.orders.unshift(order);
@@ -258,6 +437,20 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
 
   return {
     submissionCount: () => submissions,
+    // A later ask of 336 × 4 reaches the account's working order.
+    fillWorkingOrder: (accountId: string) => {
+      const state = accounts.get(accountId);
+      const gtc = state?.gtc;
+      if (state === undefined || gtc?.stage !== 'working') {
+        throw new Error(`no working order to fill for ${accountId}`);
+      }
+      gtc.stage = 'partially_filled';
+      state.orders = state.orders.map((order) => (order.client_order_id === gtc.clientOrderId ? gtcOrder(accountId, gtc) : order));
+      state.fills.unshift(gtcFill(accountId, gtc));
+      state.holds.aapl = true;
+      activity += 1;
+      revision += 1;
+    },
     // Moves the mock live source, as a dropped or restored feed would.
     setLiveState: (state: string) => {
       liveState = state;

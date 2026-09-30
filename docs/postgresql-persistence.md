@@ -4,28 +4,45 @@
 
 This component makes the in-memory paper-order processor durable. It stores a
 validated recovery snapshot, normalized into an account row and a row per
-instrument, and an append-only order/event journal in one PostgreSQL
-transaction. A new process can reconstruct the account, every position, risk
-limits, processed client-order IDs, applied fill IDs, each instrument's
-active market snapshot, and consumed shadow liquidity without relying on the
-previous process.
+instrument, each executed order's current state and fills, and an
+append-only order/event journal, one PostgreSQL transaction per change. A
+new process can reconstruct the account, every position, risk limits,
+processed client-order IDs, applied fill IDs, each instrument's active market
+snapshot and consumed shadow liquidity, and every working order with its
+fills, fee state, priority, and reservation, without relying on the previous
+process.
 
 The adapter is optional. The accounting, market-data, replay, risk, and
 execution libraries still build without PostgreSQL or Docker.
 
 ## Transaction boundary
 
-For one submitted paper order, a successful database transaction contains:
+An account changes in one of three ways: a submission, a match of its
+working orders against one observation, or a cancellation. Each is one
+transaction that contains, in this order:
 
-1. An optimistic account-version update of the account row (cash, health,
-   and stream binding).
-2. Only the position and execution-state rows the order changed: at most the
-   order instrument's ledger and execution state. Rows for other instruments
-   are not rewritten.
-3. The complete original order intent and market observation.
-4. Its structured risk, execution, or processing outcome.
-5. Any simulated fill, the cash, and the order instrument's ledger afterward.
+1. The account row, locked first and version-checked (cash, health, and
+   stream binding).
+2. Only the position and execution-state rows the change touched. Rows for
+   other instruments are not rewritten.
+3. For a match: each filled working order's `paper_orders` row moved from
+   exactly its recovered state, its new `paper_fills` row, and its events.
+4. For a submission: the complete original order intent and market
+   observation, its structured outcome, and a snapshot of cash and the
+   instrument's ledger afterward (`paper_order_records`); for an executed
+   order, its `paper_orders` row and any fill.
+5. For a cancellation: the order's terminal `paper_orders` row with its
+   cancel request ID.
 6. Ordered immutable audit events.
+
+The service and the working-order matcher take the account row lock with
+`SELECT … FOR UPDATE` and recover the account inside the same transaction,
+so a change always starts from the committed state and two changes of one
+account never interleave, across connections and processes. No transaction
+locks more than one account, and the account row is always its first lock.
+Repository connections of the server set `lock_timeout` (5 s for the
+service, 1 s for the matcher); a wait longer than that is reported as
+`PaperPersistenceUnavailable` and retried or returned as `503`.
 
 The session passes the state it loaded at the expected version and the state
 after the order; the repository writes the difference. Because the version
@@ -53,7 +70,18 @@ load version 4, the first successful commit creates version 5 and the second
 receives a structured version conflict without overwriting the winner. Cash
 is shared by every instrument, so orders for different instruments on one
 account serialize on the same version: a retry re-runs risk against the cash
-the winner left, and cash cannot be spent twice.
+the winner left, and cash cannot be spent twice. The server's own writers
+lock the row before recovering the account, so they wait for one another
+rather than conflict; the version check remains the defense against any
+writer that does not.
+
+A cancel request ID is unique per account (`paper_orders_cancel_request_key`):
+it cancels at most one order. Matching is idempotent through the execution
+state: an account's working orders are offered an observation only while it
+is newer than the instrument's latest execution observation, and taking any
+liquidity from it records it there, so a retried or repeated match of the
+same observation books nothing. Fill IDs are unique per account
+(`paper_fills_fill_id_key`), and fill indexes per order.
 
 ## Recovery snapshot
 
@@ -70,7 +98,21 @@ The authoritative snapshot is three tables:
 - `paper_execution_states`, one row per `(account_id, instrument)` the
   account has executed against: the active top-of-book observation with its
   full lineage (`market_*` columns, the same shape as the journal's) and the
-  consumed bid and ask shadow liquidity.
+  consumed bid and ask shadow liquidity. It is also the "last processed
+  observation" of each instrument for matching.
+- `paper_orders`, one row per executed order (every order that reached the
+  simulator): status, original, filled, and remaining quantities, filled
+  notional, fill count, the fee its first fill pays, cancellation reason and
+  cancel request ID, the stream and observation it was accepted on, and its
+  submission and latest-change market times. `fee_charged`,
+  `cumulative_fee_raw`, `reserved_cash_raw`, and `reserved_quantity_raw` are
+  generated columns computed from the row itself (the buy reservation rounds
+  `limit × remaining × 1e-9`, which is exact, half away from zero), so they
+  can never disagree with it. Its primary key is the journal record ID,
+  which is also the order's priority.
+- `paper_fills`, append-only: every booked fill with its order, index from 0,
+  price, quantity, fee, exact notional, time, and the observation it
+  executed against.
 
 The database enforces the invariants that span them:
 
@@ -87,10 +129,27 @@ The database enforces the invariants that span them:
 - Per-row checks keep quantities, cost, and fees non-negative, zero quantity
   exactly when cost basis is zero, and consumed liquidity within the
   displayed book.
+- The same deferred triggers, now also on `paper_orders`, check that every
+  account's working orders reserve no more cash than it holds and, per
+  instrument, no more shares than its position.
+- A deferred trigger on `paper_orders` and `paper_fills` checks that every
+  order's fills add up to its filled quantity, filled notional, cumulative
+  fee, and fill count, numbered without gaps.
+- `paper_orders` checks tie status to quantities, cancellation reason, cancel
+  request ID, and time in force: only a good-til-cancelled order works or is
+  cancelled by a client, and a terminal order reserves nothing.
+  `paper_fills` checks that only fill 0 pays a fee, that a fill ID names its
+  order and index, and that each notional is exactly the rounded product; its
+  composite foreign key makes a fill agree with its order's account, client
+  order ID, instrument, and side.
 
-Applied fill IDs and processed client order IDs are reconstructed from the
-append-only order journal. All recovery queries use one repeatable-read,
-read-only database snapshot, so a concurrent commit cannot mix versions.
+Applied fill IDs come from `paper_fills`, processed client order IDs from
+the journal, and working orders, in priority order, from the partial
+`paper_orders_account_working_idx`. Recovery recomputes each working order's
+reservation in C++ and refuses a row whose generated reservation differs.
+Recovery for a read runs in one repeatable-read, read-only snapshot; for a
+change, inside the transaction that holds the account lock, where no other
+writer of the account can commit.
 Recovery passes through the same C++ validation boundaries used by direct
 state restoration. Negative balances, inconsistent cost basis, totals out of
 range, invalid market observations, duplicate IDs, mismatched account
@@ -135,13 +194,20 @@ negative timestamp remains auditable.
 
 `paper_events` adds a database-assigned sequence for deterministic retrieval.
 Sequence allocation is not a promise of transaction commit order and gaps are
-valid. Depending on the outcome, one submission records a subset of:
+valid. Within one order, `event_order` numbers its events from 1 in the
+order they happened, across every transaction that changed the order, and
+`occurred_at_ns` is each event's market time. Events recorded before
+migration 004 are dated with their submission's time, when all of them were
+written. Depending on the outcome, an order records a subset of:
 
 - `order_submitted`
 - `risk_rejected`
 - `execution_rejected`
-- `order_completed`
-- `fill_applied`
+- `order_completed` (an immediate-or-cancel order finished executing)
+- `order_accepted` (a good-til-cancelled order was accepted)
+- `fill_applied`, with the `fill_id` it booked
+- `order_filled` (a good-til-cancelled order has nothing left)
+- `order_cancelled`
 - `account_state_updated`
 - `processor_faulted`
 
@@ -152,9 +218,14 @@ transaction.
 
 ## Journal read model
 
-`list_orders`, `find_order`, and `list_fills` read the journal for the
-paper-trading history API. They map persisted rows only; risk, execution,
-and accounting are never re-run to reconstruct a result.
+`list_orders`, `find_order`, `list_fills`, `list_working_orders`,
+`list_order_fills`, and `list_order_events` read the journal and the order
+state for the paper-trading API. They map persisted rows only; risk,
+execution, and accounting are never re-run to reconstruct a result. Every
+order record carries its current state from `paper_orders` when it reached
+execution, checked against the journaled submission: an immediate-or-cancel
+order never changed after it, and a good-til-cancelled order's state can
+follow from it.
 
 - **Consistency.** Each read runs in one repeatable-read, read-only
   transaction that first checks the account, so a missing account is always
@@ -179,12 +250,21 @@ and accounting are never re-run to reconstruct a result.
   `order_record_id < last` therefore never repeats a record while new orders
   are committed. Allocating record identities outside that lock, or giving
   the sequence a cache, would break this property.
-- **Booked fills.** Only `receipt` records book fills. A processing fault can
-  journal the simulated fill that accounting rejected, so fill reads filter on
-  `outcome_kind = 'receipt'` and never report it.
-- **Notional.** The journal stores fill price and quantity, not notional. The
-  read side derives notional with the same `calculate_notional` function the
-  account used, so it is exact under the current accounting contract.
+- **Booked fills.** Fill history reads `paper_fills`, newest first by
+  `fill_record_id` through `paper_fills_account_fill_idx` and, filtered,
+  `paper_fills_account_instrument_fill_idx`. A processing fault can journal
+  the simulated fill that accounting rejected; it never reaches
+  `paper_fills`. A fill recorded before migration 004 has the fill record ID
+  of its journal record, and later fills are numbered after every copied
+  one, so a cursor issued before the migration pages the same fills after
+  it.
+- **Forward pages.** Working orders page in priority order after an order
+  record ID through `paper_orders_account_working_idx`; one order's fills
+  after a fill index through `paper_fills_fill_index_key`; one order's events
+  after an event number through `paper_events_order_record_id_event_order_key`.
+- **Notional.** The read side checks each fill's stored notional against
+  `calculate_notional` of its price and quantity, the function the account
+  used.
 - **Fail closed.** A row whose fields could not have been written together
   raises `std::runtime_error`. Examples include an execution status that
   disagrees with its fill and quantities, an execution that names a different
@@ -217,9 +297,15 @@ changes add a new file.
   integrity triggers, records the instrument of the journal's "after"
   snapshot, adds the filtered-history indexes, and drops the moved columns
   so no value has two writable homes.
+- `004_working_orders.sql`: good-til-cancelled working orders. Adds
+  `paper_orders` and `paper_fills` with their constraints, triggers, and
+  indexes, dates events and links fill events to their fills, widens
+  `paper_events.event_order` to `integer`, allows the working execution
+  statuses in the journal, and extends the reconcile trigger to
+  reservations. See [ADR 0011](decisions/0011-durable-gtc-working-orders.md).
 
 PostgreSQL's image runs the mounted files only when it initializes an empty
-volume, so a fresh volume gets 001, 002, and 003 in order. An existing local
+volume, so a fresh volume gets 001 to 004 in order. An existing local
 volume needs each newer file applied once, in order.
 
 Sending a file on standard input avoids depending on the container's
@@ -273,6 +359,44 @@ What 003 guarantees:
 To restore the backup instead, recreate the volume and load the dump with
 `pg_restore -U chronos -d chronos --clean --if-exists`. There are no down
 migrations.
+
+Migration 004 is applied the same way, with the server stopped and a fresh
+backup:
+
+```sh
+docker compose exec -T postgres pg_dump -U chronos -d chronos -Fc \
+  > chronos-before-004.dump
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/004_working_orders.sql
+```
+
+What 004 guarantees:
+
+- **All or nothing, and idempotent,** as for 003: one transaction, and
+  nothing to do once version 4 is recorded. It locks `paper_accounts` first,
+  which every writer and reader touches first, then `paper_events` and
+  `paper_order_records` in the order migration 001 takes its index locks, so
+  a concurrent rerun of 001 cannot deadlock with it. (003 locks the journal
+  before the events and can deadlock with such a rerun; PostgreSQL then
+  aborts one of the two, which can simply be run again.)
+- **Validated before anything changes.** Every executed record must be a
+  declared immediate-or-cancel order whose outcome, quantities, and fill have
+  one of the three shapes the simulator produces, on the order's own
+  observation, and every `fill_applied` event must belong to a booked fill.
+  These are the rules the journal reader enforces, so the migration refuses
+  exactly the rows the server would refuse to read, naming the rule and the
+  count, and rolls back with the version 3 schema and data intact.
+- **No data loss.** No existing column value changes. Every executed order
+  gets one `paper_orders` row that repeats its journaled outcome and every
+  booked fill one `paper_fills` row with its ID; the copy is recounted and
+  re-reconciled before version 4 is recorded.
+
+A database that the repository's integration tests have run against before
+this release contains accounts named `corrupt-*` whose journal rows those
+tests deliberately corrupted to prove that reads fail closed. Migration 004
+refuses them, as it should. The tests now repair what they corrupt, but
+older rows remain; they belong only to test accounts and can be removed from
+a test database after a backup, or the tests can use a fresh database.
 
 ## Local development
 
@@ -338,6 +462,16 @@ tests prove:
 - A terminated connection is reported as unavailable and then reconnected.
 - A connection lost while a commit waits on a row lock records nothing and
   leaves the client order ID reusable.
+- Working orders, their reservations, fee state, and priority survive a new
+  process; several fills of one order add up and pay one fee; matching the
+  same observation twice, from two connections, or after a lost connection
+  books once; cancellation is durable and idempotent and releases the
+  reservation; concurrent matchers and a canceller serialize; and every
+  working-order query can use an index.
+- Migration 004 copies a populated version 3 database exactly, reruns as a
+  no-op, rolls back on each kind of corrupt version 3 row, cannot deadlock
+  with a concurrent rerun of migration 001, and its constraints refuse
+  inconsistent order and fill rows.
 
 The integration executable returns the standard CTest skip code when
 `CHRONOS_TEST_POSTGRES_URL` is absent, so ordinary core builds do not require a
@@ -346,7 +480,9 @@ database.
 ## Current limitations
 
 - One PostgreSQL connection per repository; no connection pool yet
-- No statement or lock timeout; a blocked row lock blocks the caller
+- No statement timeout; the server's connections have a lock timeout
+- Recovery for every change reads all of the account's fill IDs and
+  processed client order IDs, so its cost grows with the account's history
 - No authentication or user-to-account authorization layer
 - No TLS policy or production secret manager configuration
 - No migration runner CLI, rollback migrations, or schema-version check at

@@ -31,6 +31,9 @@ export type FailureCategory =
   | 'account_already_exists'
   | 'duplicate_client_order_id'
   | 'account_version_conflict'
+  | 'order_matching_busy'
+  | 'order_not_cancellable'
+  | 'duplicate_cancel_request_id'
   | 'unsupported_instrument'
   | 'invalid_starting_cash'
   | 'market_data_unavailable'
@@ -49,6 +52,9 @@ const CATEGORY_BY_CODE: Readonly<Record<string, FailureCategory>> = {
   account_already_exists: 'account_already_exists',
   duplicate_client_order_id: 'duplicate_client_order_id',
   account_version_conflict: 'account_version_conflict',
+  order_matching_busy: 'order_matching_busy',
+  order_not_cancellable: 'order_not_cancellable',
+  duplicate_cancel_request_id: 'duplicate_cancel_request_id',
   unsupported_instrument: 'unsupported_instrument',
   invalid_starting_cash: 'invalid_starting_cash',
   market_data_unavailable: 'market_data_unavailable',

@@ -1528,14 +1528,24 @@ void test_malformed_intents_round_trip_through_the_journal() {
         store.find_order(account_id, "malformed"),
         std::runtime_error
     );
+    // Leave the shared database readable, and migratable, for later runs.
+    static_cast<void>(editor.query(
+        "UPDATE paper_order_records SET side = 'unknown:99' "
+        "WHERE account_id = $1",
+        {account_id}
+    ));
+    REQUIRE(require_order_record(store, account_id, "malformed").intent == malformed);
 }
 
 void test_inconsistent_journal_rows_fail_closed() {
     auto store = repository();
     store.apply_migration(all_migrations_sql());
     PostgresTestConnection editor(connection_string);
+    // Each corruption is repaired afterwards, so the shared test database
+    // stays readable and migratable for later runs and later migrations.
     const auto corrupted_read = [&](const std::string& prefix,
-                                    std::string_view update) {
+                                    std::string_view update,
+                                    std::string_view repair) {
         const std::string account_id = unique_test_id(prefix);
         auto session = create_session(store, account_id);
         require_persisted_receipt(session.submit(
@@ -1558,31 +1568,52 @@ void test_inconsistent_journal_rows_fail_closed() {
             ),
             std::runtime_error
         );
+        static_cast<void>(editor.query(repair, {account_id}));
+        static_cast<void>(require_order_record(store, account_id, "subject"));
     };
     corrupted_read(
         "corrupt-status",
         "UPDATE paper_order_records SET execution_status = 'cancelled' "
+        "WHERE account_id = $1",
+        "UPDATE paper_order_records SET execution_status = 'filled' "
         "WHERE account_id = $1"
     );
     corrupted_read(
         "corrupt-quantity",
         "UPDATE paper_order_records SET unfilled_quantity_raw = 1 "
+        "WHERE account_id = $1",
+        "UPDATE paper_order_records SET unfilled_quantity_raw = 0 "
         "WHERE account_id = $1"
     );
     corrupted_read(
         "corrupt-side",
         "UPDATE paper_order_records SET side = 'unknown:1' "
-        "WHERE account_id = $1"
+        "WHERE account_id = $1",
+        "UPDATE paper_order_records SET side = 'buy' WHERE account_id = $1"
     );
     corrupted_read(
         "corrupt-code",
         "UPDATE paper_order_records SET outcome_code = 'insufficient_cash' "
+        "WHERE account_id = $1",
+        "UPDATE paper_order_records SET outcome_code = NULL "
         "WHERE account_id = $1"
     );
     corrupted_read(
         "corrupt-market",
         "UPDATE paper_order_records "
-        "SET execution_market_ingest_sequence = 11 WHERE account_id = $1"
+        "SET execution_market_ingest_sequence = 11 WHERE account_id = $1",
+        "UPDATE paper_order_records "
+        "SET execution_market_ingest_sequence = 10 WHERE account_id = $1"
+    );
+    // The order's current state must repeat its journaled intent. A state
+    // that disagrees with its fills cannot even be committed (see the
+    // migration tests); this one can, and reads refuse it.
+    corrupted_read(
+        "corrupt-intent",
+        "UPDATE paper_order_records SET time_in_force = 'gtc' "
+        "WHERE account_id = $1",
+        "UPDATE paper_order_records SET time_in_force = 'ioc' "
+        "WHERE account_id = $1"
     );
 }
 

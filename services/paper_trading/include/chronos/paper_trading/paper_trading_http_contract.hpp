@@ -4,6 +4,7 @@
 #include "chronos/market_data/market_data_source.hpp"
 #include "chronos/paper_trading/http_message.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
+#include "chronos/paper_trading/working_order_matcher.hpp"
 
 #include <cstdint>
 
@@ -53,11 +54,24 @@ parse_create_account_request(std::string_view body);
 [[nodiscard]] std::variant<PaperOrderRequest, MalformedRequest>
 parse_order_request(std::string account_id, std::string_view body);
 
+// The body is exactly {"cancel_request_id": "<identifier>"}.
+[[nodiscard]] std::variant<CancelPaperOrderRequest, MalformedRequest>
+parse_cancel_request(
+    std::string account_id,
+    std::string client_order_id,
+    std::string_view body
+);
+
 // Accepts only `limit`, `cursor`, and `instrument`, each at most once. Range,
 // cursor, and identifier validity are the service's rules, so they apply to
 // every transport.
 [[nodiscard]] std::variant<HistoryPageRequest, MalformedRequest>
 parse_history_query(std::string_view query);
+
+// `limit` and `cursor`, and `instrument` only where it filters (the working
+// orders); each at most once.
+[[nodiscard]] std::variant<ForwardPageRequest, MalformedRequest>
+parse_forward_query(std::string_view query, bool allow_instrument);
 
 // For endpoints without parameters: any query parameter is rejected rather
 // than silently ignored.
@@ -101,10 +115,12 @@ inline constexpr std::string_view kEventStreamPreamble = "retry: 3000\n\n";
 [[nodiscard]] std::string format_timestamp(Timestamp timestamp);
 
 // With a source status, the body also reports the market-data source's
-// mode, label, and lifecycle state, such as a live feed still connecting.
+// mode, label, and lifecycle state, such as a live feed still connecting;
+// with a matcher status, the working-order matcher's.
 [[nodiscard]] HttpResponse render_health(
     const PaperTradingHealth& health,
-    const std::optional<market_data::MarketDataSourceStatus>& source = std::nullopt
+    const std::optional<market_data::MarketDataSourceStatus>& source = std::nullopt,
+    const std::optional<WorkingOrderMatcherStatus>& matching = std::nullopt
 );
 
 [[nodiscard]] HttpResponse render_account(
@@ -126,6 +142,22 @@ inline constexpr std::string_view kEventStreamPreamble = "retry: 3000\n\n";
 
 [[nodiscard]] HttpResponse render_fill_history(
     const PaperFillHistoryResult& result
+);
+
+[[nodiscard]] HttpResponse render_cancellation(
+    const CancelPaperOrderResult& result
+);
+
+[[nodiscard]] HttpResponse render_working_orders(
+    const WorkingOrderPageResult& result
+);
+
+[[nodiscard]] HttpResponse render_order_fills(
+    const OrderFillPageResult& result
+);
+
+[[nodiscard]] HttpResponse render_order_events(
+    const OrderEventPageResult& result
 );
 
 [[nodiscard]] HttpResponse render_portfolio(const PaperPortfolioResult& result);

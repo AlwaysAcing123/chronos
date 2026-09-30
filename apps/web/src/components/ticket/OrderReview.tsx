@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 
 import type { OrderRequest } from '../../api/submission';
-import { ORDER_TYPE, SIDE, SOURCE_KIND } from '../../presentation/vocabulary';
+import { ORDER_TYPE, SIDE, SOURCE_KIND, TIME_IN_FORCE } from '../../presentation/vocabulary';
 import { Button } from '../ui/Button';
 import formStyles from '../form/form.module.css';
 import styles from './ticket.module.css';
@@ -26,7 +26,9 @@ export function RequestSummary({ request }: { readonly request: OrderRequest }) 
         </>
       )}
       <dt>Time in force</dt>
-      <dd>Immediate or cancel</dd>
+      <dd>
+        {TIME_IN_FORCE[request.time_in_force].label} ({TIME_IN_FORCE[request.time_in_force].short})
+      </dd>
       <dt>Source</dt>
       <dd>
         {SOURCE_KIND[request.source.kind]} · <span className="mono">{request.source.id}</span>
@@ -34,6 +36,24 @@ export function RequestSummary({ request }: { readonly request: OrderRequest }) 
       <dt>Client order ID</dt>
       <dd className="mono">{request.client_order_id}</dd>
     </dl>
+  );
+}
+
+// What the time in force means for this order, in the terms the server
+// applies. Amounts are the server's to compute: the review only names them.
+export function reviewExplanation(request: OrderRequest): string {
+  if (request.time_in_force === 'ioc') {
+    return 'Simulated only. Immediate or cancel: the server executes it once against its current quote; any unfilled quantity is cancelled.';
+  }
+  const reserve =
+    request.side === 'buy'
+      ? 'cash for the limit price times the unfilled quantity, plus the fee until the first fill'
+      : 'the unfilled shares, plus the fee from cash until the first fill';
+  return (
+    'Simulated only. Good til cancelled: the server fills what it can against its current quote, and the rest ' +
+    'rests as a working order. Later quotes at or better than the limit fill it at the displayed price, up to the ' +
+    `displayed size, until it fills or you cancel it. While it works it reserves ${reserve}. The fee is charged ` +
+    'once, with the first fill.'
   );
 }
 
@@ -58,9 +78,7 @@ export function OrderReview({
         Review paper order
       </h3>
       <RequestSummary request={request} />
-      <p className={formStyles.hint}>
-        Simulated only. The server executes it once against its current quote; any unfilled quantity is cancelled.
-      </p>
+      <p className={formStyles.hint}>{reviewExplanation(request)}</p>
       <div className={formStyles.actions}>
         <Button ref={submitButton} variant="primary" onClick={onSubmit} disabled={submitDisabled}>
           Submit paper order

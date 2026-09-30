@@ -104,6 +104,7 @@ export function Choice<Value extends string>({
   options,
   onChange,
   disabled = false,
+  hint,
 }: {
   readonly legend: string;
   readonly name: string;
@@ -111,9 +112,16 @@ export function Choice<Value extends string>({
   readonly options: readonly { readonly value: Value; readonly label: string }[];
   readonly onChange: (value: Value) => void;
   readonly disabled?: boolean;
+  // Explains the chosen option; announced with the group.
+  readonly hint?: ReactNode;
 }) {
+  const hintId = `${useId()}-hint`;
   return (
-    <fieldset className={styles.choice} disabled={disabled}>
+    <fieldset
+      className={styles.choice}
+      disabled={disabled}
+      aria-describedby={hint === undefined ? undefined : hintId}
+    >
       <legend className={styles.choiceLegend}>{legend}</legend>
       <div className={styles.choiceOptions}>
         {options.map((option) => (
@@ -131,6 +139,11 @@ export function Choice<Value extends string>({
           </label>
         ))}
       </div>
+      {hint !== undefined && (
+        <p id={hintId} className={styles.hint}>
+          {hint}
+        </p>
+      )}
     </fieldset>
   );
 }

@@ -38,7 +38,7 @@ test('creates an account, trades with the keyboard, and restores the account aft
   await page.keyboard.press('Enter');
 
   await expect(ticket.getByText('Partially filled 4 of 10 at 337; 6 cancelled')).toBeVisible();
-  const orders = page.getByRole('region', { name: 'Orders' });
+  const orders = page.getByRole('region', { name: 'Orders', exact: true });
   await expect(orders.getByRole('cell', { name: 'Partially filled' })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Fills' }).getByText('1348')).toBeVisible();
   await expect(page.getByRole('region', { name: 'Portfolio' }).getByText('99994.93')).toBeVisible();
@@ -78,9 +78,10 @@ test('trades two symbols from one cash balance and filters history by symbol', a
   await expect(positions.getByRole('row', { name: /^AAPL/ })).toContainText('1343.28');
   await expect(positions.getByRole('row', { name: /^SPY/ })).toContainText('1539.4');
   await expect(portfolio.getByText('99994.42')).toBeVisible();
-  await expect(portfolio.getByText('97111.74')).toBeVisible();
+  // Cash, and the same amount available, since nothing is reserved.
+  await expect(portfolio.getByText('97111.74')).toHaveCount(2);
 
-  const orders = page.getByRole('region', { name: 'Orders' });
+  const orders = page.getByRole('region', { name: 'Orders', exact: true });
   await orders.getByRole('combobox', { name: 'Symbol' }).selectOption('SPY');
   await expect(orders.getByRole('table').getByRole('row')).toHaveCount(2);
   await expect(orders.getByRole('cell', { name: 'Filled', exact: true })).toBeVisible();
@@ -122,7 +123,7 @@ test('offers section navigation only where panels stack', async ({ page, isMobil
   if (isMobile) {
     await expect(sections).toBeVisible();
     await sections.getByRole('link', { name: 'Orders' }).click();
-    await expect(page.getByRole('region', { name: 'Orders' })).toBeInViewport();
+    await expect(page.getByRole('region', { name: 'Orders', exact: true })).toBeInViewport();
   } else {
     await expect(sections).toBeHidden();
   }

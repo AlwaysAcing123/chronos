@@ -22,9 +22,12 @@ export class FakeNoticeStream implements NoticeStream {
     this.onopen?.(new Event('open'));
   }
 
-  notice(revision: string): void {
+  // A change notice; with an activity revision, as servers with working
+  // orders send.
+  notice(revision: string, activityRevision?: string): void {
+    const data = activityRevision === undefined ? { revision } : { revision, activity_revision: activityRevision };
     for (const listener of this.listeners) {
-      listener(new MessageEvent('market-data', { data: JSON.stringify({ revision }) }));
+      listener(new MessageEvent('market-data', { data: JSON.stringify(data) }));
     }
   }
 

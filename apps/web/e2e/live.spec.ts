@@ -43,12 +43,46 @@ test('trades against the real server and restores the account after reload', asy
   });
   expect(model.status()).toBe(201);
 
-  const orders = page.getByRole('region', { name: 'Orders' });
+  const orders = page.getByRole('region', { name: 'Orders', exact: true });
   await expect(orders.getByText('model-limit-1')).toBeVisible();
   await expect(orders.getByText('Model', { exact: true })).toBeVisible();
   await expect(orders.getByText('Manual', { exact: true })).toBeVisible();
 
   await page.reload();
   await expect(page.getByRole('banner').getByText(accountId)).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Orders' }).getByText('model-limit-1')).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Orders', exact: true }).getByText('model-limit-1')).toBeVisible();
+});
+
+// A good-til-cancelled buy far below the market rests on the real server,
+// reserves cash there, and is cancelled through the working-orders view.
+test('rests and cancels a GTC order on the real server', async ({ page }, testInfo) => {
+  const accountId = `web-gtc-${testInfo.project.name}-${Date.now().toString(36)}`;
+  await page.goto('/');
+  const create = page.getByRole('region', { name: 'Create a paper account' });
+  await create.getByLabel('Account ID').fill(accountId);
+  await create.getByRole('button', { name: 'Create paper account' }).click();
+  const start = page.getByRole('region', { name: 'Market-data source' }).getByRole('button', { name: 'Start replay' });
+  if (await start.isVisible()) {
+    await start.click();
+  }
+  const ticket = page.getByRole('region', { name: 'Order ticket' });
+  await expect(ticket.getByText('Best bid')).toBeVisible();
+  await ticket.getByRole('radio', { name: 'Limit' }).check();
+  await ticket.getByRole('radio', { name: 'Good til cancelled (GTC)' }).check();
+  await ticket.getByLabel('Quantity (AAPL)').fill('2');
+  await ticket.getByLabel('Limit price').fill('1');
+  await ticket.getByRole('button', { name: 'Review order' }).click();
+  await ticket.getByRole('button', { name: 'Submit paper order' }).click();
+  await expect(ticket.getByText('Working: 2 rests at limit 1')).toBeVisible();
+
+  const working = page.getByRole('region', { name: 'Working orders' });
+  // 1 × 2 plus the account's fee until the first fill, as the server says.
+  await expect(working.getByRole('row', { name: /Working/ })).toBeVisible();
+  await working.getByRole('button', { name: /^Cancel remainder of / }).click();
+  await expect(working.getByText(/: remainder cancelled$/)).toBeVisible();
+  await expect(working.getByText(/No working orders/)).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByRole('region', { name: 'Orders', exact: true }).getByRole('cell', { name: 'Cancelled', exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Working orders' }).getByText(/No working orders/)).toBeVisible();
 });

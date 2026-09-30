@@ -7,11 +7,14 @@ import type {
   CancellationReason,
   MarketDataMode,
   MarketDataSourceState,
+  OrderEventType,
+  OrderMatchingState,
   OrderStatus,
   OrderType,
   QualityFlag,
   Side,
   SourceKind,
+  TimeInForce,
 } from '../api/schemas';
 
 // Every colour-coded state is also named in text.
@@ -23,8 +26,10 @@ export interface Labelled {
 }
 
 export const ORDER_STATUS: Readonly<Record<OrderStatus, Labelled>> = {
+  working: { label: 'Working', tone: 'info' },
+  partially_filled: { label: 'Working, partially filled', tone: 'info' },
   filled: { label: 'Filled', tone: 'positive' },
-  partially_filled_and_cancelled: { label: 'Partially filled', tone: 'caution' },
+  partially_filled_and_cancelled: { label: 'Partially filled, rest cancelled', tone: 'caution' },
   cancelled: { label: 'Cancelled', tone: 'neutral' },
   rejected: { label: 'Rejected', tone: 'negative' },
   faulted: { label: 'Faulted', tone: 'negative' },
@@ -33,6 +38,31 @@ export const ORDER_STATUS: Readonly<Record<OrderStatus, Labelled>> = {
 export const CANCELLATION_REASON: Readonly<Record<CancellationReason, string>> = {
   limit_not_marketable: 'Limit price was not marketable against the displayed quote',
   displayed_liquidity_exhausted: 'Displayed liquidity was exhausted',
+  user_requested: 'The remainder was cancelled at your request',
+};
+
+export const TIME_IN_FORCE: Readonly<Record<TimeInForce, { readonly label: string; readonly short: string }>> = {
+  ioc: { label: 'Immediate or cancel', short: 'IOC' },
+  gtc: { label: 'Good til cancelled', short: 'GTC' },
+};
+
+export const ORDER_EVENT: Readonly<Record<OrderEventType, string>> = {
+  order_submitted: 'Submitted',
+  risk_rejected: 'Rejected by pre-trade risk',
+  execution_rejected: 'Rejected by the execution simulator',
+  order_completed: 'Executed once and completed',
+  fill_applied: 'Fill booked',
+  account_state_updated: 'Account updated',
+  processor_faulted: 'Processing fault; account halted',
+  order_accepted: 'Accepted as a working order',
+  order_filled: 'Completely filled',
+  order_cancelled: 'Remainder cancelled',
+};
+
+export const ORDER_MATCHING: Readonly<Record<OrderMatchingState, Labelled>> = {
+  running: { label: 'Matching working orders', tone: 'positive' },
+  retrying: { label: 'Matching is waiting for the database', tone: 'caution' },
+  stopped: { label: 'Matching stopped', tone: 'negative' },
 };
 
 export const SIDE: Readonly<Record<Side, string>> = { buy: 'Buy', sell: 'Sell' };
@@ -108,6 +138,7 @@ const REASON: Readonly<Record<string, string>> = {
   insufficient_cash_for_fee: 'Not enough cash for the fee',
   insufficient_position: 'Not enough position to sell',
   arithmetic_overflow: 'A value exceeds the supported fixed-point range',
+  market_order_requires_ioc: 'A market order cannot rest; use a limit order to work it',
   // Execution
   duplicate_client_order_id: 'The client order ID was already processed',
   market_stream_mismatch: "The market is a different stream than the account's",
@@ -170,6 +201,18 @@ export const FAILURE: Readonly<Record<FailureCategory, FailureDescription>> = {
   account_version_conflict: {
     title: 'The account changed during submission',
     detail: 'Another order was processed first. Nothing was recorded, so the same order can be sent again.',
+  },
+  order_matching_busy: {
+    title: 'Working orders are still being matched',
+    detail: 'The server was still matching the latest market event. Nothing was recorded, so the same order can be sent again.',
+  },
+  order_not_cancellable: {
+    title: 'Nothing left to cancel',
+    detail: 'The order already filled, was cancelled, or never worked; its current state is shown.',
+  },
+  duplicate_cancel_request_id: {
+    title: 'Cancel request ID already used',
+    detail: 'This cancel request ID already cancelled another order of the account.',
   },
   unsupported_instrument: {
     title: 'Instrument not supported',

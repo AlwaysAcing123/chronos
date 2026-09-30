@@ -53,6 +53,13 @@ namespace chronos {
     PaperOrderProcessingErrorCode code
 ) noexcept;
 
+// An order's lifecycle status. The executed statuses share their names with
+// SimulatedExecutionStatus, so an order's status and its submission's
+// execution status read alike.
+[[nodiscard]] std::optional<std::string_view> canonical_name(
+    PaperOrderStatus status
+) noexcept;
+
 // The enumerations above declare no explicit values, so their enumerators
 // are exactly the contiguous values from zero that have a canonical name.
 // Deriving the declared set this way keeps canonical_name the only mapping;

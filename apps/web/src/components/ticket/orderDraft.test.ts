@@ -32,10 +32,29 @@ describe('order draft', () => {
 
   it('sends decimals exactly as typed', () => {
     const request = buildOrderRequest(
-      { side: 'sell', type: 'limit', quantity: '1.50', limitPrice: '300.000' },
+      { side: 'sell', type: 'limit', quantity: '1.50', limitPrice: '300.000', timeInForce: 'ioc' },
       'AAPL',
       'web-2',
     );
     expect(request).toMatchObject({ quantity: '1.50', limit_price: '300.000', side: 'sell', type: 'limit' });
+  });
+
+  it('sends the chosen time in force for a limit order', () => {
+    const request = buildOrderRequest(
+      { side: 'buy', type: 'limit', quantity: '10', limitPrice: '100', timeInForce: 'gtc' },
+      'AAPL',
+      'web-3',
+    );
+    expect(request).toMatchObject({ type: 'limit', limit_price: '100', time_in_force: 'gtc' });
+  });
+
+  it('forces a market order to immediate-or-cancel even after GTC was chosen for a limit', () => {
+    const request = buildOrderRequest(
+      { side: 'buy', type: 'market', quantity: '10', limitPrice: '100', timeInForce: 'gtc' },
+      'AAPL',
+      'web-4',
+    );
+    expect(request).toMatchObject({ type: 'market', time_in_force: 'ioc' });
+    expect('limit_price' in request).toBe(false);
   });
 });

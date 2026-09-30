@@ -12,20 +12,34 @@ This is an in-memory, single-account, long-only paper simulation. One account
 trades any number of instruments from one cash balance; every order names
 exactly one of them. It cannot send an order to a broker, exchange, or
 real-money account. The multi-instrument rules are recorded in
-[decisions/0010-multi-instrument-accounts.md](decisions/0010-multi-instrument-accounts.md).
+[decisions/0010-multi-instrument-accounts.md](decisions/0010-multi-instrument-accounts.md);
+good-til-cancelled working orders in
+[decisions/0011-durable-gtc-working-orders.md](decisions/0011-durable-gtc-working-orders.md).
 
 ## Flow
 
 ```text
 manual UI or model policy
     -> OrderIntent
-    -> PaperOrderProcessor
-        -> pre-trade validation and risk
+    -> PaperOrderProcessor::submit
+        -> pre-trade validation and risk, against unreserved cash and shares
         -> ApprovedOrderIntent
         -> top-of-book execution
         -> simulated report and optional Fill
         -> paper-account accounting
+        -> a good-til-cancelled remainder rests as a WorkingOrder
     -> PaperOrderReceipt
+
+later market observation of the instrument
+    -> PaperOrderProcessor::match
+        -> each eligible, marketable working order in priority order
+        -> Fill at the opposite best, up to untaken displayed size
+        -> paper-account accounting
+    -> WorkingOrderMatch
+
+client cancel request
+    -> PaperOrderProcessor::cancel
+    -> WorkingOrderCancellation
 ```
 
 Only the risk engine can construct an `ApprovedOrderIntent`. This makes the
@@ -33,11 +47,11 @@ approved value a typed capability: the execution simulator cannot be called
 with an arbitrary, unchecked `OrderIntent`.
 
 `PaperOrderProcessor` is the normal end-to-end entry point. It owns one fresh
-paper account, its risk engine, and its execution simulator. Approval never
-escapes `submit`: the processor evaluates the current account, executes the
-order immediately, and applies any resulting fill before returning. This
-prevents a caller from caching an approval while other fills change cash or
-position.
+paper account, its risk engine, its execution simulator, and its working
+orders. Approval never escapes `submit`: the processor evaluates the current
+account and reservations, executes the order immediately, and applies any
+resulting fill before returning. This prevents a caller from caching an
+approval while other fills change cash or position.
 
 A successful `PaperOrderReceipt` contains the execution report, an accounting
 receipt when a fill occurred, and the complete account state afterward.
@@ -58,9 +72,13 @@ Every order contains:
 Manual and model orders differ only in source attribution. Source information
 does not alter risk or fill behavior.
 
-The first slice supports market orders and limit orders with
-immediate-or-cancel time in force. Resting orders, replace requests, and
-cancel requests require an order state machine and are intentionally deferred.
+Time in force is immediate-or-cancel (`ioc`) or good-til-cancelled (`gtc`).
+A market order must be immediate-or-cancel: `market` + `gtc` is the risk
+rejection `market_order_requires_ioc`. An immediate-or-cancel order executes
+once and cancels any remainder. A good-til-cancelled limit order executes
+what is marketable now and rests the remainder as a working order, which
+later observations fill until nothing remains or a client cancels it.
+Replace requests are deferred (see ADR 0011).
 
 ## Pre-trade validation and risk
 
@@ -80,9 +98,13 @@ engine then enforces:
 - Maximum order quantity and notional, per order
 - Maximum long position after a buy, per instrument: the order instrument's
   position only
-- Sufficient shared cash for a buy and its flat fill fee
-- Sufficient owned position in the order's instrument for a sell
-- Sufficient cash to pay the fee for a possible partial sell fill
+- Sufficient unreserved shared cash for a buy and its flat fee: cash minus
+  what working orders reserve
+- Sufficient unreserved position in the order's instrument for a sell: the
+  position minus what working sells reserve
+- Sufficient unreserved cash to pay the fee for a sell
+- For a buy, the position limit counts the unfilled shares of the
+  instrument's working buys
 - Checked fixed-point arithmetic with structured overflow rejection,
   including the account totals: risk previews the complete fill against the
   account, so a fill that would make total cost basis, realized PnL, or fees
@@ -93,9 +115,49 @@ engine then enforces:
   instrument
 
 Notional and buying power are checked conservatively using the complete
-requested quantity at the current opposite best price, even if displayed
-quantity is smaller or an IOC limit is not marketable. This avoids approving
-an order on the assumption that it will receive only a partial fill.
+requested quantity: at the current opposite best price for an
+immediate-or-cancel order, even if displayed quantity is smaller or its
+limit is not marketable, and at the limit price for a good-til-cancelled
+order, the most it can ever pay. This avoids approving an order on the
+assumption that it will receive only a partial fill.
+
+## Working orders and reservations
+
+A working order holds back from later orders:
+
+- a buy: `limit price × remaining`, rounded like every notional, plus the
+  fee until its first fill;
+- a sell: its remaining shares, plus the fee from cash until its first fill.
+
+Reservations change no cash, position, cost basis, realized PnL, fee, or
+equity. A fill reduces a buy's reservation to the new remainder at the limit,
+so a fill below the limit releases the difference immediately; the final
+fill and a cancellation release everything. `reserved cash ≤ cash` and, per
+instrument, `reserved shares ≤ position` hold after every transition and on
+recovery.
+
+Each fill's notional is rounded separately, so a partial buy fill can cost
+up to one money unit (1e-8 USD) more than the reservation it releases. When
+the account has less than that unreserved, the fill is not taken at that
+observation (`WorkingOrderSkipReason::ReservationShortfall`) instead of
+leaving the other reservations uncovered; the order keeps working. A skip
+also prevents newer orders on the same side from taking that observation's
+liquidity: the rest of that side is marked consumed in this account's shadow
+liquidity state, so FIFO priority still holds across later submissions and
+restarts. The opposite book side remains independent. The same applies to
+an immediate fill at acceptance, and to a fill whose notional rounds to zero
+or would overflow an account total.
+
+`match(observation, market_time)` offers one observation to the working
+orders of its instrument, in priority order (acceptance order). An order is
+eligible only for an observation strictly newer than the one it was
+accepted on, and newer than the account's latest execution observation of
+the instrument; suspect, stale, invalid, other-stream, and missing-side
+observations are skipped without cancelling anything. A buy is marketable
+when the ask is at or below its limit, a sell when the bid is at or above
+it, and each fills at that opposite best price up to the displayed size the
+account has not already taken from the observation. A halted account's
+orders never fill, but can be cancelled.
 
 Risk approval captures the exact order, market observation, candidate
 execution price, maximum notional, and configured fee. Later mutations to the
@@ -111,10 +173,11 @@ deeper levels.
 The simulator fills at most the remaining displayed quantity:
 
 - Enough liquidity: the order is filled.
-- Some liquidity: the available quantity is filled and the IOC remainder is
-  cancelled.
-- No liquidity: the complete order is cancelled.
-- Non-marketable limit: the complete order is cancelled.
+- Some liquidity: the available quantity is filled; an immediate-or-cancel
+  remainder is cancelled and a good-til-cancelled remainder rests.
+- No liquidity: an immediate-or-cancel order is cancelled; a
+  good-til-cancelled order rests unfilled and takes nothing.
+- Non-marketable limit: likewise cancelled or resting.
 
 Displayed bid and ask liquidity are tracked independently, per account and
 per instrument. Multiple orders against the same market observation cannot
@@ -132,7 +195,9 @@ another's market or simulated liquidity, even for the same instrument.
 
 - A client order ID may be processed only once per account, including when
   the first result was a cancellation, and including for another instrument.
-- A generated fill ID is deterministic: `<client-order-id>:fill:0`.
+- A generated fill ID is deterministic: `<client-order-id>:fill:<n>`, where
+  `n` counts the order's fills from 0. A client order ID never contains
+  `:`, so fill IDs of different orders cannot collide.
 - An execution simulator is permanently bound to one account. It keeps an
   execution state per instrument: the latest executed observation and the
   liquidity consumed from it.
@@ -182,13 +247,17 @@ ordinary input errors are returned earlier as risk or execution rejections.
 
 ## Fees and time
 
-This slice uses one configurable flat fee per non-empty simulated fill. A
-cancelled order has no fill and no fee. More realistic maker/taker schedules
-belong in a later versioned fee model.
+This slice uses one configurable flat fee per order, charged by its first
+non-zero fill; later fills of a good-til-cancelled order carry zero fee. An
+order that never fills pays no fee, and a partially filled order that is
+cancelled keeps its one fee. More realistic maker/taker schedules belong in
+a later versioned fee model.
 
-No latency model exists yet. The fill timestamp is the order submission
-timestamp. Explicit decision, acknowledgement, arrival, and execution times
-will be added before Chronos claims realistic trading evaluation.
+No latency model exists yet. A fill at submission is timestamped with the
+order's submission time; a fill of a working order with the receive time of
+the observation that filled it. Explicit decision, acknowledgement,
+arrival, and execution times will be added before Chronos claims realistic
+trading evaluation.
 
 Orders submitted through the paper-trading API are timestamped with the
 server's market clock, the receive time of the latest accepted market event,
@@ -197,12 +266,12 @@ and execute against the server's own quote. See
 
 ## Important limitations
 
-- Top-of-book only; no Level-2 sweep, queue, or market impact
+- Top-of-book only; no Level-2 sweep, queue position, or market impact; a
+  working order fills from displayed size as soon as a later quote shows it
 - No shared exchange: accounts never see each other's orders or liquidity
-- Immediate-or-cancel only; no resting order lifecycle
-- One fill at most per order
+- No replace; cancellation cancels the whole remainder
 - Long-only paper accounting
-- Flat fee per fill
+- One flat fee per order
 - No latency or slippage beyond crossing the visible spread
 - An unbounded processed-ID set inside each reconstructed processor
 - One processor instance is not safe for concurrent calls

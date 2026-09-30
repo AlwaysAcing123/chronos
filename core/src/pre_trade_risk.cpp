@@ -102,12 +102,26 @@ std::optional<PreTradeRiskRejection> validate_intent(
                 "order type is not recognized"
             );
     }
-    if (intent.time_in_force != TimeInForce::ImmediateOrCancel) {
-        return rejection(
-            PreTradeRiskErrorCode::UnsupportedTimeInForce,
-            "time_in_force",
-            "the first execution slice supports immediate-or-cancel only"
-        );
+    switch (intent.time_in_force) {
+        case TimeInForce::ImmediateOrCancel:
+            break;
+        case TimeInForce::GoodTilCancelled:
+            // The type is known to be declared here.
+            if (intent.type == OrderType::Market) {
+                return rejection(
+                    PreTradeRiskErrorCode::MarketOrderRequiresImmediateOrCancel,
+                    "time_in_force",
+                    "market orders must be immediate-or-cancel; only limit "
+                    "orders can be good-til-cancelled"
+                );
+            }
+            break;
+        default:
+            return rejection(
+                PreTradeRiskErrorCode::UnsupportedTimeInForce,
+                "time_in_force",
+                "time in force is not recognized"
+            );
     }
     if (intent.quantity.raw() <= 0) {
         return rejection(
@@ -193,6 +207,15 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
     const PaperAccount& account,
     const TopOfBookEvent& market
 ) const {
+    return evaluate(intent, account, AccountReservations{}, market);
+}
+
+PreTradeRiskDecision PreTradeRiskEngine::evaluate(
+    const OrderIntent& intent,
+    const PaperAccount& account,
+    const AccountReservations& reservations,
+    const TopOfBookEvent& market
+) const {
     if (const auto error = validate_intent(intent)) {
         return *error;
     }
@@ -276,9 +299,14 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
         );
     }
 
+    // A resting order can fill at any price up to its limit, so it is sized
+    // there; an immediate order only at the opposite best.
+    const bool rests = intent.time_in_force == TimeInForce::GoodTilCancelled;
+    const Price sizing_price = rests ? *intent.limit_price
+                                     : opposite_side->price;
     try {
         const Money maximum_notional = calculate_notional(
-            opposite_side->price,
+            sizing_price,
             intent.quantity
         );
         if (maximum_notional.raw() == 0) {
@@ -296,39 +324,48 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             );
         }
 
+        // Reserved cash and shares belong to working orders. Reservations
+        // never exceed what the account holds, so these differences are
+        // not negative for any consistent account.
+        const Money available_cash =
+            account.state().cash - reservations.reserved_cash;
         const Quantity held = account.state().quantity(intent.instrument);
         if (intent.side == Side::Buy) {
             const Money cash_required =
                 maximum_notional + limits_.fee_per_fill;
-            if (cash_required > account.state().cash) {
+            if (cash_required > available_cash) {
                 return rejection(
                     PreTradeRiskErrorCode::InsufficientCash,
                     "quantity",
-                    "paper account lacks cash for the order and fee"
+                    "paper account lacks unreserved cash for the order and fee"
                 );
             }
-            const Quantity resulting_position = held + intent.quantity;
+            const Quantity resulting_position = held +
+                reservations.working_buy_quantity(intent.instrument) +
+                intent.quantity;
             if (resulting_position > limits_.maximum_position_quantity) {
                 return rejection(
                     PreTradeRiskErrorCode::PositionLimitExceeded,
                     "quantity",
-                    "order would exceed the instrument's configured position "
-                    "limit"
+                    "order and working buys would exceed the instrument's "
+                    "configured position limit"
                 );
             }
         } else {
-            if (intent.quantity > held) {
+            const Quantity available_quantity =
+                held - reservations.reserved_sell_quantity(intent.instrument);
+            if (intent.quantity > available_quantity) {
                 return rejection(
                     PreTradeRiskErrorCode::InsufficientPosition,
                     "quantity",
-                    "sell order exceeds the instrument's position"
+                    "sell order exceeds the instrument's unreserved position"
                 );
             }
-            if (limits_.fee_per_fill > account.state().cash) {
+            if (limits_.fee_per_fill > available_cash) {
                 return rejection(
                     PreTradeRiskErrorCode::InsufficientCashForFee,
                     "fee_per_fill",
-                    "paper account lacks cash for a possible partial-fill fee"
+                    "paper account lacks unreserved cash for the order's fee"
                 );
             }
         }
@@ -340,7 +377,8 @@ PreTradeRiskDecision PreTradeRiskEngine::evaluate(
             .fill_id = intent.client_order_id + ":risk-preview",
             .instrument = intent.instrument,
             .side = intent.side,
-            .price = opposite_side->price,
+            .price = intent.side == Side::Buy ? sizing_price
+                                              : opposite_side->price,
             .quantity = intent.quantity,
             .fee = limits_.fee_per_fill,
             .timestamp = intent.submitted_at,

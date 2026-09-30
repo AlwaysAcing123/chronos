@@ -163,6 +163,7 @@ add_library(chronos_paper_execution
     core/src/portfolio_valuation.cpp
     core/src/pre_trade_risk.cpp
     core/src/top_of_book_execution.cpp
+    core/src/working_order.cpp
 )
 
 target_include_directories(chronos_paper_execution
@@ -277,6 +278,7 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
     add_library(chronos_paper_trading_service
         services/paper_trading/src/history_cursor.cpp
         services/paper_trading/src/paper_trading_service.cpp
+        services/paper_trading/src/working_order_matcher.cpp
     )
 
     target_include_directories(chronos_paper_trading_service
@@ -285,6 +287,7 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
 
     target_link_libraries(chronos_paper_trading_service
         PUBLIC
+            chronos_market_data_sources
             chronos_market_state
             chronos_postgresql_persistence
         PRIVATE chronos_build_options
@@ -567,6 +570,21 @@ if(BUILD_TESTING)
         COMMAND chronos_paper_order_processor_tests
     )
 
+    add_executable(chronos_working_order_tests
+        tests/working_order_tests.cpp
+    )
+
+    target_link_libraries(chronos_working_order_tests
+        PRIVATE
+            chronos_paper_execution
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_working_order_tests
+        COMMAND chronos_working_order_tests
+    )
+
     if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
         add_executable(chronos_postgresql_persistence_tests
             tests/postgresql_paper_order_repository_tests.cpp
@@ -589,6 +607,30 @@ if(BUILD_TESTING)
         )
 
         set_tests_properties(chronos_postgresql_persistence_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
+        add_executable(chronos_postgresql_working_order_tests
+            tests/postgresql_working_order_tests.cpp
+        )
+
+        target_compile_definitions(chronos_postgresql_working_order_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_postgresql_working_order_tests
+            PRIVATE
+                chronos_postgresql_persistence
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_postgresql_working_order_tests
+            COMMAND chronos_postgresql_working_order_tests
+        )
+
+        set_tests_properties(chronos_postgresql_working_order_tests
             PROPERTIES SKIP_RETURN_CODE 77
         )
 
@@ -684,6 +726,55 @@ if(BUILD_TESTING)
         )
 
         set_tests_properties(chronos_paper_trading_service_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
+        add_executable(chronos_paper_trading_working_order_tests
+            tests/paper_trading_working_order_tests.cpp
+        )
+
+        target_compile_definitions(chronos_paper_trading_working_order_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_paper_trading_working_order_tests
+            PRIVATE
+                chronos_paper_trading_service
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_paper_trading_working_order_tests
+            COMMAND chronos_paper_trading_working_order_tests
+        )
+
+        set_tests_properties(chronos_paper_trading_working_order_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
+        add_executable(chronos_paper_trading_gtc_http_api_tests
+            tests/paper_trading_gtc_http_api_tests.cpp
+        )
+
+        target_compile_definitions(chronos_paper_trading_gtc_http_api_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_paper_trading_gtc_http_api_tests
+            PRIVATE
+                chronos_paper_trading_http
+                chronos_build_options
+                nlohmann_json::nlohmann_json
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_paper_trading_gtc_http_api_tests
+            COMMAND chronos_paper_trading_gtc_http_api_tests
+        )
+
+        set_tests_properties(chronos_paper_trading_gtc_http_api_tests
             PROPERTIES SKIP_RETURN_CODE 77
         )
 

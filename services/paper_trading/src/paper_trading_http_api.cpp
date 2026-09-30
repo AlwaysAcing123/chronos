@@ -147,6 +147,7 @@ std::optional<HttpResponse> require_json_body(const HttpRequest& request) {
 HttpResponse health(
     PaperTradingService& service,
     const market_data::MarketDataSource& source,
+    const WorkingOrderMatcher* matcher,
     const DiagnosticLog& log,
     const HttpRequest& request
 ) {
@@ -156,7 +157,12 @@ HttpResponse health(
     if (auto rejected = require_no_query(request)) {
         return *rejected;
     }
-    HttpResponse response = render_health(service.health(), source.status());
+    HttpResponse response = render_health(
+        service.health(),
+        source.status(),
+        matcher ? std::optional<WorkingOrderMatcherStatus>(matcher->status())
+                : std::nullopt
+    );
     if (response.status != 200) {
         log("health check: PostgreSQL is unavailable");
     }
@@ -267,6 +273,108 @@ HttpResponse order(
     ));
 }
 
+// POST cancels the order's working remainder.
+HttpResponse cancel_order(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (auto rejected = require_method(request, "POST")) {
+        return *rejected;
+    }
+    if (auto rejected = require_no_query(request)) {
+        return *rejected;
+    }
+    if (auto rejected = require_json_body(request)) {
+        return *rejected;
+    }
+    auto parsed = parse_cancel_request(
+        std::string(account_id),
+        std::string(client_order_id),
+        request.body
+    );
+    if (const auto* malformed = std::get_if<MalformedRequest>(&parsed)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_cancellation(log_unavailable(
+        service.cancel_order(std::get<CancelPaperOrderRequest>(parsed)),
+        log,
+        "cancel order"
+    ));
+}
+
+HttpResponse order_fills(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    auto page = parse_forward_query(request.query, false);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&page)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_order_fills(log_unavailable(
+        service.list_order_fills(
+            account_id,
+            client_order_id,
+            std::get<ForwardPageRequest>(page)
+        ),
+        log,
+        "list order fills"
+    ));
+}
+
+HttpResponse order_events(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id,
+    std::string_view client_order_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    auto page = parse_forward_query(request.query, false);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&page)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_order_events(log_unavailable(
+        service.list_order_events(
+            account_id,
+            client_order_id,
+            std::get<ForwardPageRequest>(page)
+        ),
+        log,
+        "list order events"
+    ));
+}
+
+HttpResponse working_orders(
+    PaperTradingService& service,
+    const DiagnosticLog& log,
+    const HttpRequest& request,
+    std::string_view account_id
+) {
+    if (auto rejected = require_method(request, "GET")) {
+        return *rejected;
+    }
+    auto page = parse_forward_query(request.query, true);
+    if (const auto* malformed = std::get_if<MalformedRequest>(&page)) {
+        return render_malformed_request(*malformed);
+    }
+    return render_working_orders(log_unavailable(
+        service.list_working_orders(account_id, std::get<ForwardPageRequest>(page)),
+        log,
+        "list working orders"
+    ));
+}
+
 HttpResponse portfolio(
     PaperTradingService& service,
     const DiagnosticLog& log,
@@ -327,12 +435,14 @@ PaperTradingHttpApi::PaperTradingHttpApi(
     PaperTradingService& service,
     market_data::MarketDataSource& source,
     market_data::MarketDataNotifier& notifier,
-    DiagnosticLog log
+    DiagnosticLog log,
+    const WorkingOrderMatcher* matcher
 )
     : service_(service),
       source_(source),
       notifier_(notifier),
-      log_(std::move(log)) {}
+      log_(std::move(log)),
+      matcher_(matcher) {}
 
 bool PaperTradingHttpApi::is_event_stream_request(const HttpRequest& request) {
     return request.method == "GET" && request.path == kEventStreamPath;
@@ -457,7 +567,7 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
     }
     const auto& parts = *segments;
     if (parts.size() == 1 && parts[0] == "health") {
-        return health(service_, source_, log_, request);
+        return health(service_, source_, matcher_, log_, request);
     }
     if (parts.size() >= 3 && parts[0] == "api" && parts[1] == "v1" &&
         parts[2] == "market-data") {
@@ -485,8 +595,23 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
     if (parts.size() == 5 && parts[4] == "portfolio") {
         return portfolio(service_, log_, request, account_id);
     }
+    if (parts.size() == 5 && parts[4] == "working-orders") {
+        return working_orders(service_, log_, request, account_id);
+    }
     if (parts.size() == 6 && parts[4] == "orders") {
         return order(service_, log_, request, account_id, parts[5]);
+    }
+    if (parts.size() == 7 && parts[4] == "orders") {
+        const std::string_view client_order_id = parts[5];
+        if (parts[6] == "cancel") {
+            return cancel_order(service_, log_, request, account_id, client_order_id);
+        }
+        if (parts[6] == "fills") {
+            return order_fills(service_, log_, request, account_id, client_order_id);
+        }
+        if (parts[6] == "events") {
+            return order_events(service_, log_, request, account_id, client_order_id);
+        }
     }
     return route_not_found();
 }

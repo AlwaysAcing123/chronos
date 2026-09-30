@@ -1,12 +1,15 @@
 // The server's change stream (Server-Sent Events). A notice carries no market
 // data: it only says the market or source changed, so the provider
 // invalidates the market-dependent queries and they refetch their typed
-// resources. Without an open stream, those queries poll instead.
+// resources. A notice whose activity revision moved also says some account
+// recorded an order, a fill, or a cancellation, so the durable account
+// resources are read again too; other notices leave them to their polling.
+// Without an open stream, every query polls instead.
 import { useQueryClient } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 
-import { isMarketDependentQuery, queryKeys } from './queries';
+import { isAccountQuery, isMarketDependentQuery, queryKeys } from './queries';
 import { useChronosServices } from './services';
 import type { StreamStatus } from './streamStatus';
 import { StreamStatusContext } from './streamStatus';
@@ -26,6 +29,24 @@ export type OpenNoticeStream = () => NoticeStream;
 function isMarketQuery(key: readonly unknown[]): boolean {
   const marketData = queryKeys.marketData();
   return (key[0] === marketData[0] && key[1] === marketData[1] && key.length === 2) || isMarketDependentQuery(key);
+}
+
+// The activity revision of a notice, or null when the notice has none (an
+// older server) or is not the documented JSON.
+export function activityRevisionOf(event: MessageEvent): string | null {
+  if (typeof event.data !== 'string') {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(event.data);
+    if (typeof parsed === 'object' && parsed !== null && 'activity_revision' in parsed) {
+      const revision = parsed.activity_revision;
+      return typeof revision === 'string' && /^(0|[1-9][0-9]*)$/.test(revision) ? revision : null;
+    }
+  } catch {
+    // Treated as a plain market notice.
+  }
+  return null;
 }
 
 // EventSource.CLOSED: the browser will not reconnect by itself.
@@ -53,13 +74,27 @@ export function MarketDataStreamProvider({ children }: { readonly children: Reac
     const keepInFlight = { cancelRefetch: false };
     const behind = new Set<string>();
 
-    const refreshMarket = () => {
-      for (const query of cache.findAll({ predicate: (candidate) => isMarketQuery(candidate.queryKey) })) {
+    const refresh = (matches: (key: readonly unknown[]) => boolean) => {
+      for (const query of cache.findAll({ predicate: (candidate) => matches(candidate.queryKey) })) {
         if (query.state.fetchStatus === 'fetching') {
           behind.add(query.queryHash);
         }
       }
-      void queryClient.invalidateQueries({ predicate: (query) => isMarketQuery(query.queryKey) }, keepInFlight);
+      void queryClient.invalidateQueries({ predicate: (query) => matches(query.queryKey) }, keepInFlight);
+    };
+    const refreshMarket = () => {
+      refresh(isMarketQuery);
+    };
+    // The last activity revision delivered on this page, across reconnects.
+    let activity: string | null = null;
+    const onNotice = (event: MessageEvent) => {
+      const revision = activityRevisionOf(event);
+      if (revision !== null && revision !== activity) {
+        activity = revision;
+        refresh((key) => isMarketQuery(key) || isAccountQuery(key));
+        return;
+      }
+      refreshMarket();
     };
 
     const unsubscribe = cache.subscribe((event) => {
@@ -77,9 +112,9 @@ export function MarketDataStreamProvider({ children }: { readonly children: Reac
         failures = 0;
         setStatus('streaming');
         // Changes may have happened while disconnected.
-        refreshMarket();
+        refresh((key) => isMarketQuery(key) || isAccountQuery(key));
       };
-      opened.addEventListener('market-data', refreshMarket);
+      opened.addEventListener('market-data', onNotice);
       opened.onerror = () => {
         setStatus('polling');
         // The browser retries a dropped stream itself; a refused one it

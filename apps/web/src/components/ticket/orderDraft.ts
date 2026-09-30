@@ -1,5 +1,5 @@
 import { FRACTION_DIGITS, validatePositiveDecimal } from '../../api/decimal';
-import type { OrderType, Side } from '../../api/schemas';
+import type { OrderType, Side, TimeInForce } from '../../api/schemas';
 import type { OrderRequest } from '../../api/submission';
 import { decimalProblemMessage } from '../form/messages';
 
@@ -9,9 +9,17 @@ export interface OrderDraft {
   readonly type: OrderType;
   readonly quantity: string;
   readonly limitPrice: string;
+  // Chosen for limit orders; a market order is always immediate-or-cancel.
+  readonly timeInForce: TimeInForce;
 }
 
-export const INITIAL_DRAFT: OrderDraft = { side: 'buy', type: 'market', quantity: '', limitPrice: '' };
+export const INITIAL_DRAFT: OrderDraft = {
+  side: 'buy',
+  type: 'market',
+  quantity: '',
+  limitPrice: '',
+  timeInForce: 'ioc',
+};
 
 // Without authentication there is no principal, so a manual order names the
 // channel it came from. An authenticated user will replace this later.
@@ -38,7 +46,10 @@ export function hasDraftErrors(errors: DraftErrors): boolean {
   return errors.quantity !== undefined || errors.limitPrice !== undefined;
 }
 
-/** The exact request for a validated draft. A market order carries no limit price. */
+/**
+ * The exact request for a validated draft. A market order carries no limit
+ * price and is always immediate-or-cancel, whatever was chosen for a limit.
+ */
 export function buildOrderRequest(draft: OrderDraft, instrument: string, clientOrderId: string): OrderRequest {
   const common = {
     client_order_id: clientOrderId,
@@ -46,9 +57,8 @@ export function buildOrderRequest(draft: OrderDraft, instrument: string, clientO
     instrument,
     side: draft.side,
     quantity: draft.quantity,
-    time_in_force: 'ioc',
   } as const;
   return draft.type === 'limit'
-    ? { ...common, type: 'limit', limit_price: draft.limitPrice }
-    : { ...common, type: 'market' };
+    ? { ...common, type: 'limit', limit_price: draft.limitPrice, time_in_force: draft.timeInForce }
+    : { ...common, type: 'market', time_in_force: 'ioc' };
 }
