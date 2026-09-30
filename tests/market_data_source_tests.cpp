@@ -418,6 +418,10 @@ void test_completion_records_the_recording_checksum() {
     REQUIRE(std::holds_alternative<chronos::ExecutionQuote>(
         replay.market.execution_quote(InstrumentId("AAPL"))
     ));
+    REQUIRE(eventually([&] {
+        const std::lock_guard lock(replay.log_mutex);
+        return replay.log.size() == 1;
+    }));
     const std::lock_guard lock(replay.log_mutex);
     REQUIRE(replay.log.size() == 1);
     REQUIRE(replay.log.front() == "replay completed after 1 events; recording sha256 " + std::string(64, 'a'));
