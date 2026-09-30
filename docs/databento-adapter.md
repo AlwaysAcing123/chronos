@@ -92,8 +92,12 @@ The workflow is documented in `docs/historical-data-acquisition.md`.
 Licensed recordings remain outside Git. A local, ignored `AAPL`/`SPY`
 recording has been acquired and replayed through the complete adapter-to-view
 path. The offline replay command reports its independently recomputed
-manifest, event counts, and final market view. The system does not yet persist
-normalized events.
+manifest, event counts, and final market view. `chronos_databento_normalize`
+converts a recording into a provider-independent normalized dataset, recording
+the adapter's mapping as normalizer `chronos.databento.equs_mini_mbp1`
+version 1 in the dataset's provenance; a change to the mapping must change
+that version
+([normalized-market-datasets.md](normalized-market-datasets.md)).
 
 ## References
 

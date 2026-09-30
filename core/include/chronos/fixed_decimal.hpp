@@ -54,13 +54,20 @@ inline std::int64_t checked_int64(WideInteger value) {
     return static_cast<std::int64_t>(value);
 }
 
+// The denominator may exceed the int64 range, as a sum of two quantities
+// can; the quotient must not.
 inline std::int64_t rounded_divide(
     WideInteger numerator,
-    std::int64_t denominator,
+    WideInteger denominator,
     RoundingMode mode
 ) {
     if (denominator <= 0) {
         throw std::invalid_argument("fixed-point denominator must be positive");
+    }
+    // -2^127 has no positive counterpart to take the magnitude of.
+    constexpr WideInteger kWideMinimum = -(((WideInteger{1} << 126) - 1) * 2) - 2;
+    if (numerator == kWideMinimum) {
+        throw std::overflow_error("fixed-point numerator exceeds the 128-bit range");
     }
 
     const bool negative = numerator < 0;
@@ -68,7 +75,9 @@ inline std::int64_t rounded_divide(
     WideInteger quotient = magnitude / denominator;
     const WideInteger remainder = magnitude % denominator;
 
-    if (mode == RoundingMode::HalfAwayFromZero && remainder * 2 >= denominator) {
+    // remainder >= denominator / 2, without doubling a remainder that could
+    // exceed half the 128-bit range.
+    if (mode == RoundingMode::HalfAwayFromZero && remainder >= denominator - remainder) {
         ++quotient;
     }
 

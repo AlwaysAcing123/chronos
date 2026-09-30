@@ -91,11 +91,15 @@ latest accepted event and replays remain reproducible.
 ## Current boundary
 
 The replay core supports event-step replay of synthetic and local real DBN
-recordings; the server paces it in real time as described below. The core
-does not persist normalized events, calculate features, or simulate
-execution. Those
-responsibilities build on the replay clock and market view rather than
-entering the provider adapter.
+recordings, and of normalized datasets through `NormalizedMarketEventReader`
+([normalized-market-datasets.md](normalized-market-datasets.md)), which is a
+provider-independent `MarketEventReader`: replaying a dataset gives the same
+market view and final checksum as replaying the recording it came from, and
+`PacedReplaySource` plays it unchanged. The server paces replay in real time
+as described below; its command line still selects DBN recordings only.
+Features are computed from the same event stream by the separate feature
+engine ([feature-engine.md](feature-engine.md)), not by replay, and execution
+is simulated by the paper-trading core.
 
 ## Paced replay
 

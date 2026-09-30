@@ -129,6 +129,12 @@ Market timestamps are deliberately not required to increase. Equal, late, and no
 
 The generic stream validator deliberately does not interpret provider venue sequences, detect content duplicates that received different Chronos ingest sequences, enforce freshness policy, or check tick-size compliance against the active instrument definition. Those rules require provider metadata or market-view state and belong to the provider adapter and later market view. Keeping these responsibilities separate makes each contract deterministic and independently testable.
 
+## Persisted form
+
+Normalized datasets persist these events exactly, one canonical JSON record
+per event with raw fixed-point strings, and return them only after the same
+validation ([normalized-market-datasets.md](normalized-market-datasets.md)).
+
 ## Current limitations
 
 - Identifiers enforce non-emptiness but not yet character sets or length limits.

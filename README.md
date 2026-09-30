@@ -80,15 +80,26 @@ Chronos simulates trading only. It does not place real-money orders.
   subscribe lifecycle, reconnection with backoff, and quotes that are never
   executable while the feed is down or before a fresh quote arrives. IEX is
   one exchange, not SIP or the NBBO, and is labelled so everywhere
+- Provider-independent normalized market datasets: immutable,
+  content-addressed directories of canonical NDJSON events with exact raw
+  fixed-point strings, a strict manifest, and a deterministic quality report,
+  published atomically and verified end to end when read; converted offline
+  from Databento recordings and replayable by the existing replay code
+- A point-in-time `top_of_book` feature engine (best bid and ask, sizes,
+  spread, midpoint, imbalance, microprice) with checked integer arithmetic,
+  typed unavailability, and reproducible, content-addressed feature artifacts
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
-  risk, and execution, plus real-PostgreSQL service and API tests
+  datasets, features, risk, and execution, plus real-PostgreSQL service and
+  API tests
 
 The core accepts, simulates, books, persists, and recovers paper orders
 through controlled paths, the optional API exposes that path to local
 clients, and the web workspace in `apps/web/` is the first of them. A
 replayed market now moves while the server runs, and an optional live IEX
-feed can replace it. Authentication, model deployment, and historical charts
-are not built yet. See [plan.md](plan.md) for the complete roadmap.
+feed can replace it. Recordings become normalized datasets and feature
+artifacts for research. Labels, model evaluation, authentication, model
+deployment, and historical charts are not built yet. See [plan.md](plan.md)
+for the complete roadmap.
 
 ## Requirements
 
@@ -154,6 +165,38 @@ existing recording. See
 validates and replays every event, recomputes its checksum-backed manifest, and
 prints deterministic JSON containing event counts and each instrument's final
 trade and top of book. See [docs/market-replay.md](docs/market-replay.md).
+
+`chronos_databento_normalize` converts a local recording, offline, into an
+immutable normalized dataset in a catalog directory such as the ignored
+`data/normalized/`:
+
+```sh
+./build-databento/chronos_databento_normalize \
+  --input data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst \
+  --stream-id databento-equs-mini-mbp1-20260925-1330-1340 \
+  --catalog data/normalized
+```
+
+## Normalized datasets and features
+
+The default build includes `chronos_dataset`, which lists, verifies, and
+inspects normalized datasets and extracts point-in-time feature artifacts:
+
+```sh
+./build/chronos_dataset list --catalog data/normalized
+./build/chronos_dataset inspect --catalog data/normalized --dataset <ID>
+./build/chronos_dataset features extract --catalog data/normalized \
+  --dataset <ID> --output data/features
+./build/chronos_dataset features inspect --output data/features \
+  --artifact <ARTIFACT-ID> --catalog data/normalized
+```
+
+Datasets and feature artifacts are content-addressed: the same recording
+always gives the same IDs and bytes, and nothing is ever overwritten. They are
+generated, often from licensed data, and stay out of Git. See
+[docs/normalized-market-datasets.md](docs/normalized-market-datasets.md),
+[docs/feature-engine.md](docs/feature-engine.md), and
+[docs/decisions/0012-normalized-market-dataset-and-features.md](docs/decisions/0012-normalized-market-dataset-and-features.md).
 
 ## Build the PostgreSQL persistence adapter
 
@@ -284,6 +327,8 @@ architecture, exact-decimal rules, uncertain-order reconciliation, and tests.
 adapters/   Provider-specific integrations isolated from the core
 apps/web/   React and TypeScript paper-trading workspace
 core/       C++ domain types and paper-trading core
+datasets/   Normalized market datasets: format, writer, reader, catalog
+features/   Point-in-time feature engine and feature artifacts
 docs/       Contracts, architecture decisions, and accounting rules
 services/   Application service and HTTP API over the core
 tests/      C++ unit, edge-case, and integration tests
@@ -326,6 +371,9 @@ Real-data quoting and guarded downloads are documented in
 [docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
 Replay time, ordering, reset, and market-view semantics are documented in
 [docs/market-replay.md](docs/market-replay.md).
+Normalized datasets and their quality reports are documented in
+[docs/normalized-market-datasets.md](docs/normalized-market-datasets.md), and
+point-in-time features in [docs/feature-engine.md](docs/feature-engine.md).
 Paper-order, risk, and simple top-of-book execution semantics are documented in
 [docs/paper-execution.md](docs/paper-execution.md).
 PostgreSQL transaction, journal, idempotency, and recovery semantics are

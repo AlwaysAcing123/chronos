@@ -12,6 +12,7 @@ compile_commands.json
 # Market data and licensed artifacts
 data/raw/
 data/normalized/
+data/features/
 data/downloads/
 *.dbn
 *.dbn.zst

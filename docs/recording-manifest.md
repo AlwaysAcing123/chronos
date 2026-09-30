@@ -37,4 +37,6 @@ The operating-system owner can still deliberately change permissions or delete t
 
 ## Licensing boundary
 
-The manifest can be committed because it contains provenance and aggregate counts rather than licensed market records. Raw Databento recordings, normalized event dumps, and screenshots or fixtures derived from licensed data require a separate redistribution review before publication.
+The manifest can be committed because it contains provenance and aggregate counts rather than licensed market records. Raw Databento recordings, normalized datasets and feature artifacts derived from them, and screenshots or fixtures derived from licensed data require a separate redistribution review before publication.
+
+A normalized dataset records this manifest's `source.sha256` as its `recording_sha256` and never replaces the recording ([normalized-market-datasets.md](normalized-market-datasets.md)).
