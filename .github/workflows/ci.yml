@@ -308,6 +308,58 @@ jobs:
           --output-on-failure
           --no-tests=error
 
+  # The research package verifies its inputs with the C++ chronos_dataset
+  # tool and builds them from synthetic events with a test-only C++ tool, so
+  # this job builds both first. No market data, credentials, or network
+  # beyond the hash-pinned Python dependencies.
+  python-research:
+    name: Python research package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CHRONOS_DATASET: ${{ github.workspace }}/build/chronos_dataset
+      CHRONOS_SYNTHETIC_DATASET: ${{ github.workspace }}/build/chronos_synthetic_dataset
+      CHRONOS_REQUIRE_TOOLS: "1"
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: python/.python-version
+
+      - name: Build the C++ verifier and synthetic-dataset tool
+        working-directory: .
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          cmake --build build --parallel --target chronos_dataset chronos_synthetic_dataset
+
+      - name: Install pinned dependencies
+        run: python -m pip install --require-hashes --no-deps -r requirements.lock
+
+      - name: Check formatting
+        run: python -m ruff format --check .
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Type-check
+        run: python -m mypy
+
+      - name: Test
+        run: python -m pytest
+
   web:
     name: Web client
     runs-on: ubuntu-24.04

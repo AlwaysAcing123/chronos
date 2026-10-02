@@ -128,6 +128,7 @@ add_library(chronos_datasets
     datasets/src/dataset_quality.cpp
     datasets/src/dataset_reader.cpp
     datasets/src/dataset_writer.cpp
+    datasets/src/derived_artifact.cpp
     datasets/src/json_fields.cpp
     datasets/src/market_event_codec.cpp
     datasets/src/ndjson_file.cpp
@@ -162,13 +163,45 @@ target_link_libraries(chronos_features
     PRIVATE chronos_build_options
 )
 
+# Future-return labels computed from feature artifacts. See ADR 0013.
+add_library(chronos_labels
+    labels/src/future_midpoint_return.cpp
+    labels/src/label_artifact.cpp
+    labels/src/label_row_codec.cpp
+)
+
+target_include_directories(chronos_labels
+    PUBLIC labels/include
+)
+
+target_link_libraries(chronos_labels
+    PUBLIC chronos_features
+    PRIVATE chronos_build_options
+)
+
+# Chronological, purged splits of label artifacts. See ADR 0014.
+add_library(chronos_splits
+    splits/src/chronological_split.cpp
+    splits/src/split_artifact.cpp
+    splits/src/split_row_codec.cpp
+)
+
+target_include_directories(chronos_splits
+    PUBLIC splits/include
+)
+
+target_link_libraries(chronos_splits
+    PUBLIC chronos_labels
+    PRIVATE chronos_build_options
+)
+
 add_executable(chronos_dataset
     tools/dataset_cli.cpp
 )
 
 target_link_libraries(chronos_dataset
     PRIVATE
-        chronos_features
+        chronos_splits
         chronos_build_options
 )
 
@@ -563,6 +596,63 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_feature_engine_tests
         COMMAND chronos_feature_engine_tests
+    )
+
+    add_executable(chronos_label_artifact_tests
+        tests/label_artifact_tests.cpp
+    )
+
+    target_link_libraries(chronos_label_artifact_tests
+        PRIVATE
+            chronos_labels
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_label_artifact_tests
+        COMMAND chronos_label_artifact_tests
+    )
+
+    add_executable(chronos_split_artifact_tests
+        tests/split_artifact_tests.cpp
+    )
+
+    target_link_libraries(chronos_split_artifact_tests
+        PRIVATE
+            chronos_splits
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_split_artifact_tests
+        COMMAND chronos_split_artifact_tests
+    )
+
+    # Writes synthetic datasets for tests outside C++, such as the Python
+    # research package's.
+    add_executable(chronos_synthetic_dataset
+        tests/tools/synthetic_dataset.cpp
+    )
+
+    target_link_libraries(chronos_synthetic_dataset
+        PRIVATE
+            chronos_datasets
+            chronos_build_options
+    )
+
+    add_executable(chronos_dataset_command_tests
+        tests/dataset_command_tests.cpp
+    )
+
+    target_link_libraries(chronos_dataset_command_tests
+        PRIVATE
+            chronos_splits
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_dataset_command_tests
+        COMMAND chronos_dataset_command_tests $<TARGET_FILE:chronos_dataset>
     )
 
     add_executable(chronos_market_data_tests

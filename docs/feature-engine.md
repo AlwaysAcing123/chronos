@@ -204,5 +204,9 @@ Memory is bounded by the number of instruments and one line.
 - Rows are only emitted on top-of-book events; a status change does not
   emit a row until the next quote.
 - The engine is ready for live use but not yet wired to the live server.
-- Next: labels (future returns over a declared horizon) as another derived
-  artifact, chronological splits, and baseline models.
+- Feature artifacts are labelled, split, and evaluated by the artifacts in
+  [labels-and-splits.md](labels-and-splits.md) and
+  [baseline-evaluation.md](baseline-evaluation.md). The artifact-directory,
+  row-stream, and publication code they share with feature artifacts lives
+  in `datasets/derived_artifact.hpp`; feature artifact bytes and IDs are
+  unchanged by that refactoring.

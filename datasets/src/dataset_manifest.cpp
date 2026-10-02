@@ -34,14 +34,6 @@ bool increment(std::uint64_t& counter) {
     return true;
 }
 
-bool add_to(std::uint64_t& total, std::uint64_t value) {
-    if (value > std::numeric_limits<std::uint64_t>::max() - total) {
-        return false;
-    }
-    total += value;
-    return true;
-}
-
 std::uint64_t* type_counter(EventTypeCounts& counts, const MarketEvent& event) {
     return std::visit(
         [&counts](const auto& concrete) -> std::uint64_t* {
@@ -76,13 +68,6 @@ json::Value manifest_body(const DatasetManifest& manifest) {
               {"start_ns", nanoseconds(source.coverage->start)},
           })
         : json::Value(nullptr);
-    const auto file = [](std::string_view name, const FileDigest& digest) {
-        return json::Value(json::Object{
-            {"name", name},
-            {"sha256", digest.sha256},
-            {"size_bytes", decimal(digest.size_bytes)},
-        });
-    };
     return json::Value(json::Object{
         {"counts", json::Object{
             {"by_event_type", event_type_counts_json(summary.by_type)},
@@ -94,8 +79,8 @@ json::Value manifest_body(const DatasetManifest& manifest) {
             {"version", kEventEncodingVersion},
         }},
         {"files", json::Object{
-            {"events", file(kEventsFileName, manifest.events)},
-            {"quality", file(kQualityFileName, manifest.quality)},
+            {"events", file_digest_json(kEventsFileName, manifest.events)},
+            {"quality", file_digest_json(kQualityFileName, manifest.quality)},
         }},
         {"ingest_sequence", json::Object{
             {"first", decimal(summary.first_ingest_sequence)},
@@ -140,30 +125,6 @@ json::Value manifest_body(const DatasetManifest& manifest) {
         }},
     });
 }
-
-// A nested object of known keys. finish() passes its first error, with its
-// full path, to the parent, so the caller checks one place.
-class Nested final {
-public:
-    Nested(ObjectFields& parent, std::string_view key, std::initializer_list<std::string_view> keys)
-        : parent_(parent), fields_(value_or_empty(parent, key), parent.field(key)) {
-        fields_.require_keys(keys);
-    }
-
-    ObjectFields& fields() { return fields_; }
-
-    void finish() { parent_.adopt(fields_.error()); }
-
-private:
-    static const json::Value& value_or_empty(ObjectFields& parent, std::string_view key) {
-        static const json::Value empty{json::Object{}};
-        const json::Value* value = parent.value(key);
-        return value != nullptr ? *value : empty;
-    }
-
-    ObjectFields& parent_;
-    ObjectFields fields_;
-};
 
 void require_nonempty(ObjectFields& fields, std::string_view key, const std::string& value) {
     if (fields.ok() && value.empty()) {
@@ -242,7 +203,7 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     ObjectFields fields(root, "manifest");
     // The schema decides every other field, so it is checked first.
     if (fields.ok()) {
-        Nested schema(fields, "schema", {"name", "version"});
+        NestedFields schema(fields, "schema", {"name", "version"});
         schema.fields().constant("name", kDatasetSchemaName);
         schema.fields().constant("version", kDatasetSchemaVersion);
         schema.finish();
@@ -255,17 +216,17 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
         "record", "scales", "schema", "source", "stream", "time_range",
     });
 
-    Nested encoding(fields, "encoding", {"name", "version"});
+    NestedFields encoding(fields, "encoding", {"name", "version"});
     encoding.fields().constant("name", kEventEncodingName);
     encoding.fields().constant("version", kEventEncodingVersion);
     encoding.finish();
 
-    Nested record(fields, "record", {"name", "version"});
+    NestedFields record(fields, "record", {"name", "version"});
     record.fields().constant("name", kMarketEventRecordName);
     record.fields().constant("version", kMarketEventSchemaVersion);
     record.finish();
 
-    Nested scales(fields, "scales", {"price_raw", "quantity_raw", "timestamps"});
+    NestedFields scales(fields, "scales", {"price_raw", "quantity_raw", "timestamps"});
     scales.fields().constant("price_raw", std::to_string(Price::scale()));
     scales.fields().constant("quantity_raw", std::to_string(Quantity::scale()));
     scales.fields().constant("timestamps", kTimestampUnit);
@@ -275,7 +236,7 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     std::string stream = fields.string("stream");
     require_nonempty(fields, "stream", stream);
 
-    Nested source_fields(fields, "source", {
+    NestedFields source_fields(fields, "source", {
         "coverage", "description", "normalizer", "provider", "provider_dataset",
         "provider_schema", "recording_sha256",
     });
@@ -294,7 +255,7 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     require_nonempty(source, "provider_dataset", parsed_source.provider_dataset);
     require_nonempty(source, "provider_schema", parsed_source.provider_schema);
     {
-        Nested normalizer(source, "normalizer", {"name", "version"});
+        NestedFields normalizer(source, "normalizer", {"name", "version"});
         parsed_source.normalizer = normalizer.fields().string("name");
         parsed_source.normalizer_version = normalizer.fields().string("version");
         require_nonempty(normalizer.fields(), "name", parsed_source.normalizer);
@@ -302,7 +263,7 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
         normalizer.finish();
     }
     if (const json::Value* coverage = source.value("coverage"); coverage != nullptr && !coverage->is_null()) {
-        Nested window(source, "coverage", {"end_ns", "semantics", "start_ns"});
+        NestedFields window(source, "coverage", {"end_ns", "semantics", "start_ns"});
         DatasetCoverage parsed_coverage{
             .start = window.fields().timestamp("start_ns"),
             .end = window.fields().timestamp("end_ns"),
@@ -319,10 +280,10 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
 
     DatasetSummary summary;
     {
-        Nested counts(fields, "counts", {"by_event_type", "by_instrument", "events"});
+        NestedFields counts(fields, "counts", {"by_event_type", "by_instrument", "events"});
         summary.events = counts.fields().unsigned_integer("events");
         {
-            Nested by_type(counts.fields(), "by_event_type", {
+            NestedFields by_type(counts.fields(), "by_event_type", {
                 "instrument_definition", "market_status", "top_of_book", "trade",
             });
             summary.by_type = EventTypeCounts{
@@ -351,21 +312,21 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
         counts.finish();
     }
     {
-        Nested sequences(fields, "ingest_sequence", {"first", "last"});
+        NestedFields sequences(fields, "ingest_sequence", {"first", "last"});
         summary.first_ingest_sequence = sequences.fields().unsigned_integer("first");
         summary.last_ingest_sequence = sequences.fields().unsigned_integer("last");
         sequences.finish();
     }
     {
-        Nested range(fields, "time_range", {"event_timestamp_ns", "receive_timestamp_ns"});
+        NestedFields range(fields, "time_range", {"event_timestamp_ns", "receive_timestamp_ns"});
         {
-            Nested event_range(range.fields(), "event_timestamp_ns", {"earliest", "latest"});
+            NestedFields event_range(range.fields(), "event_timestamp_ns", {"earliest", "latest"});
             summary.earliest_event_timestamp = event_range.fields().timestamp("earliest");
             summary.latest_event_timestamp = event_range.fields().timestamp("latest");
             event_range.finish();
         }
         {
-            Nested receive_range(range.fields(), "receive_timestamp_ns", {"earliest", "latest"});
+            NestedFields receive_range(range.fields(), "receive_timestamp_ns", {"earliest", "latest"});
             summary.earliest_receive_timestamp = receive_range.fields().timestamp("earliest");
             summary.latest_receive_timestamp = receive_range.fields().timestamp("latest");
             receive_range.finish();
@@ -376,16 +337,12 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     FileDigest events;
     FileDigest quality;
     {
-        Nested files(fields, "files", {"events", "quality"});
+        NestedFields files(fields, "files", {"events", "quality"});
         const auto file = [&files](std::string_view key, std::string_view name, FileDigest& digest) {
-            Nested entry(files.fields(), key, {"name", "sha256", "size_bytes"});
-            entry.fields().constant("name", name);
-            digest.sha256 = entry.fields().sha256("sha256");
-            digest.size_bytes = entry.fields().unsigned_integer("size_bytes");
-            if (entry.fields().ok() && digest.size_bytes == 0) {
-                entry.fields().fail(DatasetErrorCode::InvalidValue, "size_bytes", "must be positive");
+            digest = parse_file_digest(files.fields(), key, name);
+            if (files.fields().ok() && digest.size_bytes == 0) {
+                files.fields().fail(DatasetErrorCode::InvalidValue, std::string(key) + ".size_bytes", "must be positive");
             }
-            entry.finish();
         };
         file("events", kEventsFileName, events);
         file("quality", kQualityFileName, quality);
@@ -441,12 +398,12 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     }
     std::uint64_t by_type_total = 0;
     std::uint64_t by_instrument_total = 0;
-    bool representable = add_to(by_type_total, totals.by_type.trade) &&
-        add_to(by_type_total, totals.by_type.top_of_book) &&
-        add_to(by_type_total, totals.by_type.market_status) &&
-        add_to(by_type_total, totals.by_type.instrument_definition);
+    bool representable = add_count(by_type_total, totals.by_type.trade) &&
+        add_count(by_type_total, totals.by_type.top_of_book) &&
+        add_count(by_type_total, totals.by_type.market_status) &&
+        add_count(by_type_total, totals.by_type.instrument_definition);
     for (const auto& entry : totals.by_instrument) {
-        representable = representable && add_to(by_instrument_total, entry.second);
+        representable = representable && add_count(by_instrument_total, entry.second);
     }
     if (!representable || by_type_total != totals.events) {
         return inconsistent("manifest.counts.by_event_type", "must add up to counts.events");
@@ -467,6 +424,29 @@ std::variant<DatasetManifest, DatasetError> parse_manifest(std::string_view byte
     }
 
     return manifest;
+}
+
+}  // namespace chronos::datasets
+
+namespace chronos::datasets {
+
+json::Value file_digest_json(std::string_view name, const FileDigest& digest) {
+    return json::Value(json::Object{
+        {"name", name},
+        {"sha256", digest.sha256},
+        {"size_bytes", std::to_string(digest.size_bytes)},
+    });
+}
+
+FileDigest parse_file_digest(ObjectFields& parent, std::string_view key, std::string_view name) {
+    NestedFields file(parent, key, {"name", "sha256", "size_bytes"});
+    file.fields().constant("name", name);
+    FileDigest digest{
+        .sha256 = file.fields().sha256("sha256"),
+        .size_bytes = file.fields().unsigned_integer("size_bytes"),
+    };
+    file.finish();
+    return digest;
 }
 
 }  // namespace chronos::datasets

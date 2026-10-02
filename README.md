@@ -88,18 +88,29 @@ Chronos simulates trading only. It does not place real-money orders.
 - A point-in-time `top_of_book` feature engine (best bid and ask, sizes,
   spread, midpoint, imbalance, microprice) with checked integer arithmetic,
   typed unavailability, and reproducible, content-addressed feature artifacts
+- Future-midpoint-return label artifacts: exact fixed-point returns to the
+  first observation at least one horizon later, typed reasons for every
+  unavailable label, and a label availability time separate from the
+  prediction time
+- Chronological, purged split artifacts whose no-leakage inequalities are
+  checked when written and when read
+- A Python research package that evaluates a no-skill majority baseline and a
+  logistic-regression baseline per instrument on verified artifacts, into an
+  immutable evaluation artifact with plain-number model parameters
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
-  datasets, features, risk, and execution, plus real-PostgreSQL service and
-  API tests
+  datasets, features, labels, splits, risk, and execution, plus Python tests,
+  and real-PostgreSQL service and API tests
 
 The core accepts, simulates, books, persists, and recovers paper orders
 through controlled paths, the optional API exposes that path to local
 clients, and the web workspace in `apps/web/` is the first of them. A
 replayed market now moves while the server runs, and an optional live IEX
-feed can replace it. Recordings become normalized datasets and feature
-artifacts for research. Labels, model evaluation, authentication, model
-deployment, and historical charts are not built yet. See [plan.md](plan.md)
-for the complete roadmap.
+feed can replace it. Recordings become normalized datasets, feature, label,
+and split artifacts, and baseline predictive evaluations for research. These
+are predictive evaluations only: there is no trading strategy, cost model, or
+backtest over predictions yet, and no result is evidence of profitability.
+Authentication, model deployment, and historical charts are not built yet.
+See [plan.md](plan.md) for the complete roadmap.
 
 ## Requirements
 
@@ -197,6 +208,46 @@ generated, often from licensed data, and stay out of Git. See
 [docs/normalized-market-datasets.md](docs/normalized-market-datasets.md),
 [docs/feature-engine.md](docs/feature-engine.md), and
 [docs/decisions/0012-normalized-market-dataset-and-features.md](docs/decisions/0012-normalized-market-dataset-and-features.md).
+
+## Labels, splits, and baseline evaluation
+
+Feature artifacts are labelled with future midpoint returns, and labels are
+split chronologically with purging at each boundary:
+
+```sh
+./build/chronos_dataset labels extract --features data/features \
+  --feature-artifact <FEATURE-ID> --output data/labels --horizon-ns 1000000000
+./build/chronos_dataset labels inspect --output data/labels --artifact <LABEL-ID> \
+  --features data/features
+./build/chronos_dataset splits create --labels data/labels --label-artifact <LABEL-ID> \
+  --output data/splits --train-percent 60 --validation-percent 20 --test-percent 20
+./build/chronos_dataset splits inspect --output data/splits --artifact <SPLIT-ID> \
+  --labels data/labels
+```
+
+The Python research package in `python/` trains and evaluates the baselines
+after `chronos_dataset` has verified and reproduced every source artifact:
+
+```sh
+cd python
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python --require-hashes -r requirements.lock
+.venv/bin/python -m chronos_research evaluate --chronos-dataset ../build/chronos_dataset \
+  --features ../data/features --labels ../data/labels --splits ../data/splits \
+  --split-artifact <SPLIT-ID> --output ../data/experiments
+.venv/bin/python -m chronos_research inspect --output ../data/experiments --experiment <ID>
+.venv/bin/python -m ruff format --check . && .venv/bin/python -m ruff check . && .venv/bin/python -m mypy
+CHRONOS_DATASET=../build/chronos_dataset \
+CHRONOS_SYNTHETIC_DATASET=../build/chronos_synthetic_dataset \
+  .venv/bin/python -m pytest
+```
+
+Label, split, and experiment directories are generated and ignored by Git. See
+[docs/labels-and-splits.md](docs/labels-and-splits.md),
+[docs/baseline-evaluation.md](docs/baseline-evaluation.md), and ADRs
+[0013](docs/decisions/0013-future-midpoint-return-labels.md),
+[0014](docs/decisions/0014-chronological-purged-splits.md), and
+[0015](docs/decisions/0015-python-research-boundary-and-baseline-artifacts.md).
 
 ## Build the PostgreSQL persistence adapter
 
@@ -327,8 +378,11 @@ architecture, exact-decimal rules, uncertain-order reconciliation, and tests.
 adapters/   Provider-specific integrations isolated from the core
 apps/web/   React and TypeScript paper-trading workspace
 core/       C++ domain types and paper-trading core
-datasets/   Normalized market datasets: format, writer, reader, catalog
+datasets/   Normalized market datasets and the shared derived-artifact layer
 features/   Point-in-time feature engine and feature artifacts
+labels/     Future-return labels and label artifacts
+splits/     Chronological, purged splits and split artifacts
+python/     Research package: baseline training and evaluation artifacts
 docs/       Contracts, architecture decisions, and accounting rules
 services/   Application service and HTTP API over the core
 tests/      C++ unit, edge-case, and integration tests
@@ -350,6 +404,9 @@ no tests are discovered and receives read-only repository access. Pushes to
 job installs `apps/web` from its lockfile on a pinned Node.js and runs type
 checking, lint, unit and component tests, the production build, and the
 Playwright suite; it needs no server, database, credentials, or market data.
+A Python job builds the C++ verifier and synthetic-dataset tool, installs the
+hash-pinned research dependencies, and runs formatting, lint, strict type
+checking, and the research tests on synthetic data only.
 
 ## Data and credentials
 
@@ -372,8 +429,10 @@ Real-data quoting and guarded downloads are documented in
 Replay time, ordering, reset, and market-view semantics are documented in
 [docs/market-replay.md](docs/market-replay.md).
 Normalized datasets and their quality reports are documented in
-[docs/normalized-market-datasets.md](docs/normalized-market-datasets.md), and
-point-in-time features in [docs/feature-engine.md](docs/feature-engine.md).
+[docs/normalized-market-datasets.md](docs/normalized-market-datasets.md),
+point-in-time features in [docs/feature-engine.md](docs/feature-engine.md),
+labels and splits in [docs/labels-and-splits.md](docs/labels-and-splits.md),
+and baseline evaluation in [docs/baseline-evaluation.md](docs/baseline-evaluation.md).
 Paper-order, risk, and simple top-of-book execution semantics are documented in
 [docs/paper-execution.md](docs/paper-execution.md).
 PostgreSQL transaction, journal, idempotency, and recovery semantics are
