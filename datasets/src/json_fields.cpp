@@ -7,6 +7,7 @@
 #include <exception>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -247,6 +248,69 @@ std::vector<std::string> ObjectFields::string_array(std::string_view key) {
         strings.push_back(*text);
     }
     return strings;
+}
+
+namespace {
+
+const json::Value& value_or_empty(ObjectFields& parent, std::string_view key) {
+    static const json::Value empty{json::Object{}};
+    const json::Value* value = parent.value(key);
+    return value != nullptr ? *value : empty;
+}
+
+}  // namespace
+
+NestedFields::NestedFields(
+    ObjectFields& parent,
+    std::string_view key,
+    std::initializer_list<std::string_view> keys
+)
+    : parent_(parent), fields_(value_or_empty(parent, key), parent.field(key)) {
+    fields_.require_keys(keys);
+}
+
+json::Value name_version_json(std::string_view name, std::string_view version) {
+    return json::Value(json::Object{{"name", name}, {"version", version}});
+}
+
+void require_name_version(
+    ObjectFields& parent,
+    std::string_view key,
+    std::string_view name,
+    std::string_view version
+) {
+    NestedFields nested(parent, key, {"name", "version"});
+    nested.fields().constant("name", name);
+    nested.fields().constant("version", version);
+    nested.finish();
+}
+
+json::Value count_map_json(const std::map<std::string, std::uint64_t>& counts) {
+    json::Object members;
+    for (const auto& [name, count] : counts) {
+        if (count > 0) {
+            members.emplace_back(name, std::to_string(count));
+        }
+    }
+    return json::Value(std::move(members));
+}
+
+std::map<std::string, std::uint64_t> parse_count_map(ObjectFields& fields, std::string_view key) {
+    std::map<std::string, std::uint64_t> counts;
+    const json::Object* object = fields.object(key);
+    if (object == nullptr) {
+        return counts;
+    }
+    for (const auto& [name, value] : *object) {
+        const std::string* text = value.if_string();
+        const auto count = text ? json::parse_canonical_unsigned(*text) : std::nullopt;
+        if (name.empty() || !count || *count == 0) {
+            fields.fail(DatasetErrorCode::InvalidValue, key, "must map names to positive canonical counts");
+            return {};
+        }
+        counts.emplace(name, *count);
+    }
+    return counts;
 }
 
 std::variant<json::Value, DatasetError> parse_canonical_document(

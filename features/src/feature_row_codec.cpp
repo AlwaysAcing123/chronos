@@ -24,41 +24,8 @@ constexpr std::array<TradingStatus, 5> kStatuses = {
     TradingStatus::Halted, TradingStatus::Closed,
 };
 
-template <typename Value>
-json::Value feature_json(const Feature<Value>& feature) {
-    if (const auto* value = std::get_if<Value>(&feature)) {
-        return json::Value(json::Object{{"raw", std::to_string(value->raw())}});
-    }
-    return json::Value(json::Object{
-        {"unavailable", unavailability_name(std::get<Unavailability>(feature))},
-    });
-}
-
 std::string_view status_name(const std::optional<TradingStatus>& status) {
     return status ? datasets::trading_status_name(*status) : "not_reported";
-}
-
-template <typename Value>
-Feature<Value> decode_feature(ObjectFields& features, std::string_view key, std::optional<std::uint64_t> line) {
-    const json::Value* value = features.value(key);
-    if (value == nullptr) {
-        return Unavailability::MissingBothSides;
-    }
-    ObjectFields feature(*value, features.field(key), line);
-    const json::Object* members = value->if_object();
-    if (members != nullptr && members->size() == 1 && members->front().first == "raw") {
-        const std::int64_t raw = feature.signed_integer("raw");
-        features.adopt(feature.error());
-        return Value::from_raw(raw);
-    }
-    feature.require_keys({"unavailable"});
-    const std::string reason = feature.string("unavailable");
-    features.adopt(feature.error());
-    if (const auto known = unavailability_from_name(reason)) {
-        return *known;
-    }
-    features.fail(DatasetErrorCode::InvalidValue, key, "unknown unavailability reason " + reason);
-    return Unavailability::MissingBothSides;
 }
 
 }  // namespace
@@ -75,14 +42,14 @@ std::string encode_feature_row(const TopOfBookFeatureRow& row) {
         {"event_timestamp_ns", std::to_string(row.event_timestamp.nanoseconds())},
         {"feature_set", kTopOfBookFeatureSetName},
         {"features", json::Object{
-            {"ask_size", feature_json(row.ask_size)},
-            {"best_ask", feature_json(row.best_ask)},
-            {"best_bid", feature_json(row.best_bid)},
-            {"bid_size", feature_json(row.bid_size)},
-            {"imbalance", feature_json(row.imbalance)},
-            {"microprice", feature_json(row.microprice)},
-            {"midpoint", feature_json(row.midpoint)},
-            {"spread", feature_json(row.spread)},
+            {"ask_size", feature_value_json(row.ask_size)},
+            {"best_ask", feature_value_json(row.best_ask)},
+            {"best_bid", feature_value_json(row.best_bid)},
+            {"bid_size", feature_value_json(row.bid_size)},
+            {"imbalance", feature_value_json(row.imbalance)},
+            {"microprice", feature_value_json(row.microprice)},
+            {"midpoint", feature_value_json(row.midpoint)},
+            {"spread", feature_value_json(row.spread)},
         }},
         {"ingest_sequence", std::to_string(row.ingest_sequence)},
         {"instrument", row.instrument.value()},
@@ -156,14 +123,14 @@ std::variant<TopOfBookFeatureRow, DatasetError> decode_feature_row(
     features.require_keys({
         "ask_size", "best_ask", "best_bid", "bid_size", "imbalance", "microprice", "midpoint", "spread",
     });
-    auto best_bid = decode_feature<Price>(features, "best_bid", line);
-    auto best_ask = decode_feature<Price>(features, "best_ask", line);
-    auto bid_size = decode_feature<Quantity>(features, "bid_size", line);
-    auto ask_size = decode_feature<Quantity>(features, "ask_size", line);
-    auto spread_value = decode_feature<Price>(features, "spread", line);
-    auto midpoint_value = decode_feature<Price>(features, "midpoint", line);
-    auto imbalance_value = decode_feature<Ratio>(features, "imbalance", line);
-    auto microprice_value = decode_feature<Price>(features, "microprice", line);
+    auto best_bid = decode_feature_value<Price>(features, "best_bid", line);
+    auto best_ask = decode_feature_value<Price>(features, "best_ask", line);
+    auto bid_size = decode_feature_value<Quantity>(features, "bid_size", line);
+    auto ask_size = decode_feature_value<Quantity>(features, "ask_size", line);
+    auto spread_value = decode_feature_value<Price>(features, "spread", line);
+    auto midpoint_value = decode_feature_value<Price>(features, "midpoint", line);
+    auto imbalance_value = decode_feature_value<Ratio>(features, "imbalance", line);
+    auto microprice_value = decode_feature_value<Price>(features, "microprice", line);
     fields.adopt(features.error());
     if (!fields.ok()) {
         return *fields.error();

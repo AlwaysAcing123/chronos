@@ -31,11 +31,7 @@ inline json::Value artifact_summary_json(
     }
     json::Object unavailable;
     for (const auto& [feature, reasons] : manifest.unavailable) {
-        json::Object counts;
-        for (const auto& [reason, count] : reasons) {
-            counts.emplace_back(reason, cli::decimal(count));
-        }
-        unavailable.emplace_back(feature, std::move(counts));
+        unavailable.emplace_back(feature, datasets::count_map_json(reasons));
     }
     return json::Value(json::Object{
         {"artifact_id", manifest.artifact_id},
@@ -54,20 +50,13 @@ inline json::Value artifact_summary_json(
     });
 }
 
-inline std::filesystem::path id_path(const std::filesystem::path& root, const std::string& id, std::string_view option) {
-    if (!is_sha256_hex(id)) {
-        throw cli::UsageError(std::string(option) + " must be a 64-digit lowercase ID");
-    }
-    return root / id;
-}
-
 inline int extract(const cli::Options& options) {
     const std::string feature_set = options.optional("--feature-set").value_or(std::string(kTopOfBookFeatureSet));
     if (feature_set != kTopOfBookFeatureSet) {
         throw cli::UsageError("the only feature set is " + std::string(kTopOfBookFeatureSet));
     }
     const std::filesystem::path dataset =
-        id_path(options.required("--catalog"), options.required("--dataset"), "--dataset");
+        cli::id_path(options, "--catalog", "--dataset");
     const std::filesystem::path output = options.required("--output");
     if (auto error = cli::ensure_directory(output, "output")) {
         return cli::fail(*error);
@@ -90,28 +79,16 @@ inline int list(const cli::Options& options) {
     if (auto* error = std::get_if<datasets::DatasetError>(&listed)) {
         return cli::fail(*error);
     }
-    json::Array artifacts;
-    json::Array invalid;
-    for (const auto& entry : std::get<std::vector<features::FeatureArtifactEntry>>(listed)) {
-        if (const auto* manifest = std::get_if<features::FeatureArtifactManifest>(&entry.status)) {
-            artifacts.push_back(artifact_summary_json(*manifest, output / entry.name));
-        } else {
-            invalid.push_back(json::Value(json::Object{
-                {"error", cli::error_json(std::get<datasets::DatasetError>(entry.status))},
-                {"name", cli::printable(entry.name)},
-            }));
-        }
-    }
-    return cli::print(json::Value(json::Object{
-        {"artifacts", std::move(artifacts)},
-        {"invalid_entries", std::move(invalid)},
-        {"output", cli::printable_path(output)},
-    }));
+    return cli::print(cli::artifact_list_json(
+        output,
+        std::get<std::vector<features::FeatureArtifactEntry>>(listed),
+        artifact_summary_json
+    ));
 }
 
 inline int inspect(const cli::Options& options) {
     const std::filesystem::path directory =
-        id_path(options.required("--output"), options.required("--artifact"), "--artifact");
+        cli::id_path(options, "--output", "--artifact");
     auto verified = features::verify_feature_artifact(directory);
     if (auto* error = std::get_if<datasets::DatasetError>(&verified)) {
         return cli::fail(*error);

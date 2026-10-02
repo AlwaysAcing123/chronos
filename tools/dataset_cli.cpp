@@ -4,6 +4,8 @@
 #include "chronos/sha256.hpp"
 #include "dataset_cli_support.hpp"
 #include "feature_cli_commands.hpp"
+#include "label_cli_commands.hpp"
+#include "split_cli_commands.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -28,12 +30,26 @@ std::string usage() {
         "  chronos_dataset features extract --catalog <DIR> --dataset <ID> --output <DIR>\n"
         "      [--feature-set top_of_book_v1]\n"
         "  chronos_dataset features list --output <DIR>\n"
-        "  chronos_dataset features inspect --output <DIR> --artifact <ID> [--catalog <DIR>]\n\n"
-        "Lists, verifies, and inspects normalized market datasets, and extracts\n"
-        "point-in-time features from them. Nothing is ever overwritten.\n";
+        "  chronos_dataset features inspect --output <DIR> --artifact <ID> [--catalog <DIR>]\n"
+        "  chronos_dataset labels extract --features <DIR> --feature-artifact <ID> --output <DIR>\n"
+        "      [--horizon-ns 1000000000] [--label-set future_midpoint_return_v1]\n"
+        "  chronos_dataset labels list --output <DIR>\n"
+        "  chronos_dataset labels inspect --output <DIR> --artifact <ID> [--features <DIR>]\n"
+        "  chronos_dataset splits create --labels <DIR> --label-artifact <ID> --output <DIR>\n"
+        "      [--train-percent 60] [--validation-percent 20] [--test-percent 20]\n"
+        "      [--split-set chronological_purged_v1]\n"
+        "  chronos_dataset splits list --output <DIR>\n"
+        "  chronos_dataset splits inspect --output <DIR> --artifact <ID> [--labels <DIR>]\n\n"
+        "Lists, verifies, and inspects normalized market datasets, extracts\n"
+        "point-in-time features from them, labels features with future returns,\n"
+        "and splits labels chronologically with purging. Every artifact is\n"
+        "immutable; nothing is ever overwritten.\n";
 }
 
-std::filesystem::path dataset_directory(const std::filesystem::path& catalog, const std::string& id) {
+// --catalog/--dataset, read in that order.
+std::filesystem::path dataset_directory(const cli::Options& options) {
+    const std::filesystem::path catalog = options.required("--catalog");
+    const std::string id = options.required("--dataset");
     if (!chronos::is_sha256_hex(id)) {
         throw cli::UsageError("--dataset must be a 64-digit lowercase dataset ID");
     }
@@ -68,8 +84,7 @@ int list(const cli::Options& options) {
 }
 
 int inspect(const cli::Options& options) {
-    const std::filesystem::path directory =
-        dataset_directory(options.required("--catalog"), options.required("--dataset"));
+    const std::filesystem::path directory = dataset_directory(options);
     auto verified = ds::verify_dataset(directory);
     if (auto* error = std::get_if<ds::DatasetError>(&verified)) {
         return cli::fail(*error);
@@ -101,6 +116,12 @@ int run(int argc, char* argv[]) {
     }
     if (command == "features") {
         return chronos::feature_cli::run(argc, argv);
+    }
+    if (command == "labels") {
+        return chronos::label_cli::run(argc, argv);
+    }
+    if (command == "splits") {
+        return chronos::split_cli::run(argc, argv);
     }
     if (command == "--help" || command == "-h") {
         throw cli::UsageError("");

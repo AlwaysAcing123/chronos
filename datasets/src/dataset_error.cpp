@@ -66,6 +66,10 @@ std::string_view error_code_name(DatasetErrorCode code) noexcept {
             return "unrepresentable_text";
         case DatasetErrorCode::CounterOverflow:
             return "counter_overflow";
+        case DatasetErrorCode::EmptySplit:
+            return "empty_split";
+        case DatasetErrorCode::LabelLeakage:
+            return "label_leakage";
         case DatasetErrorCode::ReadFailed:
             return "read_failed";
         case DatasetErrorCode::WriteFailed:

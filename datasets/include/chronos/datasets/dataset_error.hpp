@@ -8,7 +8,7 @@
 
 namespace chronos::datasets {
 
-// Why a dataset or feature artifact could not be written, read, or
+// Why a dataset or a derived artifact could not be written, read, or
 // verified. Each code has a stable snake_case name for machine-readable
 // output (see error_code_name).
 enum class DatasetErrorCode {
@@ -47,6 +47,10 @@ enum class DatasetErrorCode {
     EmptyDataset,
     UnrepresentableText,
     CounterOverflow,
+    // Chronological splits.
+    EmptySplit,
+    // A label that becomes known at or after the start of a later period.
+    LabelLeakage,
     // Files.
     ReadFailed,
     WriteFailed,
@@ -61,7 +65,7 @@ struct DatasetError {
     std::string field;
     // A safe diagnostic for people: never raw record bytes or credentials.
     std::string message;
-    // The one-based line of events.ndjson or features.ndjson, when known.
+    // The one-based line of the events or rows file, when known.
     std::optional<std::uint64_t> line;
 
     friend bool operator==(const DatasetError&, const DatasetError&) = default;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,6 +65,60 @@ private:
     std::optional<std::uint64_t> line_;
     std::optional<DatasetError> error_;
 };
+
+// An object nested in another, with exactly the given keys. finish() passes
+// its first error, with its full path, to the parent, so the caller checks
+// one place.
+class NestedFields final {
+public:
+    NestedFields(
+        ObjectFields& parent,
+        std::string_view key,
+        std::initializer_list<std::string_view> keys
+    );
+
+    [[nodiscard]] ObjectFields& fields() noexcept { return fields_; }
+    void finish() { parent_.adopt(fields_.error()); }
+
+private:
+    ObjectFields& parent_;
+    ObjectFields fields_;
+};
+
+// {"name": name, "version": version}, as manifests name a schema, a record,
+// a feature or label set, or a generator.
+[[nodiscard]] canonical_json::Value name_version_json(
+    std::string_view name,
+    std::string_view version
+);
+
+// Requires parent[key] to be exactly name_version_json(name, version).
+void require_name_version(
+    ObjectFields& parent,
+    std::string_view key,
+    std::string_view name,
+    std::string_view version
+);
+
+// Adds value to total unless the sum would overflow, in which case it
+// returns false and leaves total unchanged.
+[[nodiscard]] inline bool add_count(std::uint64_t& total, std::uint64_t value) noexcept {
+    if (value > UINT64_MAX - total) {
+        return false;
+    }
+    total += value;
+    return true;
+}
+
+// Names mapped to positive counts as canonical decimal strings; a zero
+// count is never written, so every count map has one spelling.
+[[nodiscard]] canonical_json::Value count_map_json(
+    const std::map<std::string, std::uint64_t>& counts
+);
+[[nodiscard]] std::map<std::string, std::uint64_t> parse_count_map(
+    ObjectFields& fields,
+    std::string_view key
+);
 
 // Parses a document that must be byte-identical to its canonical spelling
 // followed by exactly one newline.

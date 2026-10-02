@@ -4,6 +4,8 @@
 #include "chronos/datasets/dataset_error.hpp"
 #include "chronos/datasets/dataset_manifest.hpp"
 #include "chronos/datasets/dataset_writer.hpp"
+#include "chronos/datasets/derived_artifact.hpp"
+#include "chronos/sha256.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 // Argument parsing and JSON output shared by the dataset command-line tools.
 // Every document goes to stdout on success and to stderr as {"error": ...}
@@ -29,7 +32,8 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// Options of the form --name value, each given at most once.
+// Options of the form --name value, each given at most once, with a value
+// that is neither empty nor another option.
 class Options final {
 public:
     Options(int argc, char* argv[], int first, std::set<std::string> known, std::set<std::string> flags = {}) {
@@ -48,10 +52,11 @@ public:
                 values_.emplace(option, "");
                 continue;
             }
-            if (index + 1 >= argc) {
+            const std::string value = index + 1 < argc ? argv[++index] : "";
+            if (value.empty() || value.starts_with("--")) {
                 throw UsageError(option + " requires a value");
             }
-            values_.emplace(option, argv[++index]);
+            values_.emplace(option, value);
         }
     }
 
@@ -185,6 +190,61 @@ inline json::Value dataset_summary_json(
                 {"latest", decimal(summary.latest_receive_timestamp.nanoseconds())},
             }},
         }},
+    });
+}
+
+// <root option>/<id option>, once the ID is a 64-digit lowercase ID. The
+// options are read in this order, so a missing one is always reported the
+// same way.
+inline std::filesystem::path id_path(
+    const Options& options,
+    const std::string& root_option,
+    const std::string& id_option
+) {
+    const std::filesystem::path root = options.required(root_option);
+    const std::string id = options.required(id_option);
+    if (!is_sha256_hex(id)) {
+        throw UsageError(id_option + " must be a 64-digit lowercase ID");
+    }
+    return root / id;
+}
+
+// A canonical decimal integer in [1, maximum]: no sign, no leading zero, no
+// exponent or unit.
+inline std::uint64_t positive_integer(const std::string& text, std::string_view option, std::uint64_t maximum) {
+    const auto value = json::parse_canonical_unsigned(text);
+    if (!value || *value == 0 || *value > maximum) {
+        throw UsageError(
+            std::string(option) + " must be a whole number from 1 to " + std::to_string(maximum) +
+            ", written without a sign, leading zeros, or a unit"
+        );
+    }
+    return *value;
+}
+
+// The artifacts of a root and every entry that is not one.
+template <typename Manifest, typename Summary>
+json::Value artifact_list_json(
+    const std::filesystem::path& root,
+    const std::vector<datasets::DerivedArtifactEntry<Manifest>>& entries,
+    Summary summary
+) {
+    json::Array artifacts;
+    json::Array invalid;
+    for (const auto& entry : entries) {
+        if (const auto* manifest = std::get_if<Manifest>(&entry.status)) {
+            artifacts.push_back(summary(*manifest, root / entry.name));
+        } else {
+            invalid.push_back(json::Value(json::Object{
+                {"error", error_json(std::get<datasets::DatasetError>(entry.status))},
+                {"name", printable(entry.name)},
+            }));
+        }
+    }
+    return json::Value(json::Object{
+        {"artifacts", std::move(artifacts)},
+        {"invalid_entries", std::move(invalid)},
+        {"output", printable_path(root)},
     });
 }
 

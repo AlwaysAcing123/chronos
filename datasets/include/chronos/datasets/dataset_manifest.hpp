@@ -2,6 +2,7 @@
 
 #include "chronos/canonical_json.hpp"
 #include "chronos/datasets/dataset_error.hpp"
+#include "chronos/datasets/json_fields.hpp"
 #include "chronos/market_data_validation.hpp"
 
 #include <cstddef>
@@ -106,6 +107,10 @@ struct FileDigest {
 
     friend bool operator==(const FileDigest&, const FileDigest&) = default;
 };
+
+// {"name", "sha256", "size_bytes"}: how every manifest names one of its files.
+[[nodiscard]] canonical_json::Value file_digest_json(std::string_view name, const FileDigest& digest);
+[[nodiscard]] FileDigest parse_file_digest(ObjectFields& parent, std::string_view key, std::string_view name);
 
 struct DatasetManifest {
     // SHA-256 of this manifest's canonical form without the dataset ID.

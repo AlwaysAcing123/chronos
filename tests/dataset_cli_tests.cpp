@@ -1,6 +1,7 @@
 #include "dataset_cli_support.hpp"
 #include "test_support.hpp"
 
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,8 +52,31 @@ void test_options_are_strict() {
     rejects({"tool", "list", "--catalog", "a", "--catalog", "b"});
     rejects({"tool", "list", "--unknown", "a"});
     rejects({"tool", "list", "--catalog"});
+    rejects({"tool", "list", "--catalog", ""});
+    rejects({"tool", "list", "--catalog", "--verify"});
     rejects({"tool", "list", "stray"});
     REQUIRE_THROWS_AS(static_cast<void>(options.required("--dataset")), cli::UsageError);
+}
+
+// Numbers on the command line have one spelling, as in artifacts: no sign,
+// leading zero, exponent, or unit, and nothing out of range.
+void test_numbers_and_ids_are_strict() {
+    REQUIRE(cli::positive_integer("1000000000", "--horizon-ns", 9'223'372'036'854'775'807ULL) == 1'000'000'000);
+    REQUIRE(cli::positive_integer("100", "--percent", 100) == 100);
+    for (const std::string text : {"0", "-1", "+1", "01", "1e9", "1.0", "1s", " 1", "", "101"}) {
+        REQUIRE_THROWS_AS(static_cast<void>(cli::positive_integer(text, "--percent", 100)), cli::UsageError);
+    }
+    const auto path = [](std::string id) {
+        std::vector<std::string> storage = {"tool", "inspect", "--output", "root", "--artifact", std::move(id)};
+        std::vector<char*> argv;
+        for (auto& text : storage) {
+            argv.push_back(text.data());
+        }
+        return cli::id_path(cli::Options(static_cast<int>(argv.size()), argv.data(), 2, {"--output", "--artifact"}), "--output", "--artifact");
+    };
+    REQUIRE(path(std::string(64, 'a')) == std::filesystem::path("root") / std::string(64, 'a'));
+    REQUIRE_THROWS_AS(static_cast<void>(path(std::string(63, 'a'))), cli::UsageError);
+    REQUIRE_THROWS_AS(static_cast<void>(path("../" + std::string(61, 'a'))), cli::UsageError);
 }
 
 }  // namespace
@@ -61,5 +85,6 @@ int main() {
     return chronos::test::run_tests({
         {"output text escapes what JSON cannot carry", test_output_text_escapes_what_json_cannot_carry},
         {"options are strict", test_options_are_strict},
+        {"numbers and IDs are strict", test_numbers_and_ids_are_strict},
     });
 }

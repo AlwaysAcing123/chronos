@@ -3,11 +3,14 @@
 #include "chronos/datasets/dataset_error.hpp"
 #include "chronos/datasets/dataset_manifest.hpp"
 #include "chronos/datasets/dataset_writer.hpp"
+#include "chronos/datasets/derived_artifact.hpp"
+#include "chronos/datasets/json_fields.hpp"
 #include "chronos/features/top_of_book_features.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -32,8 +35,54 @@ inline constexpr std::string_view kFeatureArtifactSchemaName = "chronos.feature_
 inline constexpr std::string_view kFeatureArtifactSchemaVersion = "1";
 inline constexpr std::string_view kFeatureRowRecordName = "chronos.feature_row";
 inline constexpr std::string_view kFeatureRowRecordVersion = "1";
-inline constexpr std::string_view kFeatureManifestFileName = "manifest.json";
+inline constexpr std::string_view kFeatureManifestFileName = datasets::kArtifactManifestFileName;
 inline constexpr std::string_view kFeatureRowsFileName = "features.ndjson";
+inline constexpr datasets::DerivedArtifactLayout kFeatureArtifactLayout{
+    .kind = "feature artifact",
+    .rows_file = kFeatureRowsFileName,
+};
+
+// A feature value as rows spell it: {"raw": "<integer>"} in the feature's
+// scale, or {"unavailable": "<reason>"}. Label rows spell midpoints the same
+// way.
+template <typename Value>
+[[nodiscard]] canonical_json::Value feature_value_json(const Feature<Value>& feature) {
+    if (const auto* value = std::get_if<Value>(&feature)) {
+        return canonical_json::Value(canonical_json::Object{{"raw", std::to_string(value->raw())}});
+    }
+    return canonical_json::Value(canonical_json::Object{
+        {"unavailable", unavailability_name(std::get<Unavailability>(feature))},
+    });
+}
+
+// Reads parent[key] as a feature value; a malformed one records its error in
+// parent.
+template <typename Value>
+[[nodiscard]] Feature<Value> decode_feature_value(
+    datasets::ObjectFields& parent,
+    std::string_view key,
+    std::optional<std::uint64_t> line
+) {
+    const canonical_json::Value* value = parent.value(key);
+    if (value == nullptr) {
+        return Unavailability::MissingBothSides;
+    }
+    datasets::ObjectFields feature(*value, parent.field(key), line);
+    const canonical_json::Object* members = value->if_object();
+    if (members != nullptr && members->size() == 1 && members->front().first == "raw") {
+        const std::int64_t raw = feature.signed_integer("raw");
+        parent.adopt(feature.error());
+        return Value::from_raw(raw);
+    }
+    feature.require_keys({"unavailable"});
+    const std::string reason = feature.string("unavailable");
+    parent.adopt(feature.error());
+    if (const auto known = unavailability_from_name(reason)) {
+        return *known;
+    }
+    parent.fail(datasets::DatasetErrorCode::InvalidValue, key, "unknown unavailability reason " + reason);
+    return Unavailability::MissingBothSides;
+}
 
 // The row's canonical record, without its newline.
 [[nodiscard]] std::string encode_feature_row(const TopOfBookFeatureRow& row);
@@ -62,13 +111,7 @@ struct FeatureArtifactManifest {
     std::string_view bytes
 );
 
-struct PublishedFeatureArtifact {
-    FeatureArtifactManifest manifest;
-    std::filesystem::path directory;
-    datasets::PublicationOutcome outcome;
-    // Published, but a step after the atomic rename failed.
-    std::optional<datasets::DatasetError> warning;
-};
+using PublishedFeatureArtifact = datasets::PublishedArtifact<FeatureArtifactManifest>;
 
 // Reads and verifies a dataset, computes a row for every top-of-book event,
 // and publishes the artifact atomically into output_root, an existing
@@ -78,6 +121,30 @@ extract_top_of_book_features(
     const std::filesystem::path& dataset_directory,
     const std::filesystem::path& output_root
 );
+
+// Reads a feature artifact's rows in order, checking each as it goes: every
+// row is canonical, on the manifest's stream, after the previous one in
+// ingest order, and available at its receive time. The end is reported only
+// once the rows' count, checksum, and summary match the manifest, so a
+// consumer must not act on rows before it sees EndOfRows.
+class FeatureArtifactReader final {
+public:
+    [[nodiscard]] static std::variant<std::unique_ptr<FeatureArtifactReader>, datasets::DatasetError> open(
+        const std::filesystem::path& directory
+    );
+
+    ~FeatureArtifactReader();
+    FeatureArtifactReader(const FeatureArtifactReader&) = delete;
+    FeatureArtifactReader& operator=(const FeatureArtifactReader&) = delete;
+
+    [[nodiscard]] const FeatureArtifactManifest& manifest() const noexcept;
+    [[nodiscard]] std::variant<TopOfBookFeatureRow, datasets::EndOfRows, datasets::DatasetError> next();
+
+private:
+    class State;
+    explicit FeatureArtifactReader(std::unique_ptr<State> state);
+    std::unique_ptr<State> state_;
+};
 
 // Reads every row of an artifact and returns its manifest when the rows are
 // canonical, in ingest order, and agree with the manifest's counts and
@@ -94,10 +161,7 @@ extract_top_of_book_features(
     const std::filesystem::path& dataset_directory
 );
 
-struct FeatureArtifactEntry {
-    std::string name;
-    std::variant<FeatureArtifactManifest, datasets::DatasetError> status;
-};
+using FeatureArtifactEntry = datasets::DerivedArtifactEntry<FeatureArtifactManifest>;
 
 // Every entry of a feature root in byte order, with manifests checked.
 [[nodiscard]] std::variant<std::vector<FeatureArtifactEntry>, datasets::DatasetError>

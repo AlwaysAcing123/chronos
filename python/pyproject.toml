@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chronos-research"
+version = "0.1.0"
+description = "Baseline predictive evaluation over verified Chronos feature, label, and split artifacts"
+requires-python = ">=3.12,<3.13"
+# Exact pins: an experiment records these versions, and requirements.lock
+# pins every transitive dependency with hashes.
+dependencies = [
+    "numpy==2.5.3",
+    "scikit-learn==1.9.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+]
+
+[project.scripts]
+chronos-research = "chronos_research.cli:main"
+
+[tool.setuptools]
+packages = ["chronos_research"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "N", "PT", "RUF", "SIM", "UP", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["chronos_research", "tests"]
+
+[[tool.mypy.overrides]]
+# SciPy, scikit-learn, and threadpoolctl publish no type information.
+module = ["scipy", "sklearn.*", "threadpoolctl"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+# A warning is a failure: nothing may be hidden by turning it into a zero.
+filterwarnings = ["error"]

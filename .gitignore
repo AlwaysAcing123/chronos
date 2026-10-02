@@ -13,6 +13,9 @@ compile_commands.json
 data/raw/
 data/normalized/
 data/features/
+data/labels/
+data/splits/
+data/experiments/
 data/downloads/
 *.dbn
 *.dbn.zst
@@ -31,6 +34,14 @@ logs/
 artifacts/
 reports/generated/
 models/artifacts/
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
 # Operating-system and editor files
 .DS_Store
