@@ -116,17 +116,13 @@ test('lays out without horizontal scrolling', async ({ page }) => {
   expect(overflow).toBeLessThanOrEqual(0);
 });
 
-test('offers section navigation only where panels stack', async ({ page, isMobile }) => {
+test('offers section navigation at desktop and mobile sizes', async ({ page }) => {
   await mockChronosApi(page);
   await createAccount(page, 'e2e-nav-1');
   const sections = page.getByRole('navigation', { name: 'Workspace sections' });
-  if (isMobile) {
-    await expect(sections).toBeVisible();
-    await sections.getByRole('link', { name: 'Orders' }).click();
-    await expect(page.getByRole('region', { name: 'Orders', exact: true })).toBeInViewport();
-  } else {
-    await expect(sections).toBeHidden();
-  }
+  await expect(sections).toBeVisible();
+  await sections.getByRole('link', { name: 'Orders' }).click();
+  await expect(page.getByRole('region', { name: 'Orders', exact: true })).toBeInViewport();
 });
 
 test('removes motion when the user prefers reduced motion', async ({ page }) => {

@@ -10,6 +10,7 @@ import type { RefreshPolicy } from '../state/refreshPolicy';
 import { ChronosServicesProvider } from '../state/services';
 import type { FakeApi } from './fakeApi';
 import { createFakeApi } from './fakeApi';
+import type { FakeResearch } from './fakeResearch';
 import type { Json } from './fixtures';
 import { ACCOUNT_ID, accountJson, fillJson, healthJson, marketDataJson, partialOrderJson, portfolioJson } from './fixtures';
 
@@ -27,11 +28,17 @@ export function renderWithServices(
     api = createFakeApi(),
     refresh = NO_POLLING,
     openNoticeStream,
-  }: { api?: FakeApi; refresh?: RefreshPolicy; openNoticeStream?: OpenNoticeStream } = {},
+    research,
+  }: { api?: FakeApi; refresh?: RefreshPolicy; openNoticeStream?: OpenNoticeStream; research?: FakeResearch } = {},
 ) {
   const queryClient = createQueryClient();
   const user = userEvent.setup();
-  const services = openNoticeStream ? { client: api.client, refresh, openNoticeStream } : { client: api.client, refresh };
+  const services = {
+    client: api.client,
+    refresh,
+    ...(openNoticeStream ? { openNoticeStream } : {}),
+    ...(research ? { research: research.client } : {}),
+  };
   const view = render(
     <QueryClientProvider client={queryClient}>
       <ChronosServicesProvider services={services}>{ui}</ChronosServicesProvider>

@@ -3,12 +3,22 @@ import type { z } from 'zod';
 import { ChronosApiError } from './errors';
 import { ErrorEnvelopeSchema } from './schemas';
 
+// The header that proves which Chronos service answered.
+export interface ResponseIdentity {
+  readonly header: string;
+  readonly value: string;
+  // For messages, such as "the Chronos paper-trading API".
+  readonly service: string;
+}
+
 export interface TransportOptions {
   readonly fetch: typeof fetch;
   // Bounds how long a hung server can stall polling or a submission. A
   // submission that times out is treated as uncertain and reconciled.
   readonly readTimeoutMs: number;
   readonly writeTimeoutMs: number;
+  // Which service must have answered; the paper-trading API by default.
+  readonly identity?: ResponseIdentity;
 }
 
 export interface HttpResponse {
@@ -25,7 +35,11 @@ interface RequestSpec {
 
 // Every Chronos response carries this header; its absence means something
 // else answered, such as a development-proxy error page.
-const TRADING_MODE_HEADER = 'X-Chronos-Trading-Mode';
+export const TRADING_API_IDENTITY: ResponseIdentity = {
+  header: 'X-Chronos-Trading-Mode',
+  value: 'paper',
+  service: 'the Chronos paper-trading API',
+};
 
 // Statuses a proxy uses when it could not get an answer from the server.
 const GATEWAY_FAILURES: ReadonlySet<number> = new Set([502, 503, 504]);
@@ -74,14 +88,15 @@ export async function sendRequest(
     return failInTransit();
   }
 
-  if (response.headers.get(TRADING_MODE_HEADER) !== 'paper') {
+  const identity = transport.identity ?? TRADING_API_IDENTITY;
+  if (response.headers.get(identity.header) !== identity.value) {
     if (GATEWAY_FAILURES.has(response.status)) {
       throw new ChronosApiError({ kind: 'network', detail: 'the proxy could not reach the Chronos API' });
     }
     throw new ChronosApiError({
       kind: 'unexpected_response',
       status: response.status,
-      detail: 'the response did not come from the Chronos paper-trading API',
+      detail: `the response did not come from ${identity.service}`,
     });
   }
   try {

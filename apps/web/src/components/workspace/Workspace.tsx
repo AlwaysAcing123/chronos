@@ -106,7 +106,15 @@ export function Workspace({
 
   return (
     <div className={styles.workspace}>
-      <h1 className="visually-hidden">Paper-trading workspace for {accountId}</h1>
+      <div className={styles.heading}>
+        <div>
+          <p className={styles.eyebrow}>Execution desk</p>
+          <h1 className={styles.title}>
+            Trading workspace <span className="visually-hidden">for {accountId}</span>
+          </h1>
+        </div>
+        <p className={styles.workspaceNote}>Account overview and paper execution</p>
+      </div>
       <nav className={styles.sectionNav} aria-label="Workspace sections">
         {SECTIONS.map((section) => (
           <a key={section.id} href={`#${section.id}`}>

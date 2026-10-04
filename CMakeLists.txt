@@ -278,6 +278,44 @@ target_link_libraries(chronos_paper_execution
     PRIVATE chronos_build_options
 )
 
+# Deterministic historical strategy evaluation of inference schedules
+# through the paper-execution engine. See ADR 0016.
+add_library(chronos_strategy
+    strategy/src/inference_schedule.cpp
+    strategy/src/strategy_run_artifact.cpp
+    strategy/src/strategy_simulation.cpp
+)
+
+target_include_directories(chronos_strategy
+    PUBLIC strategy/include
+)
+
+target_link_libraries(chronos_strategy
+    PUBLIC
+        chronos_features
+        chronos_paper_execution
+    PRIVATE chronos_build_options
+)
+
+add_executable(chronos_strategy_cli
+    tools/strategy_cli.cpp
+)
+
+# The executable is named chronos_strategy; the library owns that target name.
+set_target_properties(chronos_strategy_cli
+    PROPERTIES OUTPUT_NAME chronos_strategy
+)
+
+target_include_directories(chronos_strategy_cli
+    PRIVATE tools
+)
+
+target_link_libraries(chronos_strategy_cli
+    PRIVATE
+        chronos_strategy
+        chronos_build_options
+)
+
 if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
     find_package(PostgreSQL REQUIRED)
 
@@ -626,6 +664,21 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_split_artifact_tests
         COMMAND chronos_split_artifact_tests
+    )
+
+    add_executable(chronos_strategy_tests
+        tests/strategy_tests.cpp
+    )
+
+    target_link_libraries(chronos_strategy_tests
+        PRIVATE
+            chronos_strategy
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_strategy_tests
+        COMMAND chronos_strategy_tests
     )
 
     # Writes synthetic datasets for tests outside C++, such as the Python

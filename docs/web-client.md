@@ -295,6 +295,32 @@ the API and is reported as the API being unreachable; any other response, such
 as another process on port 8080, is reported as unexpected rather than
 decoded.
 
+`/api/v1/research` is listed first and goes to the local research service
+instead, at `http://127.0.0.1:8090` or `CHRONOS_RESEARCH_ORIGIN`. Its
+responses must carry `X-Chronos-Service: research`.
+
+## Research
+
+The header's primary navigation switches between Trading and Research. The
+switch is a URL hash: `#/research`, or `#/research/results/<run-id>` for one
+result. A reload or a link reopens the same view, and the workspace's section
+links keep working. Research never reads or changes the account selection,
+so returning to Trading finds the same account open.
+
+Research starts historical strategy evaluations of prebuilt models and shows
+their verified results, kept separate from the trading API:
+- **Clients.** It uses its own `ResearchClient` (`src/api/research.ts`) and
+  its decoders (`src/api/researchSchemas.ts`).
+- **Hooks.** Components read state through the hooks in
+  `src/state/research.ts`. The job list polls only while a job is active,
+  and immutable results are read once.
+- **Equity chart.** Its geometry is approximate and used only for drawing.
+  Every displayed value is the server's exact string, and the chart has a
+  keyboard readout and a full table alternative.
+
+See [research-service.md](research-service.md) for the service, the flow, and
+the charting boundary.
+
 ## Tests
 
 ```sh
@@ -322,8 +348,16 @@ Before the first browser run: `npx playwright install chromium`.
   response, a GTC order that rests, fills in part from a later quote, and is
   cancelled, with every panel checked against hand-computed server values
   and after a reload; a market order forced to IOC; layout without
-  horizontal scrolling, mobile section navigation, reduced motion, and
-  axe-core WCAG 2.1 A/AA checks.
+  horizontal scrolling, desktop and mobile section navigation, reduced
+  motion, and axe-core WCAG 2.1 A/AA checks.
+- **Research browser tests** (`e2e/research.spec.ts`, with
+  `e2e/researchMock.ts`) cover the whole Research flow on desktop and
+  mobile: choose, review, start, follow, open, reload, and return to the
+  same account. They also cover keyboard-only starting, the chart's
+  keyboard readout, an unreachable service, a failed job, a corrupt result,
+  an empty catalog, axe, and a stricter overflow check against the client
+  width. `e2e/research-live.spec.ts` is the opt-in run against a real
+  research service (`CHRONOS_WEB_LIVE_RESEARCH=1`).
 - **Live acceptance** (`e2e/live.spec.ts`) is skipped unless
   `CHRONOS_WEB_LIVE_API=1`. With the C++ server running on the recording, it
   trades through the preview proxy, adds a model-attributed order through the
@@ -354,7 +388,10 @@ database, credentials, or market data; the live spec is skipped there.
   still shows each symbol's current quote.
 - Manual orders use the fixed source ID `web-ticket`.
 - Working orders can be cancelled but not replaced or amended. No price
-  chart, valuation history, models, or experiments.
-- Dark theme only; the plan's light theme is future work.
+  chart or valuation history for paper accounts; the only chart is a
+  historical evaluation's equity curve in Research.
+- Light paper-and-ink theme only; no theme switcher yet. IBM Plex Sans and
+  Mono are self-hosted with their SIL Open Font License; no external font
+  service or new runtime dependency is used.
 - A ticket's in-progress state is lost on reload or account switch; the
   blotter shows whatever was recorded.

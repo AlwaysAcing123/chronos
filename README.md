@@ -249,6 +249,30 @@ Label, split, and experiment directories are generated and ignored by Git. See
 [0014](docs/decisions/0014-chronological-purged-splits.md), and
 [0015](docs/decisions/0015-python-research-boundary-and-baseline-artifacts.md).
 
+## Evaluate a strategy and use Research
+
+One command takes the local recording through every research artifact,
+verifies it, and runs a long/flat policy over each fitted model's
+validation and test windows beside cash and buy-and-hold benchmarks:
+
+```sh
+cd python
+.venv/bin/python -m chronos_research demo --tools ../build --artifacts ../data \
+  --recording ../data/raw/databento/equs-mini/2026-09-25-aapl-spy.dbn.zst \
+  --stream-id databento-equs-mini-mbp1-20260925-1330-1340
+.venv/bin/python -m chronos_research serve --tools ../build --artifacts ../data --state ../data/research
+```
+
+With the research service running, the web workspace's **Research** view
+starts evaluations and shows their trades, equity, drawdown, costs,
+benchmarks, and provenance. Every result is a paper simulation on minutes
+of data, not evidence of profitability. See
+[docs/research-walkthrough.md](docs/research-walkthrough.md),
+[docs/strategy-evaluation.md](docs/strategy-evaluation.md),
+[docs/research-service.md](docs/research-service.md), and ADRs
+[0016](docs/decisions/0016-inference-schedules-and-strategy-runs.md) and
+[0017](docs/decisions/0017-local-research-service.md).
+
 ## Build the PostgreSQL persistence adapter
 
 The persistence adapter is optional. It requires PostgreSQL's C client library

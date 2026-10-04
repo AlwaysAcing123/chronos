@@ -6,26 +6,25 @@
 .quote {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--space-2);
+  gap: 0 var(--space-4);
 }
 
 .quoteSide {
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  background: var(--color-surface-sunken);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border-strong);
 }
 
 .quoteLabel {
   font-size: 11.5px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-weight: 500;
   color: var(--color-text-subtle);
 }
 
 .quoteValue {
-  font-size: 17px;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 21px;
+  letter-spacing: -0.04em;
   font-variant-numeric: tabular-nums;
 }
 
@@ -38,13 +37,15 @@
   grid-column: 1 / -1;
   font-size: 12px;
   color: var(--color-text-subtle);
+  margin-top: var(--space-2);
+  line-height: 1.55;
 }
 
 .context {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: var(--space-2) var(--space-3);
-  padding: var(--space-3);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3) var(--space-4);
+  padding: var(--space-4);
   border-radius: var(--radius);
   background: var(--color-surface-sunken);
   font-size: 12.5px;
@@ -52,7 +53,7 @@
 
 .contextItem {
   display: grid;
-  gap: 1px;
+  gap: 4px;
 }
 
 .contextLabel {
@@ -61,15 +62,16 @@
 }
 
 .contextValue {
+  font-family: var(--font-mono);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 
 .fixedTerm {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--space-2);
-  font-size: 12.5px;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
   color: var(--color-text-muted);
 }
 
@@ -77,14 +79,15 @@
   display: grid;
   gap: var(--space-3);
   padding: var(--space-4);
-  border: 1px solid var(--color-accent);
+  border: 1px solid var(--color-border-strong);
+  border-top: 2px solid var(--color-accent);
   border-radius: var(--radius);
-  background: var(--color-surface-raised);
+  background: var(--color-surface-sunken);
 }
 
 .reviewHeading {
-  font-size: 13px;
-  font-weight: 650;
+  font-size: 15px;
+  font-weight: 600;
 }
 
 .summary {
@@ -99,6 +102,8 @@
 }
 
 .summary dd {
+  font-family: var(--font-mono);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
@@ -120,5 +125,9 @@
 }
 
 .side {
-  font-weight: 650;
+  font-weight: 600;
+}
+
+.ticket form > div:last-child > button {
+  width: 100%;
 }

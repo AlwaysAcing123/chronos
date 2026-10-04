@@ -14,13 +14,13 @@ export function AccountEntry({
   return (
     <div className={styles.entry}>
       <section className={styles.intro} aria-labelledby="entry-title">
+        <p className={styles.eyebrow}>Chronos / Paper environment</p>
         <h1 id="entry-title" className={styles.title}>
           Open a paper-trading account
         </h1>
         <p className={styles.lede}>
-          A paper account is a simulated ledger kept by the Chronos server. It starts with simulated cash, trades any
-          instrument the server offers long-only from that one cash balance, and executes immediate-or-cancel orders
-          against the server’s own market data.
+          A simulated ledger, real market data. Trade any available instrument long-only from one shared cash
+          balance, with immediate orders or good-til-cancelled limits. The Chronos server handles execution.
         </p>
         <ul className={styles.points}>
           <li>Fills, fees, and PnL are calculated exactly by the server and stored in PostgreSQL.</li>
