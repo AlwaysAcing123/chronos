@@ -290,10 +290,14 @@ flat.
 - **Accuracy is not profit.** A direction forecast says nothing about the
   size of the move, whether it covers the spread, fees, and slippage, or
   whether an order could be filled at the assumed price before the move.
-  None of this is modelled yet.
+  [strategy-evaluation.md](strategy-evaluation.md) now simulates exactly
+  that for one simple policy, and on this data it loses money in every
+  window.
 
 A credible evaluation needs many days and regimes, walk-forward periods,
-costs, and a trading policy. That is later work in [plan.md](../plan.md).
+and richer costs and policies. That is later work in [plan.md](../plan.md).
+[research-walkthrough.md](research-walkthrough.md) runs this experiment and
+its strategy evaluations end to end with one command.
 
 ## Limitations
 

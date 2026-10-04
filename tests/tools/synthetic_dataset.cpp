@@ -147,6 +147,7 @@ int run(const std::string& input, const std::string& catalog, const std::string&
     std::cout << json::serialize(json::Value(json::Object{
         {"dataset_id", dataset.manifest.dataset_id},
         {"directory", dataset.directory.string()},
+        {"outcome", dataset.outcome == ds::PublicationOutcome::Published ? "published" : "already_present"},
     })) << '\n';
     return 0;
 }

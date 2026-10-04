@@ -16,6 +16,9 @@ data/features/
 data/labels/
 data/splits/
 data/experiments/
+data/schedules/
+data/strategies/
+data/research/
 data/downloads/
 *.dbn
 *.dbn.zst

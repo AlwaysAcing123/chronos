@@ -5,8 +5,12 @@ import { defineConfig } from 'vitest/config';
 // origin, and the proxy forwards API paths to the C++ process, so the C++
 // server never needs to approve cross-origin requests.
 const chronosApi = process.env.CHRONOS_API_ORIGIN ?? 'http://127.0.0.1:8080';
+// The local research service is a separate process (python -m
+// chronos_research serve). Its prefix is listed first so it wins over /api.
+const chronosResearch = process.env.CHRONOS_RESEARCH_ORIGIN ?? 'http://127.0.0.1:8090';
 
 const apiProxy = {
+  '/api/v1/research': { target: chronosResearch },
   '/api': { target: chronosApi },
   '/health': { target: chronosApi },
 };

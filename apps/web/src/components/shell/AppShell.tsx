@@ -1,15 +1,25 @@
 import type { ReactNode } from 'react';
 
+import { TRADING_HREF, researchHref } from '../../state/route';
 import { SourceBar } from '../source/SourceBar';
 import { ConnectionStatus } from './ConnectionStatus';
 import { PaperBanner } from './PaperBanner';
 import styles from './shell.module.css';
 
+export type View = 'trading' | 'research';
+
+const VIEWS: readonly { readonly view: View; readonly label: string; readonly href: string }[] = [
+  { view: 'trading', label: 'Trading', href: TRADING_HREF },
+  { view: 'research', label: 'Research', href: researchHref() },
+];
+
 export function AppShell({
   accountContext,
+  view = 'trading',
   children,
 }: {
   readonly accountContext: ReactNode;
+  readonly view?: View;
   readonly children: ReactNode;
 }) {
   return (
@@ -21,11 +31,18 @@ export function AppShell({
       <header className={styles.header}>
         <div className={styles.brand}>
           <svg className={styles.brandMark} viewBox="0 0 32 32" aria-hidden="true">
-            <rect width="32" height="32" rx="6" fill="#1a1e24" />
-            <path d="M21.5 11.2A7 7 0 1 0 21.5 20.8" fill="none" stroke="#7fa7e8" strokeWidth="3" strokeLinecap="round" />
+            <rect width="32" height="32" rx="3" />
+            <path d="M23 10a9 9 0 1 0 0 12M16 10v6l4 3" fill="none" strokeWidth="2" strokeLinecap="square" />
           </svg>
           Chronos
         </div>
+        <nav className={styles.primaryNav} aria-label="Primary">
+          {VIEWS.map((item) => (
+            <a key={item.view} href={item.href} aria-current={item.view === view ? 'page' : undefined}>
+              {item.label}
+            </a>
+          ))}
+        </nav>
         {accountContext}
         <ConnectionStatus />
       </header>

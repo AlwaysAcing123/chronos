@@ -127,7 +127,7 @@ def environment() -> dict[str, Any]:
     }
 
 
-def _source_json(sources: VerifiedSources) -> dict[str, Any]:
+def source_json(sources: VerifiedSources) -> dict[str, Any]:
     return {
         "dataset_id": sources.dataset_id,
         "feature_artifact_id": sources.features.artifact_id,
@@ -354,7 +354,7 @@ def build_experiment(
         "model_feature_set": model_feature_set_json(),
         "schema": SCHEMA,
         "scope": SCOPE,
-        "sources": _source_json(sources),
+        "sources": source_json(sources),
     }
     experiment_id = experiment_identity(manifest)
     return Experiment(

@@ -322,8 +322,17 @@ def _checked_predictions(
     return classes, probabilities
 
 
+type StoredModels = dict[str, dict[str, MajorityModel | LogisticModel | Unevaluable]]
+
+
 def verify_experiment(directory: Path) -> dict[str, Any]:
     """Returns the manifest of a valid experiment directory."""
+    return verified_experiment(directory)[0]
+
+
+def verified_experiment(directory: Path) -> tuple[dict[str, Any], StoredModels]:
+    """The manifest and stored models of a valid experiment directory, each
+    instrument's models fitted or unevaluable with their reason."""
     try:
         return _verify(directory)
     except InspectionError:
@@ -342,7 +351,7 @@ def verify_experiment(directory: Path) -> dict[str, Any]:
         ) from error
 
 
-def _verify(directory: Path) -> dict[str, Any]:
+def _verify(directory: Path) -> tuple[dict[str, Any], StoredModels]:
     if directory.is_symlink() or not directory.is_dir():
         raise _fail(f"{directory} is not an experiment directory")
     if not is_artifact_id(directory.name):
@@ -465,7 +474,7 @@ def _verify(directory: Path) -> dict[str, Any]:
         if published != actual:
             raise _fail(f"the manifest's {split} counts differ from the predictions")
     _check_training_and_exclusions(models, metrics, counts)
-    return dict(manifest)
+    return dict(manifest), models
 
 
 def _check_training_and_exclusions(
