@@ -29,7 +29,15 @@ export function renderWithServices(
     refresh = NO_POLLING,
     openNoticeStream,
     research,
-  }: { api?: FakeApi; refresh?: RefreshPolicy; openNoticeStream?: OpenNoticeStream; research?: FakeResearch } = {},
+    deployments = false,
+  }: {
+    api?: FakeApi;
+    refresh?: RefreshPolicy;
+    openNoticeStream?: OpenNoticeStream;
+    research?: FakeResearch;
+    // Serves the deployment routes from `api`.
+    deployments?: boolean;
+  } = {},
 ) {
   const queryClient = createQueryClient();
   const user = userEvent.setup();
@@ -38,6 +46,7 @@ export function renderWithServices(
     refresh,
     ...(openNoticeStream ? { openNoticeStream } : {}),
     ...(research ? { research: research.client } : {}),
+    ...(deployments ? { deployments: api.deployments } : {}),
   };
   const view = render(
     <QueryClientProvider client={queryClient}>

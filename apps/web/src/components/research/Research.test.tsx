@@ -139,7 +139,12 @@ describe('Research', () => {
 
   it('never presents a simulation as a live deployment', () => {
     renderWithServices(<Research resultId={null} />);
-    expect(screen.getByText(/Running a model live against a paper account is not supported yet/)).toBeInTheDocument();
+    expect(screen.getByText(/Every evaluation here is a historical simulation/)).toHaveTextContent(
+      'it never touches a paper account',
+    );
+    expect(screen.getByText(/Every evaluation here is a historical simulation/)).toHaveTextContent(
+      'only after you start it',
+    );
   });
 
   it('shows a failed and an interrupted run with their reasons', async () => {

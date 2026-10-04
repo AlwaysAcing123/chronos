@@ -3,6 +3,7 @@ import { FAILURE } from '../../presentation/vocabulary';
 import type { Account } from '../../api/schemas';
 import { useSelectedInstrument } from '../../state/instrumentSelection';
 import { useAccount, useHealth, useMarketData, usePortfolio } from '../../state/queries';
+import { researchHref } from '../../state/route';
 import accountStyles from '../account/account.module.css';
 import { FillHistory } from '../history/FillHistory';
 import { OrderBlotter } from '../history/OrderBlotter';
@@ -132,14 +133,30 @@ export function Workspace({
           positions={account.data.positions}
         />
         <div className={styles.ticket}>
-          <OrderTicket
-            id="ticket"
-            account={account.data}
-            symbols={tradeable}
-            selected={selected}
-            onSelect={select}
-            quotes={marketData.status === 'success' ? marketData.data.instruments : null}
-          />
+          {account.data.owner === null ? (
+            <OrderTicket
+              id="ticket"
+              account={account.data}
+              symbols={tradeable}
+              selected={selected}
+              onSelect={select}
+              quotes={marketData.status === 'success' ? marketData.data.instruments : null}
+            />
+          ) : (
+            // The server refuses manual orders on an owned account, so none
+            // is offered.
+            <Panel id="ticket" title="Order ticket">
+              <Alert tone="info" title={`Traded by model deployment ${account.data.owner.deployment_id}`}>
+                <p>
+                  Only the deployment places orders in this account; manual orders and cancellations are refused.
+                  Positions, orders, and fills below are the deployment&rsquo;s.
+                </p>
+                <p>
+                  <a href={researchHref()}>Manage the deployment in Research</a>
+                </p>
+              </Alert>
+            </Panel>
+          )}
         </div>
         <WorkingOrders id="working" className={styles.working} accountId={accountId} />
         <OrderBlotter

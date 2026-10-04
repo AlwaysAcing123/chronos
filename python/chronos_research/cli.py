@@ -14,6 +14,8 @@
                       beside both benchmarks, and verifies the run by running
                       it again; the research service runs it as a child job
     serve             the local research service (see service.py)
+    inference-worker  one model deployment's long-lived inference, for the
+                      paper-trading server (see inference_worker.py)
 
 Every option is given at most once, never abbreviated, and never empty.
 Success prints one JSON document on stdout and exits 0; a refused input or
@@ -165,6 +167,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     for option in STRATEGY_OPTIONS:
         strategy.add_argument(option, action=_Once, help="passed to chronos_strategy run unchanged")
+    worker = commands.add_parser(
+        "inference-worker", allow_abbrev=False, help="one deployment's model inference (server use)"
+    )
+    worker.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the artifact roots")
+    worker.add_argument("--experiment", required=True, type=_artifact_id, action=_Once, help="the experiment")
+    worker.add_argument("--instrument", required=True, action=_Once, help="the instrument")
+    worker.add_argument("--model", required=True, choices=SCHEDULE_MODELS, action=_Once, help="the model")
+    worker.add_argument("--describe", action="store_true", help="report the model's identity and exit")
     serve = commands.add_parser("serve", allow_abbrev=False, help="the local research service")
     for option, help_text in (
         ("--tools", "the directory of built Chronos tools"),
@@ -341,6 +351,11 @@ def _fail(kind: str, message: str) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.command == "inference-worker":
+        # A line protocol of its own, not one JSON document.
+        from chronos_research.inference_worker import main as worker_main
+
+        return worker_main(arguments)
     commands = {
         "evaluate": _evaluate,
         "inspect": _inspect,

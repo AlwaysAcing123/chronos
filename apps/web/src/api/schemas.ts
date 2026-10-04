@@ -280,6 +280,12 @@ export const AccountSchema = z.object({
   positions: z.array(OpenPositionSchema),
   closed_positions: z.array(ClosedPositionSchema),
   risk_limits: RiskLimitsSchema,
+  // The model deployment that owns the account, if any; only it trades the
+  // account. Older servers omit it, and their accounts are all manual.
+  owner: z
+    .object({ kind: z.literal('model_deployment'), deployment_id: IdentifierSchema })
+    .nullable()
+    .default(null),
 });
 export type Account = z.infer<typeof AccountSchema>;
 

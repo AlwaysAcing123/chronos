@@ -27,6 +27,15 @@ struct ReplayArguments {
     bool start_immediately{false};
 };
 
+// Model deployments (ADR 0018), enabled only by --model-deployments: the
+// Python interpreter that runs the inference worker, the repository's
+// python directory, and the research artifacts holding the experiments.
+struct DeploymentArguments {
+    std::filesystem::path python;
+    std::filesystem::path python_root;
+    std::filesystem::path artifacts;
+};
+
 // A validated server command line. At most one market-data source is
 // selected, a replay or Alpaca IEX; without one the market stays empty.
 struct ServerArguments {
@@ -38,6 +47,8 @@ struct ServerArguments {
     bool alpaca_iex{false};
     HttpServerOptions http;
     PreTradeRiskLimits risk_limits;
+    // Absent unless model deployments were explicitly enabled.
+    std::optional<DeploymentArguments> deployments{};
 };
 
 // Alpaca's free Basic plan allows 30 streamed symbols.

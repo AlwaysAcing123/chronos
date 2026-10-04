@@ -7,6 +7,8 @@ import { Alert, Code } from '../ui/Alert';
 import { Button } from '../ui/Button';
 import { Panel } from '../ui/Panel';
 import workspaceStyles from '../workspace/workspace.module.css';
+import { DeploymentForm } from './DeploymentForm';
+import { DeploymentList } from './DeploymentList';
 import { EvaluationForm } from './EvaluationForm';
 import { ModelCatalog, defaultSelection } from './ModelCatalog';
 import type { Selection } from './ModelCatalog';
@@ -73,7 +75,7 @@ function Heading({ title, note }: { readonly title: string; readonly note: strin
   );
 }
 
-function ResearchHome() {
+function ResearchHome({ onOpenAccount }: { readonly onOpenAccount: ((accountId: string) => void) | undefined }) {
   const status = useResearchStatus();
   const experiments = useExperiments();
   const [chosen, setSelection] = useState<Selection | null>(null);
@@ -108,8 +110,12 @@ function ResearchHome() {
         <div className={styles.formPanel}>
           <EvaluationForm selection={selection} defaults={status.data.defaults} experiments={experiments.data} />
         </div>
+        <div className={styles.formPanel}>
+          <DeploymentForm selection={selection} defaults={status.data.defaults} experiments={experiments.data} />
+        </div>
       </div>
       <div className={styles.column}>
+        <DeploymentList onOpenAccount={onOpenAccount} />
         <RunList />
         <ResultList />
       </div>
@@ -117,7 +123,14 @@ function ResearchHome() {
   );
 }
 
-export function Research({ resultId }: { readonly resultId: string | null }) {
+export function Research({
+  resultId,
+  onOpenAccount,
+}: {
+  readonly resultId: string | null;
+  // Opens a deployment's account in the trading workspace, on request.
+  readonly onOpenAccount?: (accountId: string) => void;
+}) {
   const client = useResearchClient();
   return (
     <div className={styles.research}>
@@ -138,14 +151,15 @@ export function Research({ resultId }: { readonly resultId: string | null }) {
       </nav>
       <p className={styles.note}>
         Every evaluation here is a historical simulation in its own fresh accounts; it never touches a paper account.
-        Running a model live against a paper account is not supported yet.
+        A deployment trades a verified model on the server&rsquo;s market data, in a new paper account of its own, only
+        after you start it.
       </p>
       {client === null ? (
         <Alert tone="caution" title="Research is not configured">
           <p>This page was built without a research service client.</p>
         </Alert>
       ) : resultId === null ? (
-        <ResearchHome />
+        <ResearchHome onOpenAccount={onOpenAccount} />
       ) : (
         <ResultView runId={resultId} />
       )}

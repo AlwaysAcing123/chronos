@@ -2,6 +2,8 @@
 // responses per route and assert on the requests the application sent.
 import { createChronosClient } from '../api/client';
 import type { ChronosClient } from '../api/client';
+import type { DeploymentClient } from '../api/deployments';
+import { createDeploymentClient } from '../api/deployments';
 
 export interface RecordedRequest {
   readonly method: string;
@@ -22,6 +24,8 @@ type Responder = (request: RecordedRequest) => FakeResponse | Promise<FakeRespon
 
 export interface FakeApi {
   readonly client: ChronosClient;
+  // The deployment routes of the same fake server.
+  readonly deployments: DeploymentClient;
   readonly requests: RecordedRequest[];
   on(method: 'GET' | 'POST', path: string, respond: Responder | FakeResponse): void;
   // Requests sent to one method and path, in order.
@@ -84,6 +88,7 @@ export function createFakeApi(): FakeApi {
 
   return {
     client: createChronosClient({ fetch: fetchImpl, readTimeoutMs: 5_000, writeTimeoutMs: 5_000 }),
+    deployments: createDeploymentClient({ fetch: fetchImpl, readTimeoutMs: 5_000, writeTimeoutMs: 5_000 }),
     requests,
     on(method, path, respond) {
       routes.set(`${method} ${path}`, typeof respond === 'function' ? respond : () => respond);

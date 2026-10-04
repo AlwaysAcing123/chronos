@@ -5,6 +5,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { createChronosClient } from './api/client';
+import { createDeploymentClient } from './api/deployments';
 import { createResearchClient } from './api/research';
 import { App } from './App';
 import { createQueryClient } from './state/queryClient';
@@ -23,6 +24,7 @@ createRoot(root).render(
         services={{
           client: createChronosClient(),
           research: createResearchClient(),
+          deployments: createDeploymentClient(),
           refresh: POLLING_REFRESH_POLICY,
           openNoticeStream: () => new EventSource('/api/v1/market-data/events'),
         }}

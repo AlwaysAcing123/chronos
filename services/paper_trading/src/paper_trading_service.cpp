@@ -1,5 +1,6 @@
 #include "chronos/paper_trading/paper_trading_service.hpp"
 
+#include "chronos/paper_order_codes.hpp"
 #include "chronos/paper_trading/history_cursor.hpp"
 
 #include <algorithm>
@@ -148,6 +149,15 @@ PaperTradingError persistence_conflict(PaperPersistenceConflict conflict) {
             );
     }
     throw std::logic_error("unknown paper persistence conflict");
+}
+
+PaperTradingError account_owned_by_deployment(std::string_view deployment_id) {
+    return error(
+        PaperTradingErrorCode::AccountOwnedByDeployment,
+        "account_id",
+        "the account belongs to model deployment " + std::string(deployment_id) +
+            "; only the deployment trades it"
+    );
 }
 
 PaperTradingError order_matching_busy() {
@@ -426,7 +436,10 @@ PaperAccountResult PaperTradingService::get_account(
         if (!session) {
             return account_not_found();
         }
-        return account_view(*session);
+        PaperAccountView view = account_view(*session);
+        // Fixed when the account was created, so it agrees with any read.
+        view.owning_deployment = repository_->account_owner(account_id);
+        return view;
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);
     }
@@ -494,6 +507,13 @@ PaperOrderSubmissionResult PaperTradingService::submit_order(
             repository_->lock_account(request.account_id);
         if (!locked) {
             return account_not_found();
+        }
+        // Read under the account lock, so a deployment cannot take the
+        // account between this check and the commit. A declared model
+        // source is not authority: this path never trades an owned account.
+        if (const auto owner = locked->owning_deployment()) {
+            locked->release();
+            return account_owned_by_deployment(*owner);
         }
 
         // The durable journal records the observation every order used, so
@@ -592,6 +612,10 @@ CancelPaperOrderResult PaperTradingService::cancel_order(
         if (!locked) {
             return account_not_found();
         }
+        if (const auto owner = locked->owning_deployment()) {
+            locked->release();
+            return account_owned_by_deployment(*owner);
+        }
         PaperOrderProcessor& processor = locked->processor();
         // A retry of a request that already cancelled the order returns it
         // unchanged; the same ID cannot cancel a second order.
@@ -664,6 +688,237 @@ CancelPaperOrderResult PaperTradingService::cancel_order(
     } catch (const PaperPersistenceUnavailable& failure) {
         return persistence_unavailable(failure);
     }
+}
+
+std::string_view deployment_order_outcome_name(DeploymentOrderOutcome outcome) noexcept {
+    switch (outcome) {
+        case DeploymentOrderOutcome::Recorded: return "recorded";
+        case DeploymentOrderOutcome::NotYetEligible: return "not_yet_eligible";
+        case DeploymentOrderOutcome::Abandoned: return "abandoned";
+        case DeploymentOrderOutcome::NotPending: return "not_pending";
+        case DeploymentOrderOutcome::Busy: return "busy";
+        case DeploymentOrderOutcome::Unavailable: return "unavailable";
+    }
+    return "unavailable";
+}
+
+namespace {
+
+DeploymentOrderAttempt attempt(DeploymentOrderOutcome outcome, std::string reason) {
+    return DeploymentOrderAttempt{.outcome = outcome, .reason = std::move(reason), .order = std::nullopt};
+}
+
+// A deployment order's outcome as its decision records it, and whether it
+// counts as a rejection.
+std::pair<std::string, bool> resolution_of(const PaperOrderResult& result) {
+    const auto named = [](std::string_view prefix, std::optional<std::string_view> name) {
+        return std::string(prefix) + std::string(name.value_or("unknown"));
+    };
+    if (const auto* receipt = std::get_if<PaperOrderReceipt>(&result)) {
+        return {std::string(canonical_name(receipt->execution.status).value_or("unknown")), false};
+    }
+    if (const auto* risk = std::get_if<PreTradeRiskRejection>(&result)) {
+        return {named("risk_rejected:", canonical_name(risk->code)), true};
+    }
+    if (const auto* execution = std::get_if<SimulatedExecutionError>(&result)) {
+        return {named("execution_rejected:", canonical_name(execution->code)), true};
+    }
+    return {named("processing_rejected:", canonical_name(std::get<PaperOrderProcessingError>(result).code)), true};
+}
+
+// Why a deployment no longer acts on its pending decision.
+std::string_view abandonment_for(DeploymentState state) noexcept {
+    switch (state) {
+        case DeploymentState::Stopping:
+        case DeploymentState::Stopped: return "stopped";
+        case DeploymentState::Faulted: return "faulted";
+        case DeploymentState::Running: return "superseded_run";
+    }
+    return "stopped";
+}
+
+}  // namespace
+
+DeploymentOrderAttempt PaperTradingService::submit_deployment_order(const DeploymentOrderRequest& request) {
+    // The same order as a manual submission: one submission at a time,
+    // then the gate, then the connection, then the rows.
+    const auto deadline = std::chrono::steady_clock::now() + config_.order_matching_wait;
+    const std::unique_lock submitting(submission_mutex_, deadline);
+    if (!submitting.owns_lock()) {
+        return attempt(DeploymentOrderOutcome::Busy, "order_matching_busy");
+    }
+    std::optional<std::shared_lock<market_data::MarketEventGate::Mutex>> market;
+    if (gate_ != nullptr) {
+        market = gate_->hold_market(deadline);
+        if (!market) {
+            return attempt(DeploymentOrderOutcome::Busy, "order_matching_busy");
+        }
+    }
+    const std::lock_guard lock(mutex_);
+    try {
+        const auto deployment = repository_->find_deployment(request.deployment_id);
+        if (!deployment) {
+            return attempt(DeploymentOrderOutcome::NotPending, "deployment_not_found");
+        }
+        std::optional<PaperAccountLock> locked = repository_->lock_account(deployment->config.account_id);
+        if (!locked || locked->owning_deployment() != request.deployment_id) {
+            if (locked) {
+                locked->release();
+            }
+            return attempt(DeploymentOrderOutcome::NotPending, "account_not_owned");
+        }
+        auto held = locked->lock_deployment_decision(request.deployment_id, request.decision_sequence);
+        if (!held) {
+            locked->release();
+            return attempt(DeploymentOrderOutcome::NotPending, "decision_not_found");
+        }
+        const ModelDeploymentRecord& current = held->deployment;
+        const DeploymentDecisionRecord& decision = held->decision;
+        if (decision.state != DecisionState::Pending) {
+            locked->release();
+            return attempt(DeploymentOrderOutcome::NotPending, std::string(decision_state_name(decision.state)));
+        }
+        const std::optional<Timestamp> market_time = market_state_.status().market_time;
+        Timestamp now = market_time.value_or(decision.decision.decided_at_market);
+        const auto abandon = [&](std::string_view reason) {
+            locked->commit_deployment_abandonment(request.deployment_id, request.decision_sequence, reason, now);
+            return attempt(DeploymentOrderOutcome::Abandoned, std::string(reason));
+        };
+        if (current.state != DeploymentState::Running || current.run_generation != request.run_generation ||
+            decision.decision.run_generation != request.run_generation) {
+            return abandon(abandonment_for(current.state));
+        }
+        if (!locked->processor().is_healthy()) {
+            return abandon("account_unhealthy");
+        }
+        if (now > *decision.expires_at_market) {
+            return abandon("signal_expired");
+        }
+        const auto not_yet = [&](std::string reason) {
+            locked->release();
+            return attempt(DeploymentOrderOutcome::NotYetEligible, std::move(reason));
+        };
+        if (trading_status_ == nullptr || !trading_status_->is_trading(current.config.instrument)) {
+            return not_yet("instrument_not_trading");
+        }
+        ExecutionQuoteResult quote_result = market_state_.execution_quote(current.config.instrument);
+        if (std::holds_alternative<MarketStateUnavailable>(quote_result)) {
+            return not_yet("market_data_unavailable");
+        }
+        ExecutionQuote quote = std::get<ExecutionQuote>(std::move(quote_result));
+        // The live receive clock can advance without a market event (and
+        // therefore without the event gate). Validate against the same
+        // clock snapshot that will stamp this order, not the earlier read.
+        now = quote.market_time;
+        if (now > *decision.expires_at_market) {
+            return abandon("signal_expired");
+        }
+        const MarketEventHeader& header = quote.top_of_book.header;
+        if (header.stream != current.config.stream) {
+            return abandon("stream_changed");
+        }
+        if (header.quality.is_suspect()) {
+            return not_yet("suspect_quote");
+        }
+        // Positive latency: never the triggering quote or an earlier one,
+        // and never one received sooner than the latency after it.
+        if (header.ingest_sequence <= decision.decision.observation_ingest_sequence ||
+            header.receive_timestamp < *decision.not_before_receive) {
+            return not_yet("awaiting_latency");
+        }
+        // A quote too old to trade on would be rejected by risk; waiting
+        // for a fresh one keeps the rejection count meaningful.
+        if (quote.market_time.nanoseconds() - header.receive_timestamp.nanoseconds() >
+            current.config.risk_limits.maximum_quote_age_nanoseconds) {
+            return not_yet("stale_quote");
+        }
+
+        OrderIntent intent{
+            .client_order_id = *decision.client_order_id,
+            .account_id = current.config.account_id,
+            .source = OrderSource{.kind = OrderSourceKind::Model, .source_id = request.deployment_id},
+            .instrument = current.config.instrument,
+            .side = *decision.decision.side,
+            .type = OrderType::Market,
+            .quantity = *decision.decision.quantity,
+            .limit_price = std::nullopt,
+            .time_in_force = TimeInForce::ImmediateOrCancel,
+            .submitted_at = quote.market_time,
+        };
+        PaperOrderProcessor& processor = locked->processor();
+        const WorkingOrderMatch earlier_orders{
+            .observation = quote.top_of_book,
+            .fills = {},
+            .skipped = {},
+            .fault = std::nullopt,
+        };
+        PaperOrderResult result = processor.submit(intent, quote.top_of_book);
+        const auto [outcome, rejected] = resolution_of(result);
+        CommitPaperOrderResult committed = locked->commit_deployment_submission(
+            earlier_orders,
+            intent,
+            quote.top_of_book,
+            result,
+            request.deployment_id,
+            request.decision_sequence,
+            DeploymentOrderResolution{
+                .outcome = outcome,
+                .rejected = rejected,
+                .execution_ingest_sequence = header.ingest_sequence,
+                .execution_receive = header.receive_timestamp,
+                .resolved_at_market = quote.market_time,
+            }
+        );
+        if (const auto* conflict = std::get_if<PaperPersistenceConflict>(&committed)) {
+            // Nothing was written; the decision is still pending.
+            return attempt(DeploymentOrderOutcome::Unavailable, conflict->message);
+        }
+        PaperAccountView account = account_view(processor, std::get<std::int64_t>(committed));
+        account.owning_deployment = request.deployment_id;
+        notify_activity();
+        auto recorded = repository_->find_order(current.config.account_id, intent.client_order_id);
+        market.reset();
+        if (!std::holds_alternative<PaperOrderRecord>(recorded)) {
+            throw std::runtime_error("a committed deployment order could not be read back");
+        }
+        return DeploymentOrderAttempt{
+            .outcome = DeploymentOrderOutcome::Recorded,
+            .reason = outcome,
+            .order = RecordedPaperOrder{
+                .intent = std::move(intent),
+                .market = std::move(quote.top_of_book),
+                .result = std::move(result),
+                .account = std::move(account),
+                .order = std::get<PaperOrderRecord>(std::move(recorded)),
+            },
+        };
+    } catch (const PaperPersistenceUnavailable& failure) {
+        return attempt(DeploymentOrderOutcome::Unavailable, failure.what());
+    }
+}
+
+bool PaperTradingService::abandon_deployment_decision(
+    std::string_view deployment_id,
+    std::int64_t decision_sequence,
+    std::string_view reason,
+    Timestamp at
+) {
+    const std::lock_guard lock(mutex_);
+    const auto deployment = repository_->find_deployment(deployment_id);
+    if (!deployment) {
+        return false;
+    }
+    std::optional<PaperAccountLock> locked = repository_->lock_account(deployment->config.account_id);
+    if (!locked) {
+        return false;
+    }
+    const auto held = locked->lock_deployment_decision(deployment_id, decision_sequence);
+    if (!held || held->decision.state != DecisionState::Pending) {
+        locked->release();
+        return false;
+    }
+    locked->commit_deployment_abandonment(deployment_id, decision_sequence, reason, at);
+    return true;
 }
 
 PaperOrderHistoryResult PaperTradingService::list_orders(
@@ -969,8 +1224,10 @@ PaperPortfolioResult PaperTradingService::get_portfolio(
         if (auto* failure = std::get_if<PortfolioValuationError>(&valuation)) {
             return portfolio_valuation_failure(std::move(*failure));
         }
+        PaperAccountView view = account_view(*session);
+        view.owning_deployment = repository_->account_owner(account_id);
         return PaperPortfolioView{
-            .account = account_view(*session),
+            .account = std::move(view),
             .valuation = std::get<PortfolioValuation>(std::move(valuation)),
         };
     } catch (const PaperPersistenceUnavailable& failure) {

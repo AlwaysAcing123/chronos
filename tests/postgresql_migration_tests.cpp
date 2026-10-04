@@ -19,7 +19,8 @@
 
 // Migration 003 turns single-instrument accounts into multi-instrument ones;
 // migration 004 adds durable order state, fills, and reservations for
-// good-til-cancelled working orders. Each test builds its own database in a
+// good-til-cancelled working orders; migration 005 adds model deployments
+// and the guard on the accounts they own. Each test builds its own database in a
 // scratch schema of the shared test database, so it can start empty or from
 // rows in an old format.
 
@@ -54,7 +55,6 @@ using chronos::test::all_migrations_sql;
 using chronos::test::migration_sql;
 using chronos::test::PostgresTestConnection;
 using chronos::test::unique_test_id;
-using chronos::test::with_search_path;
 
 std::string connection_string;
 
@@ -65,43 +65,10 @@ Money money(std::string_view value) { return Money::parse(value); }
 Price price(std::string_view value) { return Price::parse(value); }
 Quantity quantity(std::string_view value) { return Quantity::parse(value); }
 
-// A schema of its own, dropped with everything in it at scope exit.
-class ScratchSchema final {
+// A scratch schema of the shared test database.
+class ScratchSchema final : public chronos::test::ScratchSchema {
 public:
-    ScratchSchema()
-        : name_(schema_name()),
-          admin_(connection_string) {
-        static_cast<void>(admin_.query("SET client_min_messages = warning"));
-        static_cast<void>(admin_.query("CREATE SCHEMA " + name_));
-    }
-
-    ~ScratchSchema() {
-        try {
-            static_cast<void>(
-                admin_.query("DROP SCHEMA " + name_ + " CASCADE")
-            );
-        } catch (const std::exception& error) {
-            std::cerr << "could not drop " << name_ << ": " << error.what()
-                      << '\n';
-        }
-    }
-
-    ScratchSchema(const ScratchSchema&) = delete;
-    ScratchSchema& operator=(const ScratchSchema&) = delete;
-
-    [[nodiscard]] std::string connection() const {
-        return with_search_path(connection_string, name_);
-    }
-
-private:
-    static std::string schema_name() {
-        std::string name = unique_test_id("chronos_migration");
-        std::replace(name.begin(), name.end(), '-', '_');
-        return name;
-    }
-
-    std::string name_;
-    PostgresTestConnection admin_;
+    ScratchSchema() : chronos::test::ScratchSchema(connection_string) {}
 };
 
 void apply(PostgresPaperOrderRepository& store, std::string_view file_name) {
@@ -358,7 +325,7 @@ void test_a_fresh_database_gets_the_multi_instrument_schema() {
     REQUIRE(inspector.scalar(
         "SELECT string_agg(version::text, ',' ORDER BY version) "
         "FROM chronos_schema_migrations"
-    ) == "1,2,3,4");
+    ) == "1,2,3,4,5");
     REQUIRE(inspector.scalar(
         "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) "
         "FROM information_schema.columns "
@@ -612,6 +579,7 @@ void test_the_migration_applies_once() {
     inspector.run_script(kSingleInstrumentRows);
     apply(store, "003_multi_instrument_accounts.sql");
     apply(store, "004_working_orders.sql");
+    apply(store, "005_model_deployments.sql");
     const auto everything = [&] {
         return inspector.scalar(kJournalChecksum) + "/" + inspector.scalar(
             "SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM ("
@@ -622,6 +590,9 @@ void test_the_migration_applies_once() {
             "  UNION ALL SELECT paper_orders::text FROM paper_orders"
             "  UNION ALL SELECT paper_fills::text FROM paper_fills"
             "  UNION ALL SELECT paper_events::text FROM paper_events"
+            "  UNION ALL SELECT model_deployments::text FROM model_deployments"
+            "  UNION ALL SELECT model_deployment_decisions::text"
+            "    FROM model_deployment_decisions"
             "  UNION ALL SELECT chronos_schema_migrations::text"
             "    FROM chronos_schema_migrations) AS all_rows"
         ) + "/" + inspector.scalar(
@@ -635,6 +606,7 @@ void test_the_migration_applies_once() {
     store.apply_migration(all_migrations_sql());
     apply(store, "003_multi_instrument_accounts.sql");
     apply(store, "004_working_orders.sql");
+    apply(store, "005_model_deployments.sql");
     // Reading the identity advanced it once.
     const std::string rerun = everything();
     REQUIRE(rerun.substr(0, rerun.rfind('/')) ==
@@ -1206,6 +1178,336 @@ void test_order_state_constraints_hold() {
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// Migration 005: model deployments
+
+// Every version 4 row, which migration 005 must not change.
+constexpr std::string_view kVersion4Checksum = R"SQL(
+SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM (
+    SELECT paper_accounts::text AS row_text FROM paper_accounts
+    UNION ALL SELECT paper_positions::text FROM paper_positions
+    UNION ALL SELECT paper_execution_states::text FROM paper_execution_states
+    UNION ALL SELECT paper_order_records::text FROM paper_order_records
+    UNION ALL SELECT paper_orders::text FROM paper_orders
+    UNION ALL SELECT paper_fills::text FROM paper_fills
+    UNION ALL SELECT paper_events::text FROM paper_events
+) AS all_rows
+)SQL";
+
+constexpr std::string_view kMigrationVersions =
+    "SELECT string_agg(version::text, ',' ORDER BY version) "
+    "FROM chronos_schema_migrations";
+
+// The legacy accounts as the working-order release left them.
+void apply_working_order_rows(
+    PostgresPaperOrderRepository& store,
+    PostgresTestConnection& inspector
+) {
+    apply_multi_instrument_rows(store, inspector);
+    apply(store, "004_working_orders.sql");
+}
+
+void test_migration_005_leaves_every_existing_account_manual() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    const std::string before = inspector.scalar(kVersion4Checksum);
+
+    apply(store, "005_model_deployments.sql");
+
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+    REQUIRE(inspector.scalar("SELECT count(*) FROM model_deployments") == "0");
+    // No account is owned, so the ownership guard lets manual orders in.
+    auto session = PersistentPaperOrderSession::load(store, "legacy-open");
+    REQUIRE(session.has_value());
+    const std::int64_t version = session->version();
+    require_filled(session->submit(
+        market_order("legacy-open", kAapl, "after-005", Side::Buy, "1", 131),
+        quote(kAapl, 41, 126)
+    ));
+    REQUIRE(session->version() == version + 1);
+}
+
+void test_migration_005_requires_migration_004() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_multi_instrument_rows(store, inspector);
+
+    REQUIRE(contains(
+        required_migration_error(store, "005_model_deployments.sql"),
+        "migration 005 requires migration 004"
+    ));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3");
+    REQUIRE(inspector.scalar(
+        "SELECT to_regclass('model_deployments') IS NULL"
+    ) == "t");
+}
+
+void test_a_failed_migration_005_leaves_nothing_behind() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    const std::string before = inspector.scalar(kVersion4Checksum);
+    // A table in the way of the second CREATE TABLE fails the migration
+    // after it has created the first.
+    inspector.run_script("CREATE TABLE model_deployment_decisions (squatter int)");
+
+    REQUIRE(contains(
+        required_migration_error(store, "005_model_deployments.sql"),
+        "already exists"
+    ));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4");
+    REQUIRE(inspector.scalar(
+        "SELECT to_regclass('model_deployments') IS NULL"
+    ) == "t");
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM pg_proc "
+        "WHERE proname = 'paper_order_respects_deployment_ownership' "
+        "  AND pronamespace = current_schema()::regnamespace"
+    ) == "0");
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM pg_trigger "
+        "WHERE tgname = 'paper_order_records_deployment_ownership' "
+        "  AND tgrelid = 'paper_order_records'::regclass"
+    ) == "0");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+
+    inspector.run_script("DROP TABLE model_deployment_decisions");
+    apply(store, "005_model_deployments.sql");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5");
+}
+
+// Two servers starting together: both wait for the first lock, one
+// creates the tables, and the other then finds version 5 and does nothing.
+void test_concurrent_applications_of_migration_005_apply_it_once() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+
+    PostgresTestConnection blocker(schema.connection());
+    blocker.run_script("BEGIN; LOCK TABLE paper_accounts IN SHARE ROW EXCLUSIVE MODE");
+    std::vector<std::string> outcomes(2, "running");
+    std::vector<std::thread> appliers;
+    for (std::size_t index = 0; index < outcomes.size(); ++index) {
+        appliers.emplace_back([&schema, &outcomes, index] {
+            try {
+                PostgresPaperOrderRepository applying(schema.connection());
+                apply(applying, "005_model_deployments.sql");
+                outcomes[index] = "applied";
+            } catch (const std::exception& error) {
+                outcomes[index] = error.what();
+            }
+        });
+    }
+    bool both_waited = false;
+    for (int poll = 0; poll < 1'000 && !both_waited; ++poll) {
+        both_waited = inspector.scalar(
+            "SELECT count(*) FROM pg_locks WHERE NOT granted "
+            "AND locktype = 'relation' AND relation = 'paper_accounts'::regclass"
+        ) == "2";
+        if (!both_waited) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    blocker.run_script("COMMIT");
+    for (auto& applier : appliers) {
+        applier.join();
+    }
+    REQUIRE(both_waited);
+    REQUIRE(outcomes == std::vector<std::string>(2, "applied"));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5");
+}
+
+// `text` with its one occurrence of `from` replaced by `to`.
+std::string replaced(std::string text, std::string_view from, std::string_view to) {
+    const auto at = text.find(from);
+    if (at == std::string::npos || text.find(from, at + 1) != std::string::npos) {
+        throw chronos::test::TestFailure("expected one occurrence of " + std::string(from));
+    }
+    return text.replace(at, from.size(), to);
+}
+
+// A deployment of `account`, as the repository creates one.
+std::string deployment_insert(std::string_view deployment, std::string_view account) {
+    return "INSERT INTO model_deployments (deployment_id, account_id, "
+        "request_sha256, experiment_id, parameters_sha256, model_name, "
+        "instrument, model_feature_set, policy, threshold_ppb, "
+        "target_quantity_raw, decision_interval_ns, latency_ns, "
+        "max_signal_age_ns, max_orders_per_run, max_consecutive_rejections, "
+        "training_cutoff_ns, stream_id, state, state_reason) VALUES ('" +
+        std::string(deployment) + "', '" + std::string(account) +
+        "', repeat('a', 64), repeat('b', 64), repeat('c', 64), 'logistic', "
+        "'AAPL', 'top_of_book_baseline/1', 'long_flat_threshold/1', "
+        "550000000, 100000000, 1000, 10, 1000, 10, 3, 0, 'legacy-stream', "
+        "'stopped', 'created')";
+}
+
+// Decision `sequence` of dep-1: a pending buy of one share unless changed.
+std::string decision_insert(
+    std::string_view sequence,
+    std::string_view state = "pending",
+    std::string_view client_order_id = "'dep-1-000000000001'"
+) {
+    const bool held = state == "held";
+    return "INSERT INTO model_deployment_decisions (deployment_id, "
+        "decision_sequence, run_generation, stream_id, instrument, "
+        "observation_ingest_sequence, observation_event_ns, "
+        "observation_receive_ns, decided_at_market_ns, inputs_raw, "
+        "predicted_class, probabilities, confidence_ppb, position_before_raw, "
+        "target_raw, policy_reason, client_order_id, side, quantity_raw, "
+        "not_before_receive_ns, expires_at_market_ns, state) VALUES ('dep-1', " +
+        std::string(sequence) + ", 1, 'legacy-stream', 'AAPL', " +
+        std::string(sequence) + ", 99, 100, 100, '{1,0,0,1,1}', 'up', "
+        "'{0.1,0.2,0.7}', 700000000, 0, 100000000, " +
+        (held ? "'already_at_target', NULL, NULL, NULL, NULL, NULL, '"
+              : "'order_scheduled', " + std::string(client_order_id) +
+                  ", 'buy', 100000000, 110, 1100, '") +
+        std::string(state) + "')";
+}
+
+void test_deployment_constraints_and_the_ownership_guard_hold() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    store.apply_migration(all_migrations_sql());
+    for (const char* account : {"owned", "other", "manual"}) {
+        REQUIRE(std::holds_alternative<PersistentPaperOrderSession>(
+            PersistentPaperOrderSession::create(
+                store, account, money("1000"), legacy_limits()
+            )
+        ));
+    }
+    inspector.run_script(deployment_insert("dep-1", "owned"));
+    const auto rejects = [&](const std::string& statement, std::string_view expected) {
+        try {
+            inspector.run_script("BEGIN; " + statement + "; COMMIT;");
+        } catch (const std::exception& error) {
+            static_cast<void>(inspector.query("ROLLBACK"));
+            if (!contains(error.what(), expected)) {
+                throw chronos::test::TestFailure(
+                    statement + ": unexpected error: " + error.what()
+                );
+            }
+            return;
+        }
+        throw chronos::test::TestFailure(statement + ": accepted");
+    };
+    // An account belongs to one deployment, for ever.
+    rejects(deployment_insert("dep-2", "owned"), "model_deployments_account_id_key");
+    rejects(deployment_insert("bad id!", "other"), "model_deployments_deployment_id_check");
+    // At most one share, a positive latency, and a signal that outlives it.
+    rejects(
+        "UPDATE model_deployments SET target_quantity_raw = 100000001",
+        "model_deployments_target_quantity_raw_check"
+    );
+    rejects(
+        "UPDATE model_deployments SET latency_ns = 0",
+        "model_deployments_latency_ns_check"
+    );
+    rejects(
+        "UPDATE model_deployments SET max_signal_age_ns = latency_ns",
+        "model_deployments_signal_outlives_latency"
+    );
+    rejects("UPDATE model_deployments SET state = 'paused'", "model_deployments_state_check");
+    rejects(
+        "UPDATE model_deployments SET watermark_receive_ns = 1",
+        "model_deployments_watermark_is_complete"
+    );
+    // A held decision intends no order; a pending one intends exactly one.
+    rejects(replaced(
+        decision_insert("1", "held"),
+        "'already_at_target', NULL",
+        "'already_at_target', 'dep-1-x'"
+    ), "model_deployment_decisions_held_intends_no_order");
+    rejects(
+        replaced(decision_insert("1"), "'order_scheduled'", "'already_at_target'"),
+        "model_deployment_decisions_reason_matches_state"
+    );
+    // Recorded means its order's execution is recorded with it, and only a
+    // resolved decision has a resolution.
+    rejects(
+        replaced(
+            replaced(decision_insert("1", "recorded"), "'recorded')", "'recorded', 'filled', 100)"),
+            ", state)",
+            ", state, resolution, resolved_at_market_ns)"
+        ),
+        "model_deployment_decisions_execution_matches_state"
+    );
+    rejects(
+        replaced(
+            replaced(decision_insert("1"), "'pending')", "'pending', 'filled')"),
+            ", state)",
+            ", state, resolution)"
+        ),
+        "model_deployment_decisions_resolution_matches_state"
+    );
+    rejects(
+        replaced(decision_insert("1"), "'buy', 100000000, 110", "'buy', NULL, 110"),
+        "model_deployment_decisions_order_is_complete"
+    );
+    inspector.run_script(decision_insert("1"));
+    // One pending decision per deployment, and one decision per order.
+    rejects(
+        decision_insert("2", "pending", "'dep-1-000000000002'"),
+        "model_deployment_decisions_one_pending"
+    );
+    rejects(
+        replaced(
+            replaced(decision_insert("2", "abandoned"), "'abandoned')", "'abandoned', 'stopped', 100)"),
+            ", state)",
+            ", state, resolution, resolved_at_market_ns)"
+        ),
+        "model_deployment_decisions_client_order"
+    );
+
+    // The ownership guard, in the database itself: only the owner's model
+    // order for a pending decision is journaled into its account.
+    auto owned = PersistentPaperOrderSession::load(store, "owned");
+    REQUIRE(owned.has_value());
+    const auto refused = [&](OrderIntent intent) {
+        try {
+            static_cast<void>(owned->submit(intent, quote(kAapl, 7, 100)));
+        } catch (const std::exception& error) {
+            REQUIRE(contains(error.what(), "belongs to model deployment dep-1"));
+            return;
+        }
+        throw chronos::test::TestFailure("an order was journaled into an owned account");
+    };
+    refused(market_order("owned", kAapl, "dep-1-000000000001", Side::Buy, "1", 110));
+    OrderIntent model = market_order("owned", kAapl, "dep-1-000000000001", Side::Buy, "1", 110);
+    model.source = OrderSource{.kind = OrderSourceKind::Model, .source_id = "dep-2"};
+    refused(model);
+    model.source.source_id = "dep-1";
+    model.client_order_id = "dep-1-000000000009";
+    refused(model);
+    owned = PersistentPaperOrderSession::load(store, "owned");
+    REQUIRE(owned->version() == 0);
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM paper_order_records WHERE account_id = 'owned'"
+    ) == "0");
+    model.client_order_id = "dep-1-000000000001";
+    // Even an exact pending ID/source cannot authorize a generic writer:
+    // the deferred check requires its resolution in the same commit.
+    refused(model);
+    owned = PersistentPaperOrderSession::load(store, "owned");
+    REQUIRE(owned->version() == 0);
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM paper_order_records WHERE account_id = 'owned'"
+    ) == "0");
+    // Other accounts are untouched by the guard.
+    auto manual = PersistentPaperOrderSession::load(store, "manual");
+    require_filled(manual->submit(
+        market_order("manual", kAapl, "manual-1", Side::Buy, "1", 110),
+        quote(kAapl, 9, 100)
+    ));
+}
+
 }  // namespace
 
 int main() {
@@ -1253,5 +1555,25 @@ int main() {
             test_corrupt_version_3_rows_roll_migration_004_back,
         },
         {"order state constraints hold", test_order_state_constraints_hold},
+        {
+            "migration 005 leaves every existing account manual",
+            test_migration_005_leaves_every_existing_account_manual,
+        },
+        {
+            "migration 005 requires migration 004",
+            test_migration_005_requires_migration_004,
+        },
+        {
+            "a failed migration 005 leaves nothing behind",
+            test_a_failed_migration_005_leaves_nothing_behind,
+        },
+        {
+            "concurrent applications of migration 005 apply it once",
+            test_concurrent_applications_of_migration_005_apply_it_once,
+        },
+        {
+            "deployment constraints and the ownership guard hold",
+            test_deployment_constraints_and_the_ownership_guard_hold,
+        },
     });
 }

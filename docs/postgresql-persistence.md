@@ -303,9 +303,26 @@ changes add a new file.
   `paper_events.event_order` to `integer`, allows the working execution
   statuses in the journal, and extends the reconcile trigger to
   reservations. See [ADR 0011](decisions/0011-durable-gtc-working-orders.md).
+- `005_model_deployments.sql`: model deployments. Adds:
+  - `model_deployments`, one per deployment, owning exactly one account
+    (`account_id` is unique);
+  - `model_deployment_decisions`, with named consistency checks, at most
+    one pending decision per deployment, and one decision per client order
+    ID;
+  - a `BEFORE INSERT` trigger on `paper_order_records` that refuses any
+    order journaled into an owned account unless it is the owner's model
+    frozen market-IOC order for a pending decision;
+  - a deferred constraint trigger that requires the decision to be
+    `recorded`, with matching execution identifiers and times, at the
+    order's commit. Guessing a pending ID through an ordinary writer rolls
+    back the whole transaction, including its account and fill changes.
+
+  It adds tables and journal triggers; existing accounts stay manual and
+  untouched. See
+  [ADR 0018](decisions/0018-model-paper-deployments.md).
 
 PostgreSQL's image runs the mounted files only when it initializes an empty
-volume, so a fresh volume gets 001 to 004 in order. An existing local
+volume, so a fresh volume gets 001 to 005 in order. An existing local
 volume needs each newer file applied once, in order.
 
 Sending a file on standard input avoids depending on the container's
@@ -391,6 +408,13 @@ What 004 guarantees:
   booked fill one `paper_fills` row with its ID; the copy is recounted and
   re-reconciled before version 4 is recorded.
 
+Migration 005 is applied the same way. Like the others, it is one
+transaction and does nothing once version 5 is recorded. It needs version 4,
+and refuses to run without it. It locks `paper_accounts` first, then the
+migration table, so concurrent servers apply it once. It rewrites no
+existing row: a test checksums every version 4 row before and after. A
+failure part-way leaves no table, function, trigger, or version row behind.
+
 A database that the repository's integration tests have run against before
 this release contains accounts named `corrupt-*` whose journal rows those
 tests deliberately corrupted to prove that reads fail closed. Migration 004
@@ -472,6 +496,19 @@ tests prove:
   no-op, rolls back on each kind of corrupt version 3 row, cannot deadlock
   with a concurrent rerun of migration 001, and its constraints refuse
   inconsistent order and fill rows.
+- Migration 005 has its own tests:
+  - it changes no version 4 row;
+  - it requires 004;
+  - it leaves nothing behind on failure;
+  - concurrent applications apply it once;
+  - its constraints and the ownership trigger refuse what they should.
+
+  `chronos_postgresql_model_deployment_tests` covers the deployment
+  repository: creation (including concurrent identical creates), the
+  lifecycle, the watermark across restarts, the atomic order-and-decision
+  commit, a failpoint between the order's rows and the decision's
+  resolution, a lost connection, abandonment, and the lock order between a
+  submission and a new decision.
 
 The integration executable returns the standard CTest skip code when
 `CHRONOS_TEST_POSTGRES_URL` is absent, so ordinary core builds do not require a

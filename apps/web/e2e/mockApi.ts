@@ -24,6 +24,7 @@ import {
   valuedPositionJson,
   workingOrderJson,
 } from '../src/test/fixtures';
+import { decisionJson, deploymentJson } from '../src/test/deploymentFixtures';
 
 // One good-til-cancelled order per account: a buy of 10 AAPL at 336, below
 // the 337 ask, which a later ask of 336 × 4 partially fills.
@@ -41,9 +42,13 @@ interface MockAccount {
   orders: Json[];
   fills: Json[];
   gtc: MockWorkingOrder | null;
+  // The model deployment that owns the account, if any.
+  owner: Json | null;
 }
 
 export interface MockOptions {
+  // Serve model deployments as a server started with --model-deployments.
+  readonly deployments?: boolean;
   // Fail the first submission in transit even though it was recorded, as
   // when a response is lost after the commit.
   readonly loseFirstSubmissionResponse?: boolean;
@@ -183,6 +188,11 @@ function gtcResources(state: MockAccount, gtc: MockWorkingOrder): { account: Jso
 }
 
 function resources(state: MockAccount): { account: Json; portfolio: Json } {
+  const { account, portfolio } = ledgerResources(state);
+  return { account: { ...account, owner: state.owner }, portfolio };
+}
+
+function ledgerResources(state: MockAccount): { account: Json; portfolio: Json } {
   if (state.gtc !== null) {
     return gtcResources(state, state.gtc);
   }
@@ -291,6 +301,59 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
       : marketDataJson({ source: replaySourceJson({ state: replayState }), revision: String(revision) });
 
   await page.route('**/health', (route) => reply(route, 200, healthJson()));
+  // Deployments: disabled unless asked for. A created deployment starts,
+  // decides once, and stops; its account is owned and holds nothing.
+  const deployments = new Map<string, Json>();
+  await page.route('**/api/v1/deployments**', async (route) => {
+    const request = route.request();
+    const [deploymentId, action] = new URL(request.url()).pathname.split('/').slice(4);
+    if (deploymentId === undefined && request.method() === 'GET') {
+      return reply(route, 200, {
+        enabled: options.deployments === true,
+        deployments: [...deployments.values()].reverse(),
+        next_cursor: null,
+      });
+    }
+    if (options.deployments !== true) {
+      return reply(route, 409, errorJson('deployments_disabled', 'model deployments are disabled'));
+    }
+    if (deploymentId === undefined) {
+      const body = request.postDataJSON() as Json;
+      const template = deploymentJson();
+      const created = deploymentJson({
+        deployment_id: body.deployment_id,
+        account_id: body.account_id,
+        creation_sequence: String(deployments.size + 1),
+        model: { ...(template.model as Json), instrument: body.instrument, name: body.model },
+      });
+      deployments.set(String(body.deployment_id), created);
+      accounts.set(String(body.account_id), {
+        accountId: String(body.account_id),
+        holds: { aapl: false, spy: false },
+        orders: [],
+        fills: [],
+        gtc: null,
+        owner: { kind: 'model_deployment', deployment_id: body.deployment_id },
+      });
+      return reply(route, 201, { deployment: created, created: true });
+    }
+    const current = deployments.get(deploymentId);
+    if (current === undefined) {
+      return reply(route, 404, errorJson('deployment_not_found', 'no such deployment'));
+    }
+    if (action === 'decisions') {
+      return reply(route, 200, { decisions: current.run_generation === '0' ? [] : [decisionJson()], next_cursor: null });
+    }
+    if (action === 'start' || action === 'stop') {
+      const next =
+        action === 'start'
+          ? { ...current, state: 'running', state_reason: 'started', active: true, run_generation: '1' }
+          : { ...current, state: 'stopped', state_reason: 'stop_requested', active: false };
+      deployments.set(deploymentId, next);
+      return reply(route, 200, { deployment: next });
+    }
+    return reply(route, 200, { deployment: current });
+  });
   await page.route('**/api/v1/market-data**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === '/api/v1/market-data/events') {
@@ -343,6 +406,7 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
         orders: [],
         fills: [],
         gtc: null,
+        owner: null,
       };
       accounts.set(body.account_id, state);
       return reply(route, 201, { account: resources(state).account });

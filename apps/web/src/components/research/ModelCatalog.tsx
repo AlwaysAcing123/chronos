@@ -1,4 +1,4 @@
-import type { UseQueryResult } from '@tanstack/react-query';
+import type { UseInfiniteQueryResult } from '@tanstack/react-query';
 import { useId } from 'react';
 
 import type { Experiment, ExperimentInstrument, ExperimentPage, Metric, PredictionMetrics } from '../../api/researchSchemas';
@@ -10,6 +10,7 @@ import { Unavailable } from '../ui/DecimalText';
 import { Facts } from '../ui/Facts';
 import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
+import { ListFooter } from './ListFooter';
 import { ResearchFailure } from './Research';
 import styles from './research.module.css';
 
@@ -208,7 +209,7 @@ export function ModelCatalog({
   selection,
   onSelect,
 }: {
-  readonly experiments: UseQueryResult<ExperimentPage>;
+  readonly experiments: UseInfiniteQueryResult<ExperimentPage>;
   readonly selection: Selection | null;
   readonly onSelect: (selection: Selection) => void;
 }) {
@@ -220,7 +221,9 @@ export function ModelCatalog({
       </Panel>
     );
   }
-  if (experiments.status === 'error') {
+  // A failed older page keeps the loaded ones; only a first page that
+  // failed replaces the list with the failure.
+  if (experiments.data === undefined) {
     return (
       <Panel title="Model">
         <ResearchFailure
@@ -282,6 +285,14 @@ export function ModelCatalog({
               ))}
             </fieldset>
           )}
+          <ListFooter
+            shown={page.experiments.length}
+            noun="experiments"
+            hasMore={experiments.hasNextPage}
+            loading={experiments.isFetchingNextPage}
+            failed={experiments.isFetchNextPageError}
+            onLoadMore={() => void experiments.fetchNextPage()}
+          />
           {experiment !== undefined && selection !== null && (
             <div className={page.experiments.length > 1 ? styles.section : undefined}>
               <ExperimentDetails

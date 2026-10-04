@@ -75,6 +75,18 @@ The conventions are the paper-trading API's
   50), `cursor`, and, for trades, `account`. Cursors are opaque and bound to
   their list and run. Invalid percent encoding or UTF-8 is a
   `400 malformed_request` with reason `invalid_query`, never a server error.
+- **Paging growing lists.** Jobs (newest first), experiments, and results
+  (both in ID order) can grow while a client pages them, so their cursors
+  are keysets: a cursor names the last entry returned, and the next page
+  continues strictly after it.
+  - Following a chain never repeats an entry or skips one that existed
+    throughout it.
+  - An entry added behind the cursor appears when the list is read again
+    from the first page.
+  - These cursors are version `v2`. A `v1` offset cursor for these lists is
+    refused with `invalid_cursor`; restart the chain.
+  - One result's decisions, trades, and equity points never change, so they
+    keep offset cursors.
 - **Responses.** Timestamps are RFC 3339 with nine fractional digits; a
   `*_ns` artifact field becomes the field without the suffix. Durations
   stay integer nanoseconds.
@@ -222,6 +234,30 @@ The chart draws the three equity curves over market time.
 
   (`8099` keeps it away from any running trading server.)
 
+## The inference worker
+
+`python -m chronos_research inference-worker --artifacts <dir> --experiment
+<id> --instrument <symbol> --model logistic|majority` serves one verified
+model to a model deployment, which the paper-trading server runs
+([model-deployments.md](model-deployments.md)). It is not part of this
+service.
+
+- **Protocol.** It speaks `chronos.inference_worker/1`, one JSON object
+  per line. A ready line gives the model's identity: the experiment, the
+  SHA-256 of the verified parameters, the feature set, and the training
+  cutoff, the experiment's validation start.
+- **Requests.** Each request is a row's five exact model inputs, and each
+  reply is the same row-pure prediction a historical inference schedule
+  makes. The tests prove the worker's predictions and parameter checksum
+  bit-identical to the schedules', on synthetic data and on the local
+  recording's experiment.
+- **Verification.** The experiment is verified once, at start; a model that
+  does not verify, or is unevaluable, fails closed before the ready line.
+- **Malformed requests.** A malformed request gets an error line and the
+  worker continues. A line over 8 KiB ends it.
+- **Describe.** `--describe` prints the ready line and exits; the server
+  uses it to verify a model before creating a deployment.
+
 ## Limitations
 
 - **Loopback only.** There is no authentication; the service is for the
@@ -231,4 +267,6 @@ The chart draws the three equity curves over market time.
   datasets, features, labels, splits, and experiments is still the `demo`
   and `evaluate` commands' work.
 - **Simple listings.** Results are listed in ID order, not by recency; the
-  runs list gives recency.
+  runs list gives recency. The Research view loads one page of each list
+  and an older page only when asked ("Load more"); a refresh re-reads the
+  loaded pages from the first.
