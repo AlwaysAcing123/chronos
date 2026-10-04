@@ -1,5 +1,6 @@
 #include "chronos/paper_trading/paper_trading_http_api.hpp"
 
+#include "chronos/paper_trading/deployment_http.hpp"
 #include "chronos/paper_trading/paper_trading_http_contract.hpp"
 
 #include <algorithm>
@@ -436,13 +437,15 @@ PaperTradingHttpApi::PaperTradingHttpApi(
     market_data::MarketDataSource& source,
     market_data::MarketDataNotifier& notifier,
     DiagnosticLog log,
-    const WorkingOrderMatcher* matcher
+    const WorkingOrderMatcher* matcher,
+    DeploymentManager* deployments
 )
     : service_(service),
       source_(source),
       notifier_(notifier),
       log_(std::move(log)),
-      matcher_(matcher) {}
+      matcher_(matcher),
+      deployments_(deployments) {}
 
 bool PaperTradingHttpApi::is_event_stream_request(const HttpRequest& request) {
     return request.method == "GET" && request.path == kEventStreamPath;
@@ -572,6 +575,10 @@ HttpResponse PaperTradingHttpApi::route(const HttpRequest& request) {
     if (parts.size() >= 3 && parts[0] == "api" && parts[1] == "v1" &&
         parts[2] == "market-data") {
         return market_data_route(request, parts);
+    }
+    if (deployments_ != nullptr && parts.size() >= 3 && parts[0] == "api" && parts[1] == "v1" &&
+        parts[2] == "deployments") {
+        return deployment_route(*deployments_, request, parts, log_);
     }
 
     const bool is_accounts_path = parts.size() >= 3 && parts[0] == "api" &&

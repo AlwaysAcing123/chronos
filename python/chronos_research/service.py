@@ -38,6 +38,7 @@ against the manifest's checksum, through no symlink.
 
 import base64
 import binascii
+import bisect
 import contextlib
 import hashlib
 import json
@@ -586,12 +587,63 @@ def decode_cursor(cursor: str, *scope: str) -> int:
 
 
 def paginate(items: list[Any], limit: int, cursor: str | None, *scope: str) -> Page:
+    """An offset page, for lists that never change: one result's
+    decisions, trades, and equity points."""
     start = 0 if cursor is None else decode_cursor(cursor, *scope)
     if start > len(items):
         raise malformed("invalid_cursor", "the cursor is past the end of this list", "cursor")
     page = items[start : start + limit]
     end = start + len(page)
     return Page(page, encode_cursor(*scope, str(end)) if end < len(items) else None)
+
+
+# Lists that grow while a client pages them (jobs, experiments, results) use
+# keyset cursors instead: a cursor names the last item returned, never a
+# position, so an item added between two pages cannot shift the next page
+# and make it repeat or skip an item. Items added after the first page
+# appear when the list is read again from the start.
+_KEYSET_VERSION = "v2"
+
+
+def _encode_keyset(name: str, key: str) -> str:
+    return base64.urlsafe_b64encode(f"{_KEYSET_VERSION}|{name}|{key}".encode()).decode().rstrip("=")
+
+
+def _decode_keyset(cursor: str, name: str, key: re.Pattern[str]) -> str:
+    try:
+        text = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+    except (binascii.Error, UnicodeDecodeError, ValueError) as error:
+        raise malformed("invalid_cursor", "the cursor is not one this list issued", "cursor") from error
+    parts = text.split("|")
+    if (
+        len(parts) != 3
+        or parts[:2] != [_KEYSET_VERSION, name]
+        or not key.fullmatch(parts[2])
+        or _encode_keyset(name, parts[2]) != cursor
+    ):
+        raise malformed("invalid_cursor", "the cursor is not one this list issued", "cursor")
+    return parts[2]
+
+
+_ARTIFACT_KEY = re.compile(r"[0-9a-f]{64}")
+
+
+def page_after_id(ids: list[str], limit: int, cursor: str | None, name: str) -> Page:
+    """IDs in ascending order, continuing after the cursor's ID."""
+    start = 0 if cursor is None else bisect.bisect_right(ids, _decode_keyset(cursor, name, _ARTIFACT_KEY))
+    page = ids[start : start + limit]
+    more = start + len(page) < len(ids)
+    return Page(page, _encode_keyset(name, page[-1]) if more and page else None)
+
+
+def page_before_sequence(jobs: list["Job"], limit: int, cursor: str | None) -> Page:
+    """Jobs newest first, continuing with those older than the cursor's."""
+    # Decoded first, so a malformed cursor is refused even for an empty list.
+    before = None if cursor is None else int(_decode_keyset(cursor, "runs", _UNSIGNED))
+    older = [job for job in jobs if before is None or job.sequence < before]
+    page = older[:limit]
+    more = len(older) > len(page)
+    return Page(page, _encode_keyset("runs", str(page[-1].sequence)) if more and page else None)
 
 
 def parse_query(query: str, allowed: tuple[str, ...]) -> dict[str, str]:
@@ -1080,7 +1132,9 @@ class Service:
             ) from error
 
     def experiments(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
-        page = paginate(self.artifacts.experiment_ids(), limit_of(query), query.get("cursor"), "experiments")
+        page = page_after_id(
+            self.artifacts.experiment_ids(), limit_of(query), query.get("cursor"), "experiments"
+        )
         items, invalid = [], []
         for experiment_id in page.items:
             try:
@@ -1126,7 +1180,7 @@ class Service:
         return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
 
     def runs(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
-        page = paginate(self.store.newest_first(), limit_of(query), query.get("cursor"), "runs")
+        page = page_before_sequence(self.store.newest_first(), limit_of(query), query.get("cursor"))
         return HTTPStatus.OK, {"next_cursor": page.next_cursor, "runs": [job.public() for job in page.items]}
 
     def run(self, job_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
@@ -1159,7 +1213,7 @@ class Service:
             ) from error
 
     def results(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
-        page = paginate(self.artifacts.result_ids(), limit_of(query), query.get("cursor"), "results")
+        page = page_after_id(self.artifacts.result_ids(), limit_of(query), query.get("cursor"), "results")
         items, invalid = [], []
         for run_id in page.items:
             try:

@@ -1,5 +1,7 @@
 #include "chronos/strategy/strategy_simulation.hpp"
 
+#include "chronos/strategy/long_flat_policy.hpp"
+
 #include "chronos/canonical_json.hpp"
 #include "chronos/market_quotes.hpp"
 #include "chronos/paper_order_codes.hpp"
@@ -496,30 +498,17 @@ public:
         Account& strategy = account(AccountRole::Strategy);
         const Quantity position = strategy.processor.account().state().quantity(instrument);
         const SchedulePrediction& prediction = *row.prediction;
-        std::optional<Quantity> target;
-        std::string_view reason;
-        if (prediction.predicted_class == PredictedClass::Flat) {
-            reason = "hold_flat_prediction";
-            ++results.decisions.hold_flat_prediction;
-        } else if (prediction.confidence_ppb < configuration.threshold_ppb) {
-            reason = "hold_below_threshold";
-            ++results.decisions.hold_below_threshold;
-        } else {
-            target = prediction.predicted_class == PredictedClass::Up ? configuration.target_quantity : Quantity{};
-        }
-        bool order = false;
-        if (target) {
-            if (strategy.pending) {
-                reason = "order_pending";
-                ++results.decisions.order_pending;
-            } else if (*target == position) {
-                reason = "already_at_target";
-                ++results.decisions.already_at_target;
-            } else {
-                reason = "order_scheduled";
-                ++results.decisions.orders;
-                order = true;
-            }
+        const PolicyDecision policy = decide_long_flat(
+            prediction, configuration.threshold_ppb, configuration.target_quantity, position, strategy.pending.has_value()
+        );
+        const std::optional<Quantity>& target = policy.target;
+        const std::string_view reason = policy_reason_name(policy.reason);
+        switch (policy.reason) {
+            case PolicyReason::HoldFlatPrediction: ++results.decisions.hold_flat_prediction; break;
+            case PolicyReason::HoldBelowThreshold: ++results.decisions.hold_below_threshold; break;
+            case PolicyReason::OrderPending: ++results.decisions.order_pending; break;
+            case PolicyReason::AlreadyAtTarget: ++results.decisions.already_at_target; break;
+            case PolicyReason::OrderScheduled: ++results.decisions.orders; break;
         }
         const json::Value signal(json::Object{
             {"available_at_ns", at_json(row.available_at)},
@@ -538,9 +527,8 @@ public:
             })) {
             return error;
         }
-        if (order) {
-            const bool buy = *target > position;
-            if (auto error = schedule_order(strategy, buy ? Side::Buy : Side::Sell, buy ? *target - position : position - *target, at, decision)) {
+        if (policy.order) {
+            if (auto error = schedule_order(strategy, policy.order->side, policy.order->quantity, at, decision)) {
                 return error;
             }
         }

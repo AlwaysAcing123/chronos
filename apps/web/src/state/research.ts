@@ -1,10 +1,11 @@
 // Research service state. Components read the service only through these
 // hooks. Published results are immutable, so they are read once; the job
 // list polls only while a job is queued or running.
+import type { InfiniteData } from '@tanstack/react-query';
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import type { ResearchClient } from '../api/research';
-import type { AccountName, JobPage, RunRequest } from '../api/researchSchemas';
+import type { AccountName, ExperimentPage, JobPage, ResultPage, RunRequest } from '../api/researchSchemas';
 import { useChronosServices } from './services';
 
 export const researchKeys = {
@@ -42,11 +43,30 @@ export function useResearchStatus() {
   });
 }
 
+// The growing lists load one page at a time: the first page on mount, and
+// an older page only when asked (fetchNextPage). A refresh re-reads the
+// loaded pages from the first, each continuing from the refreshed page
+// before it, so keyset cursors keep the merged list free of repeats and
+// gaps while entries are added.
+function mergedPages<Page extends { readonly next_cursor: string | null }>(
+  data: InfiniteData<Page>,
+  merge: (pages: readonly Page[]) => Omit<Page, 'next_cursor'>,
+): Page {
+  return { ...merge(data.pages), next_cursor: data.pages.at(-1)?.next_cursor ?? null } as Page;
+}
+
 export function useExperiments() {
   const client = useResearchClient();
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: researchKeys.experiments(),
-    queryFn: ({ signal }) => required(client).listExperiments(signal),
+    queryFn: ({ pageParam, signal }) => required(client).listExperiments(pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.next_cursor,
+    select: (data): ExperimentPage =>
+      mergedPages(data, (pages) => ({
+        experiments: pages.flatMap((page) => page.experiments),
+        invalid_entries: pages.flatMap((page) => page.invalid_entries),
+      })),
     enabled: client !== null,
   });
 }
@@ -58,18 +78,22 @@ export function hasActiveJob(page: JobPage | undefined): boolean {
 export function useRuns() {
   const client = useResearchClient();
   const queryClient = useQueryClient();
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: researchKeys.runs(),
-    queryFn: async ({ signal }) => {
-      const page = await required(client).listRuns(signal);
+    queryFn: async ({ pageParam, signal }) => {
+      const page = await required(client).listRuns(pageParam, signal);
       // A job that finished may have published a result.
       if (page.runs.some((job) => job.state === 'succeeded')) {
         void queryClient.invalidateQueries({ queryKey: researchKeys.results(), exact: true });
       }
       return page;
     },
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.next_cursor,
+    select: (data): JobPage => mergedPages(data, (pages) => ({ runs: pages.flatMap((page) => page.runs) })),
     enabled: client !== null,
-    refetchInterval: (query) => (hasActiveJob(query.state.data) ? ACTIVE_JOB_POLL_MS : false),
+    refetchInterval: (query) =>
+      query.state.data?.pages.some((page) => hasActiveJob(page)) === true ? ACTIVE_JOB_POLL_MS : false,
   });
 }
 
@@ -84,9 +108,16 @@ export function useStartRun() {
 
 export function useResults() {
   const client = useResearchClient();
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: researchKeys.results(),
-    queryFn: ({ signal }) => required(client).listResults(signal),
+    queryFn: ({ pageParam, signal }) => required(client).listResults(pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.next_cursor,
+    select: (data): ResultPage =>
+      mergedPages(data, (pages) => ({
+        results: pages.flatMap((page) => page.results),
+        invalid_entries: pages.flatMap((page) => page.invalid_entries),
+      })),
     enabled: client !== null,
   });
 }

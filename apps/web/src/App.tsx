@@ -1,11 +1,18 @@
+import { Suspense, lazy } from 'react';
+
 import { AccountEntry } from './components/account/AccountEntry';
-import { Research } from './components/research/Research';
 import { AccountContext } from './components/shell/AccountContext';
 import { AppShell } from './components/shell/AppShell';
 import { Workspace } from './components/workspace/Workspace';
 import { useAccountSelection } from './state/accountSelection';
 import { MarketDataStreamProvider } from './state/marketDataStream';
-import { useRoute } from './state/route';
+import { TRADING_HREF, useRoute } from './state/route';
+
+// Research, with its deployment controls, loads only when it is opened, so
+// the trading workspace's bundle stays small.
+const Research = lazy(() =>
+  import('./components/research/Research').then((module) => ({ default: module.Research })),
+);
 
 export function App() {
   const selection = useAccountSelection();
@@ -20,9 +27,18 @@ export function App() {
         }
       >
         {route.view === 'research' ? (
-          // Research never reads or changes the account selection, so
-          // returning to trading finds the same account open.
-          <Research resultId={route.resultId} />
+          // Research changes the account selection only when asked to open
+          // a deployment's account, so returning to trading otherwise finds
+          // the same account open.
+          <Suspense fallback={<p role="status">Loading Research…</p>}>
+            <Research
+              resultId={route.resultId}
+              onOpenAccount={(deploymentAccount) => {
+                selection.openAccount(deploymentAccount);
+                window.location.hash = TRADING_HREF;
+              }}
+            />
+          </Suspense>
         ) : accountId === null ? (
           <AccountEntry
             recentAccountIds={selection.recentAccountIds}

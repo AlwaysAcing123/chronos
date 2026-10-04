@@ -4,6 +4,8 @@
 #include "chronos/market_data/monotonic_clock.hpp"
 #include "chronos/market_data/monotonic_utc_clock.hpp"
 #include "chronos/market_state.hpp"
+#include "chronos/paper_trading/deployment_inference.hpp"
+#include "chronos/paper_trading/deployment_runtime.hpp"
 #include "chronos/paper_trading/paper_trading_http_api.hpp"
 #include "chronos/paper_trading/paper_trading_http_contract.hpp"
 #include "chronos/paper_trading/paper_trading_http_server.hpp"
@@ -30,6 +32,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -171,6 +174,33 @@ int run(const paper_trading::ServerArguments& arguments) {
     sigaddset(&termination_signals, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &termination_signals, nullptr);
 
+    // Model deployments only when asked for, with every path checked before
+    // anything starts. A write to an inference worker that has exited must
+    // fail with EPIPE rather than end the server.
+    std::unique_ptr<paper_trading::InferenceProvider> inference;
+    if (arguments.deployments) {
+        const auto& paths = *arguments.deployments;
+        if (!std::filesystem::is_regular_file(paths.python)) {
+            throw paper_trading::ServerUsageError("--research-python is not a file: " + paths.python.string());
+        }
+        if (!std::filesystem::is_directory(paths.python_root / "chronos_research")) {
+            throw paper_trading::ServerUsageError(
+                "--research-python-root has no chronos_research package: " + paths.python_root.string()
+            );
+        }
+        if (!std::filesystem::is_directory(paths.artifacts / "experiments")) {
+            throw paper_trading::ServerUsageError(
+                "--research-artifacts has no experiments directory: " + paths.artifacts.string()
+            );
+        }
+        signal(SIGPIPE, SIG_IGN);
+        inference = std::make_unique<paper_trading::PythonInferenceProvider>(paper_trading::PythonWorkerCommand{
+            .python = std::filesystem::absolute(paths.python),
+            .python_root = std::filesystem::absolute(paths.python_root),
+            .artifacts = std::filesystem::absolute(paths.artifacts),
+        });
+    }
+
     // Declared in dependency order, so destruction runs in reverse: the
     // HTTP server stops first, and the source's thread is joined before the
     // matcher, market state, and notifier it feeds are destroyed.
@@ -195,6 +225,9 @@ int run(const paper_trading::ServerArguments& arguments) {
         [&notifier] { notifier.publish_activity(); },
         log_line
     );
+    // The feed's observer: the matcher first, then deployments' features
+    // and hand-offs, which never wait (ADR 0018).
+    paper_trading::DeploymentHub deployment_hub(&matcher);
     // Applying and matching an event excludes submissions, which hold the
     // gate from reading their quote until they commit.
     market_data::MarketEventGate market_gate;
@@ -202,7 +235,7 @@ int run(const paper_trading::ServerArguments& arguments) {
         market_state,
         notifier,
         0,
-        &matcher,
+        &deployment_hub,
         &market_gate
     );
     // The only read of the system clock: a live feed's receive times are
@@ -245,12 +278,34 @@ int run(const paper_trading::ServerArguments& arguments) {
         [&notifier] { notifier.publish_activity(); },
         &market_gate
     );
+    service.set_trading_status_view(&deployment_hub);
+    // Always present, so a server without the opt-in still stops and lists
+    // deployments; only with it can one be created or started.
+    paper_trading::DeploymentManager deployments(
+        service,
+        deployment_hub,
+        std::move(inference),
+        paper_trading::DeploymentRuntimeOptions{
+            .stream = chronos::MarketDataStreamId(arguments.stream_id),
+            .tradeable_instruments = arguments.instruments,
+            .account_risk_limits = arguments.risk_limits,
+        },
+        log_line
+    );
+    // Nothing resumes on its own: whatever was running is now stopped.
+    deployments.recover();
+    log_line(
+        deployments.enabled()
+            ? "model deployments: enabled; each runs only after an explicit Start"
+            : "model deployments: disabled (start with --model-deployments to enable)"
+    );
     paper_trading::PaperTradingHttpApi api(
         service,
         *source,
         notifier,
         log_line,
-        &matcher
+        &matcher,
+        &deployments
     );
     paper_trading::PaperTradingHttpServer server(api, arguments.http, log_line);
     const int port = server.bind();
@@ -274,6 +329,8 @@ int run(const paper_trading::ServerArguments& arguments) {
     // the thread must be joined before it is destroyed.
     pthread_kill(signal_waiter.native_handle(), SIGTERM);
     signal_waiter.join();
+    // Deployments stop first (server_stopped), ending their workers.
+    deployments.shutdown();
     // A match waiting for PostgreSQL would hold the source's thread, so end
     // it before joining that thread.
     matcher.stop();

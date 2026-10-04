@@ -36,7 +36,7 @@ describe('ResearchClient', () => {
     const research = createFakeResearch();
     research.on('GET', `${RESEARCH_API}/experiments`, { status: 200, body: experimentPageJson() });
     research.on('GET', `${RESEARCH_API}/experiments/${EXPERIMENT_ID}`, { status: 200, body: { experiment: experimentJson() } });
-    const page = await research.client.listExperiments();
+    const page = await research.client.listExperiments(null);
     expect(page.experiments[0]?.instruments.map((entry) => entry.models.logistic.status)).toEqual(['unevaluable', 'fitted']);
     expect(research.requestsTo('GET', `${RESEARCH_API}/experiments`)[0]?.query.get('limit')).toBe('50');
     const experiment = await research.client.getExperiment(EXPERIMENT_ID);

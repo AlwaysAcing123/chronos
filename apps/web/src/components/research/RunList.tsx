@@ -5,6 +5,7 @@ import historyStyles from '../history/history.module.css';
 import { Badge } from '../ui/Badge';
 import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
+import { ListFooter } from './ListFooter';
 import { ResearchFailure } from './Research';
 import styles from './research.module.css';
 
@@ -16,7 +17,7 @@ export function RunList() {
     <Panel title="Runs" meta={active ? 'Updating while a run is active' : 'Newest first'}>
       {runs.status === 'pending' ? (
         <p role="status">Loading runs…</p>
-      ) : runs.status === 'error' ? (
+      ) : runs.data === undefined ? (
         <ResearchFailure error={runs.error} onRetry={() => void runs.refetch()} retrying={runs.isFetching} />
       ) : runs.data.runs.length === 0 ? (
         <p className={historyStyles.empty}>No evaluations have been started yet.</p>
@@ -70,6 +71,14 @@ export function RunList() {
               })}
             </tbody>
           </table>
+          <ListFooter
+            shown={runs.data.runs.length}
+            noun="runs"
+            hasMore={runs.hasNextPage}
+            loading={runs.isFetchingNextPage}
+            failed={runs.isFetchNextPageError}
+            onLoadMore={() => void runs.fetchNextPage()}
+          />
         </div>
       )}
     </Panel>

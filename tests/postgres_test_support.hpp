@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -248,5 +249,50 @@ inline void terminate_backends(
         "terminated backends to exit"
     );
 }
+
+// A schema of its own inside the shared test database, dropped with
+// everything in it at scope exit, so a test can start from an empty
+// database or from rows in an old format.
+class ScratchSchema {
+public:
+    explicit ScratchSchema(const std::string& base_connection)
+        : base_(base_connection),
+          name_(schema_name()),
+          admin_(base_connection) {
+        static_cast<void>(admin_.query("SET client_min_messages = warning"));
+        static_cast<void>(admin_.query("CREATE SCHEMA " + name_));
+    }
+
+    ~ScratchSchema() {
+        try {
+            static_cast<void>(
+                admin_.query("DROP SCHEMA " + name_ + " CASCADE")
+            );
+        } catch (const std::exception& error) {
+            std::cerr << "could not drop " << name_ << ": " << error.what()
+                      << '\n';
+        }
+    }
+
+    ScratchSchema(const ScratchSchema&) = delete;
+    ScratchSchema& operator=(const ScratchSchema&) = delete;
+
+    [[nodiscard]] std::string connection() const {
+        return with_search_path(base_, name_);
+    }
+
+    [[nodiscard]] const std::string& name() const { return name_; }
+
+private:
+    static std::string schema_name() {
+        std::string name = unique_test_id("chronos_scratch");
+        std::replace(name.begin(), name.end(), '-', '_');
+        return name;
+    }
+
+    std::string base_;
+    std::string name_;
+    PostgresTestConnection admin_;
+};
 
 }  // namespace chronos::test

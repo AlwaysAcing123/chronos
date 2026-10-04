@@ -282,6 +282,7 @@ target_link_libraries(chronos_paper_execution
 # through the paper-execution engine. See ADR 0016.
 add_library(chronos_strategy
     strategy/src/inference_schedule.cpp
+    strategy/src/long_flat_policy.cpp
     strategy/src/strategy_run_artifact.cpp
     strategy/src/strategy_simulation.cpp
 )
@@ -321,6 +322,7 @@ if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
 
     add_library(chronos_postgresql_persistence
         adapters/postgresql/src/postgresql_paper_order_repository.cpp
+        adapters/postgresql/src/postgresql_model_deployments.cpp
     )
 
     target_include_directories(chronos_postgresql_persistence
@@ -420,6 +422,24 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
         services/paper_trading/src/working_order_matcher.cpp
     )
 
+    # Model deployments (ADR 0018): the inference worker client and the
+    # runtime that turns market events into decisions and orders.
+    add_library(chronos_paper_trading_deployments
+        services/paper_trading/src/deployment_inference.cpp
+        services/paper_trading/src/deployment_runtime.cpp
+    )
+
+    target_link_libraries(chronos_paper_trading_deployments
+        PUBLIC
+            chronos_paper_trading_service
+            chronos_features
+            chronos_strategy
+        PRIVATE
+            chronos_build_options
+            nlohmann_json::nlohmann_json
+            Threads::Threads
+    )
+
     target_include_directories(chronos_paper_trading_service
         PUBLIC services/paper_trading/include
     )
@@ -433,6 +453,7 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
     )
 
     add_library(chronos_paper_trading_http
+        services/paper_trading/src/deployment_http.cpp
         services/paper_trading/src/paper_trading_http_api.cpp
         services/paper_trading/src/paper_trading_http_contract.cpp
         services/paper_trading/src/paper_trading_http_server.cpp
@@ -443,6 +464,7 @@ if(CHRONOS_ENABLE_PAPER_TRADING_API)
         PUBLIC
             chronos_market_data_sources
             chronos_paper_trading_service
+            chronos_paper_trading_deployments
         PRIVATE
             chronos_build_options
             httplib::httplib
@@ -898,6 +920,30 @@ if(BUILD_TESTING)
             PROPERTIES SKIP_RETURN_CODE 77
         )
 
+        add_executable(chronos_postgresql_model_deployment_tests
+            tests/postgresql_model_deployment_tests.cpp
+        )
+
+        target_compile_definitions(chronos_postgresql_model_deployment_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_postgresql_model_deployment_tests
+            PRIVATE
+                chronos_postgresql_persistence
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_postgresql_model_deployment_tests
+            COMMAND chronos_postgresql_model_deployment_tests
+        )
+
+        set_tests_properties(chronos_postgresql_model_deployment_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
         add_executable(chronos_postgresql_working_order_tests
             tests/postgresql_working_order_tests.cpp
         )
@@ -1038,6 +1084,47 @@ if(BUILD_TESTING)
         )
 
         set_tests_properties(chronos_paper_trading_working_order_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
+        add_executable(chronos_paper_trading_inference_client_tests
+            tests/paper_trading_inference_client_tests.cpp
+        )
+
+        target_link_libraries(chronos_paper_trading_inference_client_tests
+            PRIVATE
+                chronos_paper_trading_deployments
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_paper_trading_inference_client_tests
+            COMMAND chronos_paper_trading_inference_client_tests
+        )
+
+        add_executable(chronos_paper_trading_deployment_tests
+            tests/paper_trading_deployment_tests.cpp
+        )
+
+        target_compile_definitions(chronos_paper_trading_deployment_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_paper_trading_deployment_tests
+            PRIVATE
+                chronos_paper_trading_http
+                chronos_build_options
+                nlohmann_json::nlohmann_json
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_paper_trading_deployment_tests
+            COMMAND chronos_paper_trading_deployment_tests
+        )
+
+        set_tests_properties(chronos_paper_trading_deployment_tests
             PROPERTIES SKIP_RETURN_CODE 77
         )
 
@@ -1186,6 +1273,34 @@ if(BUILD_TESTING)
             NAME chronos_alpaca_live_source_tests
             COMMAND chronos_alpaca_live_source_tests
         )
+
+        # Deployments on the live source, through its fake transport.
+        if(CHRONOS_ENABLE_PAPER_TRADING_API AND CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
+            add_executable(chronos_alpaca_deployment_tests
+                tests/alpaca_deployment_tests.cpp
+            )
+
+            target_compile_definitions(chronos_alpaca_deployment_tests
+                PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+
+            target_link_libraries(chronos_alpaca_deployment_tests
+                PRIVATE
+                    chronos_alpaca_adapter
+                    chronos_paper_trading_deployments
+                    chronos_build_options
+                    Threads::Threads
+            )
+
+            add_test(
+                NAME chronos_alpaca_deployment_tests
+                COMMAND chronos_alpaca_deployment_tests
+            )
+
+            set_tests_properties(chronos_alpaca_deployment_tests
+                PROPERTIES SKIP_RETURN_CODE 77
+            )
+        endif()
 
         # A local WebSocket server exercises the real transport; nothing
         # leaves the loopback interface.

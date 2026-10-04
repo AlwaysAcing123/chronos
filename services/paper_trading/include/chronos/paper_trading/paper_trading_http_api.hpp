@@ -2,6 +2,7 @@
 
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_data_source.hpp"
+#include "chronos/paper_trading/deployment_runtime.hpp"
 #include "chronos/paper_trading/http_message.hpp"
 #include "chronos/paper_trading/paper_trading_http_contract.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
@@ -35,6 +36,7 @@ using DiagnosticLog = std::function<void(std::string_view line)>;
 //   GET  /api/v1/market-data
 //   POST /api/v1/market-data/replay/{start,pause,resume}
 //   GET  /api/v1/market-data/events            (Server-Sent Events)
+//   /api/v1/deployments...                     (see deployment_http.hpp)
 //
 // The router holds no trading logic: it checks the method, query string, and
 // media type, parses the request through the JSON contract, calls the
@@ -48,7 +50,8 @@ public:
         market_data::MarketDataSource& source,
         market_data::MarketDataNotifier& notifier,
         DiagnosticLog log,
-        const WorkingOrderMatcher* matcher = nullptr
+        const WorkingOrderMatcher* matcher = nullptr,
+        DeploymentManager* deployments = nullptr
     );
 
     // Never throws for request content. An unexpected exception becomes a
@@ -83,6 +86,7 @@ private:
     market_data::MarketDataNotifier& notifier_;
     DiagnosticLog log_;
     const WorkingOrderMatcher* matcher_;
+    DeploymentManager* deployments_;
 };
 
 }  // namespace chronos::paper_trading

@@ -103,7 +103,12 @@ ServerArguments parse_server_arguments(
         .alpaca_iex = false,
         .http = HttpServerOptions{},
         .risk_limits = default_risk_limits(),
+        .deployments = std::nullopt,
     };
+    bool model_deployments = false;
+    std::optional<std::string> research_python;
+    std::optional<std::string> research_python_root;
+    std::optional<std::string> research_artifacts;
     std::optional<std::string> stream_id;
     std::optional<std::string> recording;
     std::optional<ReplaySpeed> replay_speed;
@@ -180,6 +185,14 @@ ServerArguments parse_server_arguments(
         } else if (option == "--fee-per-fill") {
             parsed.risk_limits.fee_per_fill =
                 parse_decimal<Money>(cursor.value(option), option);
+        } else if (option == "--model-deployments") {
+            model_deployments = true;
+        } else if (option == "--research-python") {
+            research_python = cursor.value(option);
+        } else if (option == "--research-python-root") {
+            research_python_root = cursor.value(option);
+        } else if (option == "--research-artifacts") {
+            research_artifacts = cursor.value(option);
         } else {
             throw ServerUsageError("unknown option: " + std::string(option));
         }
@@ -191,6 +204,26 @@ ServerArguments parse_server_arguments(
         );
     }
     parsed.stream_id = std::move(*stream_id);
+    const bool any_research = research_python || research_python_root || research_artifacts;
+    if (model_deployments) {
+        if (!research_python || !research_python_root || !research_artifacts ||
+            research_python->empty() || research_python_root->empty() || research_artifacts->empty()) {
+            throw ServerUsageError(
+                "--model-deployments requires --research-python, "
+                "--research-python-root, and --research-artifacts"
+            );
+        }
+        parsed.deployments = DeploymentArguments{
+            .python = std::move(*research_python),
+            .python_root = std::move(*research_python_root),
+            .artifacts = std::move(*research_artifacts),
+        };
+    } else if (any_research) {
+        throw ServerUsageError(
+            "--research-python, --research-python-root, and "
+            "--research-artifacts require --model-deployments"
+        );
+    }
     if (parsed.alpaca_iex) {
         if (recording) {
             throw ServerUsageError(
@@ -243,7 +276,7 @@ std::string server_usage() {
         "      [--max-order-quantity 1000] [--max-order-notional 1000000]\n"
         "      [--max-position-quantity 10000] [--max-quote-age-ms 5000]\n"
         "      [--fee-per-fill 0]\n"
-        "      [market-data source]\n\n"
+        "      [market-data source] [model deployments]\n\n"
         "Market-data source (at most one; without one the market is empty):\n"
         "  --replay-dbn <FILE.dbn.zst>  Replay a local Databento EQUS.MINI\n"
         "                               MBP-1 recording (Databento builds).\n"
@@ -256,6 +289,15 @@ std::string server_usage() {
         "                               not SIP or NBBO data. Credentials are\n"
         "                               read only from APCA_API_KEY_ID and\n"
         "                               APCA_API_SECRET_KEY.\n\n"
+        "Model deployments (off unless asked for; see docs/model-deployments.md):\n"
+        "  --model-deployments          Allow verified research models to\n"
+        "                               trade dedicated paper accounts, each\n"
+        "                               only after an explicit Start.\n"
+        "    --research-python <PATH>   The Python with chronos_research's\n"
+        "                               dependencies, such as python/.venv/bin/python.\n"
+        "    --research-python-root <DIR>  The repository's python directory.\n"
+        "    --research-artifacts <DIR> The research artifacts directory,\n"
+        "                               holding experiments/.\n\n"
         "Serves the paper-trading API. Simulated trading only; no order is\n"
         "ever sent to a broker or exchange. The API has no authentication\n"
         "and is not production-secure; keep it on localhost.\n";

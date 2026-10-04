@@ -5,6 +5,7 @@ import historyStyles from '../history/history.module.css';
 import { Alert, Code } from '../ui/Alert';
 import { DecimalText, Unavailable } from '../ui/DecimalText';
 import { Panel } from '../ui/Panel';
+import { ListFooter } from './ListFooter';
 import { ResearchFailure } from './Research';
 import styles from './research.module.css';
 
@@ -15,7 +16,7 @@ export function ResultList() {
     <Panel title="Saved results" meta="Immutable, verified when read">
       {results.status === 'pending' ? (
         <p role="status">Loading results…</p>
-      ) : results.status === 'error' ? (
+      ) : results.data === undefined ? (
         <ResearchFailure
           error={results.error}
           onRetry={() => void results.refetch()}
@@ -77,6 +78,14 @@ export function ResultList() {
               </table>
             </div>
           )}
+          <ListFooter
+            shown={results.data.results.length}
+            noun="results"
+            hasMore={results.hasNextPage}
+            loading={results.isFetchingNextPage}
+            failed={results.isFetchNextPageError}
+            onLoadMore={() => void results.fetchNextPage()}
+          />
         </>
       )}
     </Panel>

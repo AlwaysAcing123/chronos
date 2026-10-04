@@ -304,8 +304,11 @@ responses must carry `X-Chronos-Service: research`.
 The header's primary navigation switches between Trading and Research. The
 switch is a URL hash: `#/research`, or `#/research/results/<run-id>` for one
 result. A reload or a link reopens the same view, and the workspace's section
-links keep working. Research never reads or changes the account selection,
-so returning to Trading finds the same account open.
+links keep working. Research changes the account selection only when asked
+to open a deployment's account ("Open … in trading"), so returning to
+Trading otherwise finds the same account open. Research is loaded only when
+it is opened, as its own bundle chunk, which keeps the trading workspace's
+bundle small.
 
 Research starts historical strategy evaluations of prebuilt models and shows
 their verified results, kept separate from the trading API:
@@ -320,6 +323,39 @@ their verified results, kept separate from the trading API:
 
 See [research-service.md](research-service.md) for the service, the flow, and
 the charting boundary.
+
+### Model deployments
+
+Research also deploys a model to a paper account
+([model-deployments.md](model-deployments.md)). It talks to the trading
+server through `DeploymentClient` (`src/api/deployments.ts`) and the hooks
+in `src/state/deployments.ts`.
+
+- **Deploy to paper.** The form takes the selected experiment and
+  instrument and a model. Its defaults are the research service's. A
+  threshold is converted between decimal and parts per billion exactly,
+  never through floating point. "Review deployment" freezes the exact request
+  and lists what every deployment does. Only "Create deployment" sends it,
+  and the deployment is created stopped.
+- **Paper deployments.** Each deployment shows its state and why, its model
+  identity and training cutoff, policy, timing, the run's counts and
+  observed wall times, its latest problem, and its latest decisions.
+  - **Start** needs an explicit confirmation that the model may place
+    simulated orders in its account. **Stop** keeps the position.
+  - **The kill switch** must be armed before it stops every deployment.
+  - **Polling.** The list polls once a second while a deployment is
+    running or stopping, and every five seconds while idle, so another
+    client's controls and delayed Start results are discovered.
+  - **Uncertain controls.** A lost response or unknown server failure says
+    the outcome is unknown, never that trading did not start. Another Start
+    is blocked until Stop is acknowledged. Creation can be retried with
+    the same frozen request and IDs.
+  - **Disabled servers.** A server started without `--model-deployments`
+    is labelled as such, while Stop and the kill switch stay available.
+- **Owned accounts.** The trading workspace shows an owned account's
+  portfolio, orders, and fills, which are labelled `MODEL`. In place of the
+  order ticket it says which deployment trades the account, because the
+  server refuses manual orders there.
 
 ## Tests
 
@@ -387,6 +423,8 @@ database, credentials, or market data; the live spec is skipped there.
   whose quotes were usable: the valuation is all or nothing. The watchlist
   still shows each symbol's current quote.
 - Manual orders use the fixed source ID `web-ticket`.
+- Deployments are listed with their latest ten decisions only; the full
+  history is in the API.
 - Working orders can be cancelled but not replaced or amended. No price
   chart or valuation history for paper accounts; the only chart is a
   historical evaluation's equity curve in Research.

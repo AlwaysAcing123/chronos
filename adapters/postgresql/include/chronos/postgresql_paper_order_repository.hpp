@@ -1,5 +1,7 @@
 #pragma once
 
+#include "chronos/postgresql_model_deployments.hpp"
+
 #include "chronos/paper_order_processor.hpp"
 
 #include <chrono>
@@ -256,6 +258,12 @@ using PaperOrderEventPageResult = std::variant<
 
 class PostgresPaperOrderRepository;
 
+struct CreatedDeployment {
+    ModelDeploymentRecord deployment;
+    // False when an identical deployment already existed.
+    bool created{false};
+};
+
 // One account's row lock, held by an open transaction, with the account
 // recovered inside it. Every mutation of an account (a submission, a match
 // of its working orders, a cancellation) runs in one of these, so they are
@@ -309,6 +317,39 @@ public:
 
     // Ends the transaction without writing.
     void release();
+
+    // Model deployments (migration 005, ADR 0018).
+
+    // The deployment that owns this account, if any. Read under the account
+    // lock, so ownership cannot change before this transaction ends.
+    [[nodiscard]] std::optional<std::string> owning_deployment();
+    // Locks the deployment's row, then its decision's, after the account's:
+    // the global order. Nullopt when either does not exist.
+    [[nodiscard]] std::optional<LockedDeploymentDecision> lock_deployment_decision(
+        std::string_view deployment_id,
+        std::int64_t decision_sequence
+    );
+    // A deployment's order: what commit_submission writes and, in the same
+    // transaction, the pending decision resolved as recorded and the
+    // deployment's order counters updated. Either all of it commits or
+    // none of it does, so a pending decision never has an order.
+    [[nodiscard]] CommitPaperOrderResult commit_deployment_submission(
+        const WorkingOrderMatch& earlier_orders,
+        const OrderIntent& intent,
+        const TopOfBookEvent& market,
+        const PaperOrderResult& result,
+        std::string_view deployment_id,
+        std::int64_t decision_sequence,
+        const DeploymentOrderResolution& resolution
+    );
+    // Resolves the pending decision as abandoned, with why, and commits. No
+    // order exists for it, and none can be recorded afterwards.
+    void commit_deployment_abandonment(
+        std::string_view deployment_id,
+        std::int64_t decision_sequence,
+        std::string_view reason,
+        Timestamp market_time
+    );
 
     // Opaque; defined by the repository.
     struct State;
@@ -407,6 +448,52 @@ public:
     // Probes the connection, reconnecting once if an earlier operation lost
     // it. Returns false only when PostgreSQL is unavailable.
     [[nodiscard]] bool check_availability();
+
+    // Model deployments (migration 005, ADR 0018). Each runs in its own
+    // transaction; a write locks the deployment's row first.
+
+    // Creates the deployment, stopped, together with its new account, or
+    // returns the existing deployment when one with this ID was created
+    // from the identical request.
+    [[nodiscard]] std::variant<CreatedDeployment, DeploymentConflict> create_deployment(
+        const ModelDeploymentConfig& config
+    );
+    [[nodiscard]] std::optional<ModelDeploymentRecord> find_deployment(
+        std::string_view deployment_id
+    );
+    // Newest first, continuing with those created before
+    // `before_sequence`.
+    [[nodiscard]] DeploymentPage list_deployments(
+        std::size_t limit,
+        std::optional<std::int64_t> before_sequence
+    );
+    // Moves the deployment from one of `from` to `to`, with a reason. A
+    // start (`begin_run`) also begins a new run generation and resets the
+    // run's order counters.
+    [[nodiscard]] std::variant<ModelDeploymentRecord, DeploymentConflict> transition_deployment(
+        std::string_view deployment_id,
+        const std::vector<DeploymentState>& from,
+        DeploymentState to,
+        std::string_view reason,
+        bool begin_run
+    );
+    // Records a decision under the deployment's row lock: only while it is
+    // running in this generation, with no decision pending, and for an
+    // observation strictly after the watermark, which advances. An order
+    // decision is pending, with its deterministic client order ID and its
+    // eligibility window; a hold is resolved at once.
+    [[nodiscard]] std::variant<DeploymentDecisionRecord, DeploymentConflict> record_decision(
+        const NewDeploymentDecision& decision
+    );
+    // Newest first.
+    [[nodiscard]] DecisionPage list_decisions(
+        std::string_view deployment_id,
+        std::size_t limit,
+        std::optional<std::int64_t> before_sequence
+    );
+    [[nodiscard]] std::vector<DeploymentDecisionRecord> pending_decisions();
+    // The deployment owning an account, read outside any lock, for display.
+    [[nodiscard]] std::optional<std::string> account_owner(std::string_view account_id);
 
 private:
     friend class PersistentPaperOrderSession;

@@ -753,6 +753,15 @@ ResponseJson account_json(const PaperAccountView& account) {
     json["positions"] = std::move(positions);
     json["closed_positions"] = closed_positions_json(state);
     json["risk_limits"] = risk_limits_json(account.risk_limits);
+    // Only the owning deployment trades an owned account (ADR 0018).
+    if (account.owning_deployment) {
+        ResponseJson owner = ResponseJson::object();
+        owner["kind"] = "model_deployment";
+        owner["deployment_id"] = *account.owning_deployment;
+        json["owner"] = std::move(owner);
+    } else {
+        json["owner"] = nullptr;
+    }
     return json;
 }
 
@@ -1406,6 +1415,15 @@ HttpResponse render_service_error(const PaperTradingError& failure) {
                 "duplicate_cancel_request_id",
                 "cancel_request_id already cancelled another order of this "
                 "account",
+                nonempty(failure.field)
+            );
+        case PaperTradingErrorCode::AccountOwnedByDeployment:
+            // Whatever the request says its source is: owned accounts are
+            // traded only by their deployment's trusted path.
+            return error_response(
+                409,
+                "account_owned_by_deployment",
+                failure.message,
                 nonempty(failure.field)
             );
     }

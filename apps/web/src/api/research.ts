@@ -57,12 +57,14 @@ export interface StartedRun {
 
 export interface ResearchClient {
   getStatus(signal?: AbortSignal): Promise<ResearchStatus>;
-  listExperiments(signal?: AbortSignal): Promise<ExperimentPage>;
+  // The growing lists page with keyset cursors: following next_cursor
+  // never repeats or skips an entry; null starts from the first page.
+  listExperiments(cursor: string | null, signal?: AbortSignal): Promise<ExperimentPage>;
   getExperiment(experimentId: string, signal?: AbortSignal): Promise<Experiment>;
   startRun(request: RunRequest): Promise<StartedRun>;
-  listRuns(signal?: AbortSignal): Promise<JobPage>;
+  listRuns(cursor: string | null, signal?: AbortSignal): Promise<JobPage>;
   getRun(jobId: string, signal?: AbortSignal): Promise<Job>;
-  listResults(signal?: AbortSignal): Promise<ResultPage>;
+  listResults(cursor: string | null, signal?: AbortSignal): Promise<ResultPage>;
   getResult(runId: string, signal?: AbortSignal): Promise<ResearchResult>;
   listTrades(runId: string, account: AccountName, cursor: string | null, signal?: AbortSignal): Promise<TradePage>;
   listDecisions(runId: string, cursor: string | null, signal?: AbortSignal): Promise<DecisionPage>;
@@ -105,7 +107,8 @@ export function createResearchClient(transport: TransportOptions = DEFAULT_RESEA
 
   return {
     getStatus: (signal) => get(StatusSchema, '/status', signal),
-    listExperiments: (signal) => get(ExperimentPageSchema, `/experiments${query({ limit: String(RESEARCH_PAGE_SIZE) })}`, signal),
+    listExperiments: (cursor, signal) =>
+      get(ExperimentPageSchema, `/experiments${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
     getExperiment: async (experimentId, signal) =>
       (await get(ExperimentEnvelopeSchema, `/experiments/${encodeURIComponent(experimentId)}`, signal)).experiment,
     async startRun(request) {
@@ -119,9 +122,10 @@ export function createResearchClient(transport: TransportOptions = DEFAULT_RESEA
       }
       return decodeBody(StartedJobSchema, response);
     },
-    listRuns: (signal) => get(JobPageSchema, `/runs${query({ limit: String(RESEARCH_PAGE_SIZE) })}`, signal),
+    listRuns: (cursor, signal) => get(JobPageSchema, `/runs${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
     getRun: async (jobId, signal) => (await get(JobEnvelopeSchema, `/runs/${encodeURIComponent(jobId)}`, signal)).run,
-    listResults: (signal) => get(ResultPageSchema, `/results${query({ limit: String(RESEARCH_PAGE_SIZE) })}`, signal),
+    listResults: (cursor, signal) =>
+      get(ResultPageSchema, `/results${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
     getResult: async (runId, signal) =>
       (await get(ResultEnvelopeSchema, `/results/${encodeURIComponent(runId)}`, signal)).result,
     listTrades: (runId, account, cursor, signal) =>

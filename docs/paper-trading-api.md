@@ -447,6 +447,12 @@ recording with `fee_per_fill` 0.35, bought 5 AAPL at 336.04 and 3 SPY at
   working sells hold, and `available_quantity = quantity −
   reserved_quantity` is what a new sell may sell. Every value is the
   server's; clients never compute them.
+- `owner` is `null` for a manual account, or `{"kind": "model_deployment",
+  "deployment_id": "..."}` for an account created with a
+  [model deployment](#model-deployments). Ownership is fixed when the account
+  is created. Only the deployment trades an owned account. Manual orders and
+  cancellations on it return `409 account_owned_by_deployment`, whatever
+  `source` they declare.
 
 ### `GET /api/v1/accounts/{account_id}/portfolio`
 
@@ -1227,6 +1233,7 @@ with the same ID.
 | 409 | `account_version_conflict` | no | Another writer changed the account first; retry with the same ID. The server's own writers serialize on the account lock instead, so only a writer outside it can cause this |
 | 409 | `order_not_cancellable` | no | The order is terminal; the body carries it as it is |
 | 409 | `duplicate_cancel_request_id` | no | This `cancel_request_id` already cancelled another order of the account |
+| 409 | `account_owned_by_deployment` | no | The account belongs to a model deployment; only it trades the account, whatever `source` the request declares |
 | 413 | `payload_too_large` | no | Body exceeds 16 KiB |
 | 415 | `unsupported_media_type` | no | `Content-Type` is not JSON |
 | 422 | `unsupported_instrument` | no | An order for an instrument the server does not trade; retry with a tradeable one and the same ID |
@@ -1541,8 +1548,243 @@ These are intentionally not implemented in this slice:
 - **Other valuations.** Size-aware liquidation value needs Level-2 depth; an
   equity curve needs a valuation history, which could be derived from the
   journal and market recording without changing this endpoint.
-- **Model runtimes** will build `PaperOrderRequest` values with
-  `source.kind = model` and call the same service in process.
+- **Model runtimes** submit through `PaperTradingService::submit_deployment_order`,
+  in process and with no route (see [Model deployments](#model-deployments)).
+  A request to the order route that declares `source.kind = model` is still
+  a manual-path request, and is refused on an owned account.
+
+## Model deployments
+
+A model deployment trades one verified research model in a paper account of
+its own, only after an explicit start. See
+[model-deployments.md](model-deployments.md) for what it does and
+[ADR 0018](decisions/0018-model-paper-deployments.md) for why. The routes
+exist on every server. Unless it was started with `--model-deployments`,
+creating and starting return `409 deployments_disabled`, while listing,
+Stop, and the kill switch still work.
+
+| Route | Does |
+|---|---|
+| `GET /api/v1/deployments` | Newest first, with `enabled`; `?limit` (1 to 200, default 50) and `?cursor` |
+| `POST /api/v1/deployments` | Creates a deployment, stopped, and its new account |
+| `POST /api/v1/deployments/kill-switch` | Stops every deployment (`kill_switch`); body `{}` |
+| `GET /api/v1/deployments/{deployment_id}` | One deployment |
+| `POST /api/v1/deployments/{deployment_id}/start` | Starts a new run; body `{}` |
+| `POST /api/v1/deployments/{deployment_id}/stop` | Stops it, keeping the position; body `{}` |
+| `GET /api/v1/deployments/{deployment_id}/decisions` | Its decisions, newest first; `?limit` and `?cursor` |
+
+No route submits a deployment's order.
+
+### Creating
+
+Every field is required and is a string:
+
+```json
+{
+  "deployment_id": "demo-aapl",
+  "account_id": "demo-aapl-acct",
+  "starting_cash": "10000",
+  "experiment_id": "05be6dd441394993e67b5efadda6dc4f4ac395750fd9a4bc3ae449ac2c16ba62",
+  "model": "logistic",
+  "instrument": "AAPL",
+  "threshold": "0.5",
+  "target_quantity": "1",
+  "decision_interval_ms": "1000",
+  "latency_ms": "1",
+  "max_signal_age_ms": "5000",
+  "max_orders_per_run": "200",
+  "max_consecutive_rejections": "3"
+}
+```
+
+- **Identifiers.** `deployment_id` is at most 32 identifier characters, so
+  that `<deployment_id>-<12-digit decision sequence>` is a valid client order
+  ID. `kill-switch` is reserved for the control route. `account_id` must not
+  exist yet.
+- **Policy.** `threshold` is a decimal from 0 to 1. `target_quantity` is
+  positive and at most `1`.
+- **Timing.** The three durations are whole milliseconds, at most a day, and
+  `max_signal_age_ms` must exceed `latency_ms`.
+- **Verification.** Before anything is written, the server starts the
+  inference worker with `--describe`, which verifies the experiment and
+  reports the model's parameter checksum and training cutoff. The deployment
+  records both.
+- **Account limits.** The new account takes the server's risk limits, with
+  its order and position quantity limits lowered to `target_quantity`.
+
+The response is `201` with `{"deployment": ..., "created": true}`. The
+identical request again returns `200` with `"created": false`. The
+canonical request's SHA-256 identifies it.
+
+| Status | `code` | Meaning |
+|---:|---|---|
+| 400 | `malformed_request` | Not a JSON object, an unknown, duplicate, missing, or non-string field, or an unparseable value; `field` names it |
+| 409 | `deployment_exists` | The ID was created from a different request |
+| 409 | `account_exists` | The account ID is taken |
+| 409 | `deployments_disabled` | The server was started without `--model-deployments` |
+| 422 | `invalid_deployment` | A domain rule, such as a target above one share; `field` names it |
+| 422 | `model_unavailable` | The model could not be verified; `reason` is, for example, `model_rejected` or `inference_timeout` |
+| 503 | `persistence_unavailable` | PostgreSQL is unavailable; nothing is known to be created, so retry the identical request |
+
+### The deployment resource
+
+A deployment after the demonstration replay ([model-deployments.md](model-deployments.md)) and a clean server shutdown:
+
+```json
+{
+  "deployment": {
+    "trading_mode": "paper",
+    "deployment_id": "demo-aapl-2",
+    "account_id": "demo-aapl-2-acct",
+    "creation_sequence": "3",
+    "state": "stopped",
+    "state_reason": "server_stopped",
+    "state_changed_at": "2026-10-04T19:08:46.489397000Z",
+    "created_at": "2026-10-04T19:07:18.810428000Z",
+    "active": false,
+    "run_generation": "1",
+    "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
+    "starting_cash": "10000",
+    "model": {
+      "experiment_id": "05be6dd441394993e67b5efadda6dc4f4ac395750fd9a4bc3ae449ac2c16ba62",
+      "name": "logistic",
+      "instrument": "AAPL",
+      "parameters_sha256": "a0e07429e1654ee4cbe07ba6e2ded7b079e35a9e3671da50c7e281567c538939",
+      "feature_set": "top_of_book_baseline/1",
+      "training_cutoff": "2026-09-25T13:35:19.090266460Z"
+    },
+    "policy": {
+      "name": "long_flat_threshold/1",
+      "threshold": "0.5",
+      "target_quantity": "1"
+    },
+    "timing": {
+      "decision_interval_ms": "1000",
+      "latency_ms": "1",
+      "max_signal_age_ms": "5000"
+    },
+    "limits": {
+      "max_orders_per_run": "200",
+      "max_consecutive_rejections": "3",
+      "orders_this_run": "76",
+      "consecutive_rejections": "0"
+    },
+    "watermark": {
+      "received_at": "2026-09-25T13:39:59.960901336Z",
+      "ingest_sequence": "121296"
+    },
+    "next_decision_sequence": "238",
+    "pending_decision": null,
+    "version": "316",
+    "run": null
+  }
+}
+```
+
+- **`state` and `state_reason`.** `state` is `stopped`, `running`,
+  `stopping`, or `faulted`. `state_reason` says why; for example `created`,
+  `started`, `stop_requested`, `kill_switch`, `server_restarted`,
+  `server_stopped`, `model_identity_mismatch`, `rejection_limit_reached`,
+  `order_limit_reached`, or `inference_timeout`.
+- **`active`.** True while this server process runs the deployment's
+  runner.
+- **`watermark`.** The latest decided observation. It is durable and never
+  moves back, so no observation is decided twice.
+- **`run`.** The current or last run's counters in this process, kept in
+  memory only. They are `null` after a restart, as in the example. The
+  counters are:
+  - `candidates` and `superseded`, the rows replaced in the one-slot
+    hand-off before the runner took them;
+  - `skipped` and `waits`, counted by reason;
+  - `predictions`, `holds`, `order_decisions`, `orders_recorded`, and
+    `abandoned`;
+  - the wall time of inference and of the trusted order path, as
+    `last_inference_us`, `max_inference_us`, `last_submission_us`, and
+    `max_submission_us`;
+  - `last_error`.
+- **Errors.** Start can return `409 invalid_deployment_state`, or
+  `422 model_unavailable` when the model no longer loads or verifies; the
+  deployment is then `faulted` with that reason. The server allows at most
+  eight active deployments; an additional Start returns
+  `409 invalid_deployment_state`, reason `deployment_capacity_reached`,
+  without starting a worker. Start, Stop, and
+  `GET /api/v1/deployments/{deployment_id}` return
+  `404 deployment_not_found`.
+
+### Decisions
+
+Its first recorded decision. The deployment's latency was 1 ms, yet the order executed on a quote received 767 ms after the signal: the 10x replay held the market-event gate, and the order waited for it ([limitations](model-deployments.md#limitations)).
+
+```json
+{
+  "decisions": [
+    {
+      "decision_sequence": "41",
+      "run_generation": "1",
+      "state": "recorded",
+      "observation": {
+        "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
+        "instrument": "AAPL",
+        "ingest_sequence": "81332",
+        "event_at": "2026-09-25T13:36:05.308244633Z",
+        "received_at": "2026-09-25T13:36:05.308358348Z"
+      },
+      "decided_at": "2026-09-25T13:36:05.371816559Z",
+      "inputs": [
+        "880000000",
+        "764705882",
+        "336470588",
+        "30000000000",
+        "4000000000"
+      ],
+      "prediction": {
+        "class": "up",
+        "probabilities": [
+          "0.3318806796538787",
+          "0.06930539751800728",
+          "0.598813922828114"
+        ],
+        "confidence": "0.598813922"
+      },
+      "position_before": "0",
+      "target_quantity": "1",
+      "policy_reason": "order_scheduled",
+      "order": {
+        "client_order_id": "demo-aapl-2-000000000041",
+        "side": "buy",
+        "quantity": "1",
+        "not_before_received_at": "2026-09-25T13:36:05.309358348Z",
+        "expires_at": "2026-09-25T13:36:10.308358348Z"
+      },
+      "resolution": "filled",
+      "execution": {
+        "ingest_sequence": "81434",
+        "received_at": "2026-09-25T13:36:06.075800942Z"
+      },
+      "resolved_at": "2026-09-25T13:36:06.156701724Z",
+      "created_at": "2026-10-04T19:08:05.784544000Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- **The observation.** `inputs` are the five exact model inputs of
+  `top_of_book_baseline/1`, in their scales, from the observation the signal
+  used.
+- **`state`.** `held` (no order intended), `pending`, `recorded` (its one
+  order is in the journal, with `resolution` its outcome, such as `filled`
+  or `risk_rejected:insufficient_cash`), or `abandoned` (no order will ever
+  exist; `resolution` is why, such as `signal_expired`, `stop_requested`,
+  `kill_switch`, `faulted`, or `server_restarted`).
+- **The order.** The deployment's order is an ordinary journaled order of
+  the account, with `source: {"kind": "model", "id": "<deployment_id>"}` and
+  the decision's `client_order_id`.
+- **Cursors.** A cursor is `d1.<n>` for deployments and
+  `x2.<deployment_id>.<n>` for decisions: a keyset, so entries added meanwhile
+  cause no repeats or gaps. Decision cursors are tied to their deployment.
+  A cursor from another deployment or list is `400 invalid_cursor`. Clients
+  treat cursors as opaque and return them unchanged.
 
 ## Current limitations
 
@@ -1579,3 +1821,7 @@ These are intentionally not implemented in this slice:
   fills and events page forward only.
 - The top-of-book simulator's assumptions above make simulated PnL optimistic
   or pessimistic in ways not yet measured.
+- Model deployments are limited as
+  [model-deployments.md](model-deployments.md#limitations) describes: one
+  instrument, at most one share, market IOC orders, and run counters in
+  memory only.
