@@ -1161,7 +1161,78 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
     - **Tests.** They cover PostgreSQL migration and recovery; failpoints for uncertain commits, lost connections, failed commits, Stop during a submission, inference failures, staleness, halts, restarts with old observations, duplicate controls, and shutdown; Alpaca fake-transport reconnection; and browser accessibility.
     - **Paced-replay proof.** A paced 10x replay traded real paper orders. An independent check against the recording confirmed every input, fill, and the PnL to the cent.
 
-    Measured limitation: under a fast replay, orders wait for the market-event gate, so the realized signal-to-execution delay (median 0.4–1.1 s of market time at 10x) far exceeds the configured latency, and a few signals expire. A fairer gate or matching outside it is next. Several things remain: multi-share and multi-instrument deployments, limit orders, durable run counters, a real Alpaca smoke run of a deployment, and authentication.
+    - **Visibility.** The deployment card now says what a deployment is doing,
+      separately from what it last decided ([ADR 0019](docs/decisions/0019-deployment-observability.md)).
+      The server derives one condition by precedence: lifecycle, source,
+      quote, pending order, then latest candidate. It uses a bounded,
+      process-local runner snapshot and read-time market state, with no
+      database work on the trading path. Decisions report booked fills and
+      exact market-clock durations, which are unavailable with a reason
+      rather than zero. The UI keeps market, server wall, and work clocks
+      apart.
+    - **Live validation.** Fake-transport tests cover connecting, a reconnect
+      while pending, silence, a crossed book, the kill switch, and restart.
+      An opt-in validation tool runs a read-only database preflight (it
+      catches a version-5 database missing the deferred guard), a bounded
+      live session, and an independent audit. On 2026-10-04 (a Sunday) the
+      real IEX check reached the handshake only. On 2026-10-05, a separate
+      market-hours run proved 23 live decisions, five paper orders and
+      fills, and independently reconciled accounting. A separate no-trade
+      deployment proved explicit Stop and crash recovery without automatic
+      resume. Browser controls and live outcomes passed at desktop/mobile
+      widths. This does not establish model skill; this run had zero fees.
+      Live triggering inputs were not independently re-derived, and a real
+      disconnect or pending-live-order crash was not exercised.
+    - **Durable live-stream continuity (ADR 0020), code-reviewed and
+      fresh-account live-verified; awaiting milestone acceptance.** Process restart reset the Alpaca
+      ingest counter while keeping the stream ID: a fresh quote with
+      sequence 70 was refused by an account whose execution quote had
+      sequence 1087 (`incompatible_market_timeline`).
+      - **Mechanism.** A live stream's sequences now come from blocks
+        reserved in `live_stream_sequences` (migration 006), under an
+        exclusive writer lease that expires in the database's clock. A new
+        run's jump is declared only while the market state is suspended.
+      - **Revised after Codex's review (2026-10-06).** The first version's
+        "one publisher at a time" rested on a local check before apply,
+        which is not a fence. Now:
+        - order, fill, and decision commits are fenced against the stream's
+          current writer generation (migration 007), under a share lock
+          that a takeover waits for; valuation checks the current generation
+          before using its quote;
+        - frames are bound to their publication run, which a loss, lapse,
+          or reacquisition ends;
+        - quotes stop being executable at a lapse without traffic, and a
+          late renewal does not revive them;
+        - `verify-continuity` judges one snapshot, fails on the first
+          violation, and uses the server's `first_ingest_sequence` as
+          proof, or says it sampled.
+      - **Unchanged.** Lineage, freshness, watermark, risk, and accounting
+        guards are not weakened, and replay identities do not change.
+        Legacy history continues only after an explicit
+        `--adopt-live-stream-history`.
+      - **Proven with the fake transport and real PostgreSQL:**
+        - clean and crash restarts with one fresh quote;
+        - manual, GTC, and restarted-deployment orders;
+        - pending-decision crash recovery;
+        - two instruments, and stream isolation;
+        - reconnects, staleness, and forged older or altered quotes;
+        - ownership conflict, outage, and exhaustion at 2^64 − 1;
+        - legacy adoption.
+      - **Real IEX verification (2026-10-07):** a fresh one-share paper
+        position was valued and sold after both clean and crash restarts.
+        The server's first accepted sequence followed the durable baseline,
+        and `verify-continuity` judged the observed fresh quote. Four fills
+        independently reconciled to cash/equity 9999.82 and PnL −0.18,
+        with zero fees. Duplicate submission did not change history; a
+        majority-model control inferred Hold and stayed stopped after crash
+        recovery. The development-data fingerprint was unchanged. Test
+        storage is now persistent, with a successfully restored backup.
+      - **Evidence boundaries:** the earlier tmpfs evidence databases were
+        lost in Docker recovery, so this does not rerun the exact legacy
+        adoption account. A real network disconnect and pending-live-order
+        crash remain unexercised on real data. No broker order was sent.
+
+    Measured limitation: under a fast replay, orders wait for the market-event gate, so the realized signal-to-execution delay (median 0.4–1.1 s of market time at 10x) far exceeds the configured latency, and a few signals expire. Durable live-stream continuity is code-reviewed and fresh-account live-verified, pending milestone acceptance; a fairer gate or matching outside it follows. Several things remain: multi-share and multi-instrument deployments, limit orders, durable run counters, broader real-live reconnect/pending-order acceptance, and authentication.
 
 The repository currently implements type-specific fixed-point price, money,
 and quantity values; provider-independent market-event types; structured

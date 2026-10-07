@@ -10,6 +10,7 @@
 #include "chronos/paper_trading/paper_trading_service.hpp"
 #include "alpaca_test_support.hpp"
 #include "deployment_test_support.hpp"
+#include "live_sequence_test_support.hpp"
 #include "market_data_test_support.hpp"
 #include "paper_trading_test_support.hpp"
 #include "postgres_test_support.hpp"
@@ -142,6 +143,8 @@ public:
                   .model_load_timeout = 1'000ms,
                   .inference_timeout = 200ms,
                   .idle_wake = 5ms,
+                  // As the server reads its own source.
+                  .source_status = [this] { return source_->status(); },
               }
           ) {
         service_.set_trading_status_view(&hub_);
@@ -153,6 +156,7 @@ public:
             fake_credentials(),
             aapl_and_spy(),
             feed_,
+            sequences_.sequences(),
             clock_,
             receive_clock_,
             [](MonotonicClock::duration bound) { return bound; },
@@ -229,6 +233,20 @@ public:
             .state.quantity(InstrumentId("AAPL"));
     }
 
+    chronos::paper_trading::DeploymentCondition condition() {
+        auto found = manager_.get("live-1");
+        REQUIRE(std::holds_alternative<DeploymentStatus>(found));
+        return std::get<DeploymentStatus>(found).condition;
+    }
+
+    DeploymentStatus status() {
+        auto found = manager_.get("live-1");
+        REQUIRE(std::holds_alternative<DeploymentStatus>(found));
+        return std::get<DeploymentStatus>(std::move(found));
+    }
+
+    DeploymentManager& manager() { return manager_; }
+    PaperTradingService& service() { return service_; }
     FakeLink& link() { return *first_link_; }
     FakeTransport& transport() { return *transport_; }
     ManualClock& clock() { return clock_; }
@@ -237,7 +255,11 @@ public:
 
 private:
     std::shared_ptr<FakeModel> model_;
-    ManualClock clock_;
+    // Held, as in the live source's own tests: a wait blocks until the
+    // test advances the clock, so a state such as Reconnecting lasts until
+    // the test moves on. In Advance mode the reconnect backoff returned at
+    // once, and the test could miss Reconnecting entirely.
+    ManualClock clock_{ManualClock::Mode::Hold};
     MonotonicUtcClock receive_clock_;
     chronos::MarketState market_;
     MarketDataNotifier notifier_;
@@ -248,6 +270,7 @@ private:
     DeploymentManager manager_;
     FakeTransport* transport_{nullptr};
     std::shared_ptr<FakeLink> first_link_;
+    chronos::test::ReadyIngestSequences sequences_{std::string(kStream)};
     std::unique_ptr<AlpacaLiveSource> source_;
 };
 
@@ -315,6 +338,117 @@ void test_silence_expires_a_pending_signal() {
     REQUIRE(live.position() == Quantity::parse("0"));
 }
 
+
+// What the deployment says it is doing tracks the live source, not its
+// latest outcome: connecting, waiting for a first or fresh quote,
+// reconnecting while an order is pending, stale in silence, suspect on a
+// crossed book, and stopped above all.
+void test_the_condition_follows_the_live_source() {
+    const ScratchSchema schema;
+    LiveDeployment live(schema);
+    live.start();
+    REQUIRE(eventually([&] { return live.condition().code == "source_connecting"; }));
+    live.go_live(live.link());
+    REQUIRE(live.condition().code == "quote_unavailable");
+    REQUIRE(live.condition().reason == std::optional<std::string>("no_top_of_book"));
+
+    live.quote(live.link(), "227.36");
+    REQUIRE(eventually([&] {
+        const auto found = live.condition();
+        return found.code == "order_pending" && found.reason == std::optional<std::string>("awaiting_latency");
+    }));
+    // The drop outranks the pending order's own wait.
+    live.link().close();
+    REQUIRE(eventually([&] { return live.condition().code == "source_reconnecting"; }));
+    REQUIRE(live.status().market->quote.unavailable_reason == std::optional<std::string>("source_unavailable"));
+    REQUIRE(live.clock().await_waits(1));
+    auto second = live.transport().accept();
+    live.clock().advance_to(live.clock().now() + 1s);
+    live.go_live(*second);
+    REQUIRE(live.condition().code == "quote_unavailable");
+    REQUIRE(live.condition().reason == std::optional<std::string>("awaiting_fresh_quote"));
+    REQUIRE(live.counters().orders_recorded == 0);
+
+    // The fresh quote, and only it, executes the order.
+    live.quote(*second, "227.50", 10ms);
+    REQUIRE(eventually([&] { return live.counters().orders_recorded == 1; }));
+    REQUIRE(live.decisions().front().execution_ingest_sequence == std::optional<std::uint64_t>(1));
+    // The fresh quote is a candidate too: skipped while its order was
+    // pending, or decided on after. Either way it becomes the latest.
+    REQUIRE(eventually([&] {
+        const auto activity = live.status().activity;
+        return activity && activity->last_candidate &&
+            activity->last_candidate->ingest_sequence == std::optional<std::uint64_t>(1);
+    }));
+    REQUIRE(live.condition().code == "watching");
+
+    // Silence ages the quote; nothing claims the market is closed.
+    REQUIRE(second->await_drained());
+    live.clock().advance_to(live.clock().now() + 2s);
+    second->push_timeout();
+    REQUIRE(second->await_drained());
+    REQUIRE(live.condition().code == "quote_stale");
+    REQUIRE(live.status().market->quote.age_ns == std::optional<std::int64_t>(2'000'000'000));
+
+    // A crossed book is suspect: no prediction is made from it.
+    const std::uint64_t predictions = live.counters().predictions;
+    live.quote(*second, "227.20");
+    REQUIRE(eventually([&] {
+        const auto counted = live.counters().skipped;
+        return counted.contains("inputs_unavailable:suspect_quote");
+    }));
+    REQUIRE(live.condition().code == "quote_suspect");
+    REQUIRE(live.counters().predictions == predictions);
+
+    // Stopped outranks everything, a dropped source included.
+    static_cast<void>(live.manager().stop("live-1"));
+    second->close();
+    REQUIRE(eventually([&] { return live.source().status().state == MarketDataSourceState::Reconnecting; }));
+    REQUIRE(live.condition().code == "stopped");
+    REQUIRE(live.condition().reason == std::optional<std::string>("stop_requested"));
+}
+
+// The kill switch, ownership, and restart on the live source: no order
+// after the switch, none by hand, and none after a restart until started.
+void test_the_kill_switch_ownership_and_restart_hold_on_the_live_source() {
+    const ScratchSchema schema;
+    {
+        LiveDeployment live(schema);
+        live.start();
+        live.go_live(live.link());
+        live.quote(live.link(), "227.36");
+        REQUIRE(eventually([&] { return live.counters().order_decisions == 1; }));
+        auto manual = chronos::test::order_request("live-account", "manual-1", chronos::Side::Buy, "1");
+        const auto refused = live.service().submit_order(manual);
+        REQUIRE(std::get<chronos::paper_trading::PaperTradingError>(refused).code ==
+            chronos::paper_trading::PaperTradingErrorCode::AccountOwnedByDeployment);
+        REQUIRE(std::holds_alternative<std::vector<DeploymentStatus>>(live.manager().kill_switch()));
+        REQUIRE(live.condition().code == "stopped");
+        REQUIRE(live.condition().reason == std::optional<std::string>("kill_switch"));
+        REQUIRE(live.decisions().front().resolution == std::optional<std::string>("kill_switch"));
+        // An eligible quote after the switch trades nothing.
+        live.quote(live.link(), "227.37", 60ms);
+        REQUIRE(live.link().await_drained());
+        REQUIRE(live.position() == Quantity::parse("0"));
+    }
+    // A crash leaves it recorded as running.
+    chronos::test::PostgresTestConnection(schema.connection()).run_script(
+        "UPDATE model_deployments SET state = 'running', state_reason = 'started'"
+    );
+    LiveDeployment restarted(schema);
+    restarted.manager().recover();
+    const auto status = restarted.status();
+    REQUIRE(status.condition.code == "stopped");
+    REQUIRE(status.condition.reason == std::optional<std::string>("server_restarted"));
+    REQUIRE(!status.activity.has_value());
+    restarted.go_live(restarted.link());
+    restarted.quote(restarted.link(), "227.36");
+    REQUIRE(restarted.link().await_drained());
+    REQUIRE(restarted.model().requests.load() == 0);
+    REQUIRE(restarted.decisions().size() == 1);
+    REQUIRE(restarted.position() == Quantity::parse("0"));
+}
+
 }  // namespace
 
 int main() {
@@ -328,5 +462,10 @@ int main() {
         {"a live signal orders on a later quote after its latency", test_a_live_signal_orders_on_a_later_quote_after_its_latency},
         {"a reconnect never fills a quote from before the gap", test_a_reconnect_never_fills_a_quote_from_before_the_gap},
         {"silence expires a pending signal", test_silence_expires_a_pending_signal},
+        {"the condition follows the live source", test_the_condition_follows_the_live_source},
+        {
+            "the kill switch, ownership, and restart hold on the live source",
+            test_the_kill_switch_ownership_and_restart_hold_on_the_live_source,
+        },
     });
 }

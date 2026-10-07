@@ -313,3 +313,5 @@ market IOC.
   deployment. The second's account insert waits for the first's, then
   conflicts. It re-reads the deployment in a fresh snapshot, and returns the
   existing deployment rather than `account_exists`.
+- **Visibility.** What a deployment is doing, and how long its orders took,
+  is described in [ADR 0019](0019-deployment-observability.md).

@@ -107,6 +107,17 @@ MarketDataStreamValidationResult MarketDataStreamValidator::accept(
     return MarketDataStreamAcceptance{.ingest_sequence = actual_sequence};
 }
 
+bool MarketDataStreamValidator::continue_at(
+    std::uint64_t next_ingest_sequence
+) noexcept {
+    if (!next_expected_ingest_sequence_ ||
+        next_ingest_sequence < *next_expected_ingest_sequence_) {
+        return false;
+    }
+    next_expected_ingest_sequence_ = next_ingest_sequence;
+    return true;
+}
+
 void MarketDataStreamValidator::reset(
     std::uint64_t next_expected_ingest_sequence
 ) noexcept {

@@ -1,8 +1,19 @@
-import { useId, useState } from 'react';
+import { Fragment, useId, useState } from 'react';
+import type { ReactNode } from 'react';
 
-import type { Decision, Deployment, DeploymentState } from '../../api/deployments';
+import type { Condition, Decision, Deployment, DeploymentState, RunCounters } from '../../api/deployments';
 import { isUncertainDeploymentControl } from '../../api/deployments';
 import { ChronosApiError } from '../../api/errors';
+import type { Timestamp } from '../../api/schemas';
+import {
+  decisionIntent,
+  decisionOutcome,
+  durationText,
+  explainCondition,
+  microsecondsAsMilliseconds,
+  outcomeCode,
+  policyReasonText,
+} from '../../presentation/deployments';
 import { MODEL_LABEL, shortId } from '../../presentation/research';
 import type { Tone } from '../../presentation/vocabulary';
 import {
@@ -48,13 +59,6 @@ const REASON: Readonly<Record<string, string>> = {
   runtime_error: 'An internal failure stopped it',
 };
 
-// Exact, from the integer string: 1234 µs is "1.234".
-function microsecondsAsMilliseconds(microseconds: string): string {
-  const digits = microseconds.padStart(4, '0');
-  const fraction = digits.slice(-3).replace(/0+$/, '');
-  return `${digits.slice(0, -3)}${fraction === '' ? '' : `.${fraction}`}`;
-}
-
 function failureText(error: unknown): string {
   if (error instanceof ChronosApiError) {
     const failure = error.failure;
@@ -66,8 +70,33 @@ function failureText(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown failure';
 }
 
-function DecisionRows({ deployment }: { readonly deployment: Deployment }) {
-  const decisions = useDecisions(deployment.deployment_id, deployment.active);
+// A machine code that may wrap after its underscores, so a narrow column
+// wraps it rather than clipping it. Its text is unchanged.
+function WrappingCode({ code }: { readonly code: string }) {
+  return code.split('_').map((part, index) => (
+    <Fragment key={index}>
+      {index > 0 && (
+        <>
+          _<wbr />
+        </>
+      )}
+      {part}
+    </Fragment>
+  ));
+}
+
+// Which run a saved decision belongs to, when it is not the current one.
+function runNote(decision: Decision, deployment: Deployment): string {
+  return decision.run_generation === deployment.run_generation ? '' : ` (run ${decision.run_generation}, an earlier run)`;
+}
+
+function DecisionRows({
+  deployment,
+  decisions,
+}: {
+  readonly deployment: Deployment;
+  readonly decisions: ReturnType<typeof useDecisions>;
+}) {
   if (decisions.status === 'pending') {
     return <p role="status">Loading decisions…</p>;
   }
@@ -76,49 +105,198 @@ function DecisionRows({ deployment }: { readonly deployment: Deployment }) {
   }
   const rows: readonly Decision[] = decisions.data.decisions.slice(0, 10);
   if (rows.length === 0) {
-    return <p className={historyStyles.empty}>No decisions yet.</p>;
+    return <p className={historyStyles.empty}>No decisions saved yet.</p>;
   }
   return (
-    <div className={historyStyles.scroll}>
-      <table className={historyStyles.table}>
-        <caption className="visually-hidden">Latest decisions of {deployment.deployment_id}, newest first</caption>
-        <thead>
-          <tr>
-            <th scope="col">Observation (UTC)</th>
-            <th scope="col">Prediction</th>
-            <th scope="col">Decision</th>
-            <th scope="col">Outcome</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((decision) => (
-            <tr key={decision.decision_sequence}>
-              <td data-label="Observation (UTC)">
-                <MarketTime value={decision.observation.received_at} stacked />
-              </td>
-              <td data-label="Prediction">
-                <div>
-                  {decision.prediction.class}
-                  <span className={styles.reasonCode}>{decision.prediction.confidence}</span>
-                </div>
-              </td>
-              <td data-label="Decision">
-                <div>
-                  {decision.order === null ? 'Hold' : `${decision.order.side} ${decision.order.quantity}`}
-                  <span className={styles.reasonCode}>{decision.policy_reason}</span>
-                </div>
-              </td>
-              <td className={historyStyles.detail} data-label="Outcome">
-                <div>
-                  {decision.state}
-                  {decision.resolution !== null && <span className={styles.reasonCode}>{decision.resolution}</span>}
-                </div>
-              </td>
+    <>
+      {decisions.isRefetchError && (
+        <p className={styles.note} role="status">
+          These decisions may be out of date: the latest refresh failed.
+        </p>
+      )}
+      {/* Focusable, as the history tables are, so a keyboard can scroll it. */}
+      <div
+        className={historyStyles.scroll}
+        role="region"
+        aria-label={`Latest saved decisions of ${deployment.deployment_id}`}
+        tabIndex={0}
+      >
+        <table className={historyStyles.table}>
+          <caption className="visually-hidden">Latest saved decisions of {deployment.deployment_id}, newest first</caption>
+          <thead>
+            <tr>
+              <th scope="col">Observation (UTC, market)</th>
+              <th scope="col">Prediction</th>
+              <th scope="col">Intent</th>
+              <th scope="col">Outcome</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {rows.map((decision) => {
+              const outcome = decisionOutcome(decision);
+              const code = outcomeCode(decision);
+              return (
+                <tr key={decision.decision_sequence}>
+                  <td data-label="Observation (UTC, market)">
+                    <MarketTime value={decision.observation.received_at} stacked />
+                    {runNote(decision, deployment) !== '' && (
+                      <span className={styles.reasonCode}>{`run ${decision.run_generation}`}</span>
+                    )}
+                  </td>
+                  <td data-label="Prediction">
+                    <div>
+                      {decision.prediction.class}
+                      <span className={styles.reasonCode}>{`confidence ${decision.prediction.confidence}`}</span>
+                    </div>
+                  </td>
+                  <td data-label="Intent">
+                    <div>
+                      {decisionIntent(decision)}
+                      <span className={styles.reasonCode}>
+                        <WrappingCode code={decision.policy_reason} />
+                      </span>
+                    </div>
+                  </td>
+                  <td className={styles.decisionOutcome} data-label="Outcome">
+                    <div>
+                      <Badge tone={outcome.tone}>{outcome.label}</Badge>
+                      {outcome.detail !== null && ` ${outcome.detail}`}
+                      {code !== null && (
+                        <span className={styles.reasonCode}>
+                          <WrappingCode code={code} />
+                        </span>
+                      )}
+                      {decision.fill != null && decision.timing != null && (
+                        <span className={styles.reasonCode}>
+                          {`+${durationText(decision.timing.signal_to_fill)} after the signal (market)`}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// The times a condition names, each with its clock.
+function ConditionTimes({ condition }: { readonly condition: Condition }) {
+  const times: { readonly label: string; readonly value: Timestamp }[] = [];
+  const add = (label: string, value: Timestamp | null) => {
+    if (value !== null) times.push({ label, value });
+  };
+  add('training cutoff', condition.training_cutoff);
+  add('latest quote received', condition.observation_received_at);
+  add('next eligible quote from', condition.next_eligible_received_at);
+  add('not before', condition.not_before_received_at);
+  add('expires', condition.expires_at);
+  add('as of (market clock)', condition.observed_at_market);
+  if (times.length === 0 && condition.observed_at_wall === null) {
+    return null;
+  }
+  return (
+    <span className={styles.choiceDetail}>
+      {times.map((time) => (
+        <span key={time.label}>
+          {` ${time.label} `}
+          <MarketTime value={time.value} />
+        </span>
+      ))}
+      {condition.observed_at_wall !== null && (
+        <span>
+          {' · server time '}
+          <MarketTime value={condition.observed_at_wall} />
+        </span>
+      )}
+    </span>
+  );
+}
+
+function NowLine({ deployment }: { readonly deployment: Deployment }) {
+  const condition = deployment.condition;
+  if (condition === null) {
+    return <span>Unknown: this server does not report what the deployment is doing.</span>;
+  }
+  const explained = explainCondition(condition, deployment.model.instrument);
+  return (
+    <span>
+      <Badge tone={explained.tone}>{explained.label}</Badge> {explained.sentence}{' '}
+      <span className={styles.reasonCode}>{condition.reason === null ? condition.code : `${condition.code}: ${condition.reason}`}</span>
+      <ConditionTimes condition={condition} />
+    </span>
+  );
+}
+
+// Which observation a fact describes: the saved decisions and the status
+// refresh separately, so one can be a refresh ahead of the other.
+function ObservedAt({ decision }: { readonly decision: Decision }) {
+  return (
+    <span className={styles.reasonCode}>
+      observation received <MarketTime value={decision.observation.received_at} /> (market clock)
+    </span>
+  );
+}
+
+function latestPrediction(decisions: ReturnType<typeof useDecisions>, deployment: Deployment): ReactNode {
+  if (decisions.data === undefined) {
+    return decisions.status === 'pending' ? 'Loading…' : 'Unavailable: the saved decisions could not be read';
+  }
+  const latest = decisions.data.decisions[0];
+  if (latest === undefined) {
+    return 'None saved yet';
+  }
+  return (
+    <>
+      {`${latest.prediction.class}, model confidence ${latest.prediction.confidence} (not a probability of profit) · ${decisionIntent(latest)}: ${policyReasonText(latest.policy_reason)} · ${decisionOutcome(latest).label}${runNote(latest, deployment)}`}
+      <ObservedAt decision={latest} />
+    </>
+  );
+}
+
+function latestTiming(decisions: ReturnType<typeof useDecisions>): ReactNode {
+  const latest = decisions.data?.decisions.find((decision) => decision.order !== null);
+  if (latest?.timing == null) {
+    return 'No order decision saved yet';
+  }
+  const timing = latest.timing;
+  return (
+    <>
+      {`signal to decision ${durationText(timing.signal_to_decision)} · to decision resolved ${durationText(timing.signal_to_resolution)} · to fill ${durationText(timing.signal_to_fill)} · execution quote received ${durationText(timing.execution_quote_offset)} after the signal`}
+      <ObservedAt decision={latest} />
+    </>
+  );
+}
+
+function RunCounts({ run, generation }: { readonly run: RunCounters; readonly generation: string }) {
+  const entries = (counts: Record<string, string>) => Object.entries(counts).sort(([left], [right]) => left.localeCompare(right));
+  const skipped = entries(run.skipped);
+  const waits = entries(run.waits);
+  return (
+    <details className={styles.details}>
+      <summary>{`Counts by reason (run ${generation}, this server process)`}</summary>
+      <p className={styles.note}>
+        Cumulative since this run started. They say how often each reason occurred, not what is happening now.
+      </p>
+      <ul className={styles.list}>
+        <li>{`${run.candidates} quotes taken, ${run.superseded} replaced before they were taken`}</li>
+        {skipped.map(([reason, count]) => (
+          <li key={`skipped-${reason}`}>
+            {`Skipped ${count}: `}
+            <Code>{reason}</Code>
+          </li>
+        ))}
+        {waits.map(([reason, count]) => (
+          <li key={`wait-${reason}`}>
+            {`Order waited ${count}: `}
+            <Code>{reason}</Code>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
@@ -139,6 +317,7 @@ function DeploymentCard({
   const stopUnknown = isUncertainDeploymentControl(stop.error);
   const canStart = (deployment.state === 'stopped' || deployment.state === 'faulted') && !startUnknown && !stopUnknown;
   const run = deployment.run;
+  const decisions = useDecisions(deployment.deployment_id, deployment.active);
   return (
     <article className={styles.section} aria-label={`Deployment ${deployment.deployment_id}`}>
       <div className={styles.inline}>
@@ -148,6 +327,8 @@ function DeploymentCard({
       </div>
       <Facts
         facts={[
+          { label: 'Now', value: <NowLine deployment={deployment} /> },
+          { label: 'Latest saved prediction', value: latestPrediction(decisions, deployment) },
           {
             label: 'Paper account',
             value:
@@ -175,22 +356,23 @@ function DeploymentCard({
             value: `Threshold ${deployment.policy.threshold} · target ${deployment.policy.target_quantity}`,
           },
           {
-            label: 'Timing',
-            value: `${deployment.timing.latency_ms} ms latency · ${deployment.timing.decision_interval_ms} ms between decisions · ${deployment.timing.max_signal_age_ms} ms max signal age`,
+            label: 'Configured timing (market clock)',
+            value: `at least ${deployment.timing.latency_ms} ms from signal to order (a minimum, not a promise) · ${deployment.timing.decision_interval_ms} ms between decisions · signals expire after ${deployment.timing.max_signal_age_ms} ms`,
           },
+          { label: 'Latest order timing (market clock)', value: latestTiming(decisions) },
           {
             label: 'This run',
             value:
               run === null
-                ? `Run ${deployment.run_generation}`
+                ? `Run ${deployment.run_generation}: no counts in this server process`
                 : `Run ${deployment.run_generation}: ${run.predictions} predictions, ${run.order_decisions} order decisions, ${run.orders_recorded} orders, ${run.abandoned} abandoned, ${run.superseded} superseded`,
           },
           ...(run === null
             ? []
             : [
                 {
-                  label: 'Observed timing (wall clock)',
-                  value: `Inference up to ${microsecondsAsMilliseconds(run.max_inference_us)} ms · order path up to ${microsecondsAsMilliseconds(run.max_submission_us)} ms`,
+                  label: 'Work time (wall clock, this server process)',
+                  value: `inference up to ${microsecondsAsMilliseconds(run.max_inference_us)} ms · trusted order path up to ${microsecondsAsMilliseconds(run.max_submission_us)} ms, including waits for the market`,
                 },
               ]),
           {
@@ -200,6 +382,7 @@ function DeploymentCard({
           },
         ]}
       />
+      {run !== null && <RunCounts run={run} generation={deployment.run_generation} />}
       {run?.last_error != null && (
         <Alert tone="caution" title="Latest problem">
           <p>{run.last_error}</p>
@@ -260,7 +443,7 @@ function DeploymentCard({
           <p>{failureText(stop.error ?? start.error)}</p>
         </Alert>
       )}
-      <DecisionRows deployment={deployment} />
+      <DecisionRows deployment={deployment} decisions={decisions} />
     </article>
   );
 }
@@ -335,6 +518,13 @@ export function DeploymentList({ onOpenAccount }: { readonly onOpenAccount?: ((a
         </Alert>
       ) : (
         <>
+          {deployments.isRefetchError && (
+            <Alert tone="caution" title="This status may be out of date">
+              <p>
+                {`The latest refresh failed (${failureText(deployments.error)}). What is shown was read at ${new Date(deployments.dataUpdatedAt).toLocaleTimeString()} on this browser’s clock.`}
+              </p>
+            </Alert>
+          )}
           {!deployments.data.enabled && (
             <Alert tone="info" title="Model deployments are disabled on this server">
               <p>

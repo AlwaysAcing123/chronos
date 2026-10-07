@@ -37,7 +37,7 @@ using AlpacaNormalizationResult = std::variant<
 //   "S"   -> instrument, which must be subscribed
 //   "t"   -> event_timestamp (RFC 3339, nanoseconds)
 //   local receipt time, supplied by the caller -> receive_timestamp
-//   adapter-assigned contiguous sequence -> ingest_sequence
+//   contiguous sequences from the stream's issuer -> ingest_sequence
 //   venue "IEX", venue_sequence null: Alpaca publishes no venue sequence,
 //   so gaps cannot be detected
 //   quality: SourceSpecific always, marking single-venue IEX data; plus
@@ -54,25 +54,18 @@ using AlpacaNormalizationResult = std::variant<
 // exchange code.
 class AlpacaNormalizer final {
 public:
-    AlpacaNormalizer(
-        MarketDataStreamId stream,
-        AlpacaSubscription subscription,
-        std::uint64_t initial_ingest_sequence = 0
-    );
+    AlpacaNormalizer(MarketDataStreamId stream, AlpacaSubscription subscription);
 
     // Normalizes one frame's data messages in order, all received at
-    // `receive_timestamp`. Either every message becomes an event and the
-    // ingest sequence advances by their number, or none does and the
-    // sequence is unchanged.
+    // `receive_timestamp`, numbering them contiguously from
+    // `first_ingest_sequence`, which the stream's issuer supplies (ADR 0020).
+    // Either every message becomes an event or none does. Numbering past
+    // the last ingest sequence is refused, never wrapped.
     [[nodiscard]] AlpacaNormalizationResult normalize(
         const std::vector<AlpacaDataMessage>& messages,
-        Timestamp receive_timestamp
-    );
-
-    // The sequence of the next event, or nullopt once exhausted.
-    [[nodiscard]] std::optional<std::uint64_t> next_ingest_sequence() const noexcept {
-        return next_ingest_sequence_;
-    }
+        Timestamp receive_timestamp,
+        std::uint64_t first_ingest_sequence
+    ) const;
 
     [[nodiscard]] const AlpacaSubscription& subscription() const noexcept {
         return subscription_;
@@ -81,7 +74,6 @@ public:
 private:
     MarketDataStreamId stream_;
     AlpacaSubscription subscription_;
-    std::optional<std::uint64_t> next_ingest_sequence_;
 };
 
 }  // namespace chronos::alpaca_adapter

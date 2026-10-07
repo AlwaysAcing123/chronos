@@ -58,7 +58,13 @@ test('deploys a model to its own paper account, starts it only when confirmed, s
   await card.getByLabel('Let this model place simulated orders in model-spy').check();
   await start.click();
   await expect(card.getByText('Running', { exact: true })).toBeVisible();
-  await expect(card.getByText('buy 1')).toBeVisible();
+  await expect(card.getByRole('cell', { name: /^Buy 1/ })).toBeVisible();
+  await expect(card.getByText('Its latest prediction led to an order; it waits for the next quote.')).toBeVisible();
+  await expect(card.getByRole('cell', { name: /Filled 1 @ 768\.94/ })).toBeVisible();
+  // The counts open from the keyboard and say they are cumulative.
+  await card.getByText('Counts by reason (run 1, this server process)').focus();
+  await page.keyboard.press('Enter');
+  await expect(card.getByText(/not what is happening now/)).toBeVisible();
   await expectNoAccessibilityViolations(page);
   await expectNoHorizontalOverflow(page);
   await capture(page, testInfo, '3-running');
@@ -71,6 +77,7 @@ test('deploys a model to its own paper account, starts it only when confirmed, s
 
   await card.getByRole('button', { name: 'Stop' }).click();
   await expect(card.getByText('Stopped on request')).toBeVisible();
+  await expect(card.getByText('Not trading. It trades again only if started.')).toBeVisible();
 
   // A reload finds it as it was.
   await page.reload();

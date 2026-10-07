@@ -77,6 +77,13 @@ public:
         return stream_validator_.last_accepted_ingest_sequence();
     }
 
+    // The stream continues at `next_ingest_sequence`; see
+    // MarketDataStreamValidator::continue_at. The clock and the view are
+    // unchanged.
+    [[nodiscard]] bool continue_at(std::uint64_t next_ingest_sequence) noexcept {
+        return stream_validator_.continue_at(next_ingest_sequence);
+    }
+
     void reset(std::uint64_t next_expected_ingest_sequence = 0) noexcept;
 
 private:

@@ -252,6 +252,38 @@ void test_sequence_maximum_does_not_wrap() {
     REQUIRE(!validator.next_expected_ingest_sequence().has_value());
 }
 
+void test_a_declared_continuation_is_forward_only_and_keeps_gap_checks() {
+    constexpr std::uint64_t maximum =
+        std::numeric_limits<std::uint64_t>::max();
+    MarketDataStreamValidator validator(MarketDataStreamId("stream"));
+    require_acceptance(validator.accept(validated_trade("stream", 0)));
+
+    // Behind the next expected sequence: refused, nothing changes.
+    REQUIRE(!validator.continue_at(0));
+    REQUIRE(validator.next_expected_ingest_sequence() == 1);
+    REQUIRE(validator.continue_at(1));
+    REQUIRE(validator.continue_at(1'048'576));
+    REQUIRE(validator.next_expected_ingest_sequence() == 1'048'576);
+    REQUIRE(validator.last_accepted_ingest_sequence() == 0);
+
+    // The declared sequence is accepted; an undeclared gap after it is not.
+    require_error(
+        validator.accept(validated_trade("stream", 1)),
+        MarketDataStreamValidationErrorCode::IngestSequenceMovedBackward
+    );
+    require_acceptance(validator.accept(validated_trade("stream", 1'048'576)));
+    require_error(
+        validator.accept(validated_trade("stream", 1'048'578)),
+        MarketDataStreamValidationErrorCode::IngestSequenceGap
+    );
+
+    // Up to the last sequence, and no further.
+    REQUIRE(validator.continue_at(maximum));
+    require_acceptance(validator.accept(validated_trade("stream", maximum)));
+    REQUIRE(!validator.continue_at(maximum));
+    REQUIRE(!validator.next_expected_ingest_sequence().has_value());
+}
+
 }  // namespace
 
 int main() {
@@ -283,5 +315,9 @@ int main() {
             test_nonzero_initial_boundary_rejects_older_sequence,
         },
         {"sequence maximum", test_sequence_maximum_does_not_wrap},
+        {
+            "declared continuation",
+            test_a_declared_continuation_is_forward_only_and_keeps_gap_checks,
+        },
     });
 }

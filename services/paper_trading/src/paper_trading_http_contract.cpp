@@ -542,17 +542,7 @@ std::string_view valuation_reason(PortfolioValuationErrorCode code) {
 }
 
 std::string_view market_state_reason(MarketStateUnavailableCode code) {
-    switch (code) {
-        case MarketStateUnavailableCode::StreamInterrupted:
-            return "stream_interrupted";
-        case MarketStateUnavailableCode::NoTopOfBook:
-            return "no_top_of_book";
-        case MarketStateUnavailableCode::SourceUnavailable:
-            return "source_unavailable";
-        case MarketStateUnavailableCode::AwaitingFreshQuote:
-            return "awaiting_fresh_quote";
-    }
-    throw std::logic_error("unknown market-state unavailability");
+    return market_state_unavailable_name(code);
 }
 
 // Why one position cannot be marked, in the same vocabulary as a whole
@@ -1207,6 +1197,9 @@ ResponseJson market_stream_json(const MarketStateStatus& market) {
     json["state"] = market.interruption ? "interrupted" : "accepting";
     json["last_ingest_sequence"] = market.last_ingest_sequence
         ? ResponseJson(std::to_string(*market.last_ingest_sequence))
+        : ResponseJson(nullptr);
+    json["first_ingest_sequence"] = market.first_ingest_sequence
+        ? ResponseJson(std::to_string(*market.first_ingest_sequence))
         : ResponseJson(nullptr);
     json["market_time"] = optional_timestamp(market.market_time);
     json["interruption"] = market.interruption

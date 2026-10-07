@@ -320,9 +320,45 @@ changes add a new file.
   It adds tables and journal triggers; existing accounts stay manual and
   untouched. See
   [ADR 0018](decisions/0018-model-paper-deployments.md).
+- `006_live_stream_sequences.sql`: durable live-stream sequences. Adds
+  `live_stream_sequences`, one row per live stream:
+  - the first ingest sequence never reserved, as `numeric(20, 0)`, up to
+    2^64 for an exhausted stream;
+  - the one server process's writer lease, with expiry in the database's
+    clock;
+  - and, for a stream continued after older history, the largest sequence
+    that history references.
+
+  It adds one table and rewrites no data; no row is created until a live
+  server first acquires a stream. Replays never use it. See
+  [ADR 0020](decisions/0020-restart-safe-live-stream-identity.md).
+- `007_live_stream_writer_fence.sql`: the live-stream writer fence. Adds to
+  `live_stream_sequences`:
+  - `writer_first_sequence`, the first sequence of the current writer's
+    generation, set when a server takes the stream and cleared when it
+    releases it;
+  - a constraint that a writer has a generation, only a writer has one, and
+    it never begins beyond what was reserved;
+  - a trigger that makes every change of writer begin its generation where
+    every earlier reservation ended.
+
+  Each transaction that records a live sequence (an order, fill, execution
+  state, model decision, or watermark) reads the stream's row `FOR SHARE`
+  and is refused unless its sequences belong to the current generation; a
+  valuation reads the same without a lock. A takeover, release, or
+  reservation updates the row, so it waits for those transactions. A refused
+  order answers 503 `market_data_unavailable` (`source_unavailable`) and
+  consumes no client order ID.
+
+  A stream that has a writer when 007 is applied gets a generation starting
+  at its `next_sequence`, so that writer records nothing more until it takes
+  the stream again. Apply 007 with every live server on the database
+  stopped: a server built before it cannot take or release a stream
+  afterwards. It rewrites no other data. See
+  [ADR 0020](decisions/0020-restart-safe-live-stream-identity.md).
 
 PostgreSQL's image runs the mounted files only when it initializes an empty
-volume, so a fresh volume gets 001 to 005 in order. An existing local
+volume, so a fresh volume gets 001 to 007 in order. An existing local
 volume needs each newer file applied once, in order.
 
 Sending a file on standard input avoids depending on the container's

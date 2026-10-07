@@ -65,12 +65,8 @@ AlpacaSubscription subscription(std::vector<std::string> symbols = {"AAPL", "SPY
     return std::get<AlpacaSubscription>(std::move(created));
 }
 
-AlpacaNormalizer normalizer(std::uint64_t first_sequence = 0) {
-    return AlpacaNormalizer(
-        MarketDataStreamId(std::string(kStream)),
-        subscription(),
-        first_sequence
-    );
+AlpacaNormalizer normalizer() {
+    return AlpacaNormalizer(MarketDataStreamId(std::string(kStream)), subscription());
 }
 
 AlpacaQuote quote(
@@ -111,19 +107,20 @@ Timestamp received(std::int64_t offset_nanoseconds = 200'000'000) {
 }
 
 std::vector<ValidatedMarketEvent> normalize_ok(
-    AlpacaNormalizer& normalizer,
+    const AlpacaNormalizer& normalizer,
     std::vector<AlpacaDataMessage> messages,
-    Timestamp at = received()
+    Timestamp at = received(),
+    std::uint64_t first_sequence = 0
 ) {
-    auto result = normalizer.normalize(messages, at);
+    auto result = normalizer.normalize(messages, at, first_sequence);
     if (const auto* error = std::get_if<AlpacaNormalizationError>(&result)) {
         throw chronos::test::TestFailure("unexpected normalization error: " + error->message);
     }
     return std::get<std::vector<ValidatedMarketEvent>>(std::move(result));
 }
 
-std::string normalize_error(AlpacaNormalizer& normalizer, AlpacaDataMessage message) {
-    auto result = normalizer.normalize({std::move(message)}, received());
+std::string normalize_error(const AlpacaNormalizer& normalizer, AlpacaDataMessage message) {
+    auto result = normalizer.normalize({std::move(message)}, received(), 0);
     REQUIRE(std::holds_alternative<AlpacaNormalizationError>(result));
     return std::get<AlpacaNormalizationError>(result).message;
 }
@@ -333,8 +330,8 @@ void test_rejects_malformed_and_out_of_range_timestamps() {
 // --- normalization ---------------------------------------------------------
 
 void test_maps_a_quote_exactly_to_top_of_book() {
-    AlpacaNormalizer normalizer = ::normalizer(41);
-    auto events = normalize_ok(normalizer, {quote("227.340000001", "300", "227.36", "100")});
+    const AlpacaNormalizer normalizer = ::normalizer();
+    auto events = normalize_ok(normalizer, {quote("227.340000001", "300", "227.36", "100")}, received(), 41);
     REQUIRE(events.size() == 1U);
     const TopOfBookEvent& book = top_of_book(events[0]);
     REQUIRE(book.header.instrument == InstrumentId("AAPL"));
@@ -351,7 +348,6 @@ void test_maps_a_quote_exactly_to_top_of_book() {
     REQUIRE(book.bid->quantity == Quantity::parse("300"));
     REQUIRE(book.ask->price == Price::parse("227.36"));
     REQUIRE(book.ask->quantity == Quantity::parse("100"));
-    REQUIRE(normalizer.next_ingest_sequence() == 42U);
 }
 
 void test_maps_a_trade_exactly() {
@@ -478,8 +474,8 @@ void test_requires_iex_lineage_and_subscribed_symbols() {
 }
 
 void test_frames_are_atomic_ordered_and_contiguous() {
-    AlpacaNormalizer normalizer = ::normalizer(10);
-    auto events = normalize_ok(normalizer, {quote(), trade(), quote("227.35")});
+    const AlpacaNormalizer normalizer = ::normalizer();
+    auto events = normalize_ok(normalizer, {quote(), trade(), quote("227.35")}, received(), 10);
     REQUIRE(events.size() == 3U);
     for (std::size_t index = 0; index < events.size(); ++index) {
         const auto& header = chronos::market_event_header(events[index].value());
@@ -489,31 +485,29 @@ void test_frames_are_atomic_ordered_and_contiguous() {
     REQUIRE(std::holds_alternative<TopOfBookEvent>(events[0].value()));
     REQUIRE(std::holds_alternative<TradeEvent>(events[1].value()));
     REQUIRE(top_of_book(events[2]).bid->price == Price::parse("227.35"));
-    REQUIRE(normalizer.next_ingest_sequence() == 13U);
 
-    // A rejected message consumes nothing, even after valid ones.
-    auto rejected = normalizer.normalize({quote(), trade("0")}, received());
+    // A rejected message yields no event, even after valid ones.
+    auto rejected = normalizer.normalize({quote(), trade("0")}, received(), 13);
     REQUIRE(std::holds_alternative<AlpacaNormalizationError>(rejected));
-    REQUIRE(normalizer.next_ingest_sequence() == 13U);
-    REQUIRE(normalize_ok(normalizer, {}).empty());
-    REQUIRE(normalizer.next_ingest_sequence() == 13U);
-    auto next = normalize_ok(normalizer, {trade()});
+    REQUIRE(normalize_ok(normalizer, {}, received(), 13).empty());
+    auto next = normalize_ok(normalizer, {trade()}, received(), 13);
     REQUIRE(chronos::market_event_header(next[0].value()).ingest_sequence == 13U);
 }
 
 void test_ingest_sequence_exhaustion() {
     constexpr std::uint64_t kLast = std::numeric_limits<std::uint64_t>::max();
-    AlpacaNormalizer two_left = ::normalizer(kLast - 1);
-    auto too_many = two_left.normalize({quote(), quote(), quote()}, received());
+    const AlpacaNormalizer normalizer = ::normalizer();
+    // Two sequences remain from kLast − 1; three messages cannot fit.
+    auto too_many = normalizer.normalize({quote(), quote(), quote()}, received(), kLast - 1);
     REQUIRE(std::holds_alternative<AlpacaNormalizationError>(too_many));
     REQUIRE(contains(std::get<AlpacaNormalizationError>(too_many).message, "exhaust"));
-    REQUIRE(two_left.next_ingest_sequence() == kLast - 1);
 
-    auto last_two = normalize_ok(two_left, {quote(), quote()});
+    auto last_two = normalize_ok(normalizer, {quote(), quote()}, received(), kLast - 1);
     REQUIRE(chronos::market_event_header(last_two[1].value()).ingest_sequence == kLast);
-    REQUIRE(!two_left.next_ingest_sequence().has_value());
-    auto exhausted = two_left.normalize({quote()}, received());
-    REQUIRE(std::holds_alternative<AlpacaNormalizationError>(exhausted));
+    auto last = normalize_ok(normalizer, {quote()}, received(), kLast);
+    REQUIRE(chronos::market_event_header(last[0].value()).ingest_sequence == kLast);
+    auto beyond = normalizer.normalize({quote(), quote()}, received(), kLast);
+    REQUIRE(std::holds_alternative<AlpacaNormalizationError>(beyond));
 }
 
 // --- subscription ----------------------------------------------------------

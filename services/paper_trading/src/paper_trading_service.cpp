@@ -147,6 +147,14 @@ PaperTradingError persistence_conflict(PaperPersistenceConflict conflict) {
                 "cancel_request_id",
                 std::move(conflict.message)
             );
+        case PaperPersistenceConflictCode::StaleLiveStreamWriter:
+            // This process no longer writes the live stream (ADR 0020):
+            // its quote is not current anywhere that matters. Nothing was
+            // recorded, so the client order ID is still unused.
+            return market_data_unavailable(MarketStateUnavailable{
+                .code = MarketStateUnavailableCode::SourceUnavailable,
+                .message = std::move(conflict.message),
+            });
     }
     throw std::logic_error("unknown paper persistence conflict");
 }
@@ -1223,6 +1231,25 @@ PaperPortfolioResult PaperTradingService::get_portfolio(
         );
         if (auto* failure = std::get_if<PortfolioValuationError>(&valuation)) {
             return portfolio_valuation_failure(std::move(*failure));
+        }
+        // The marks must be the live stream's current writer's (ADR 0020):
+        // a deposed process values nothing on quotes it published after a
+        // successor took the stream.
+        const auto& marks = std::get<PortfolioValuation>(valuation).marks;
+        if (!marks.empty()) {
+            const MarketDataStreamId& stream = marks.begin()->second.header.stream;
+            std::uint64_t first = marks.begin()->second.header.ingest_sequence;
+            std::uint64_t last = first;
+            for (const auto& [instrument, mark] : marks) {
+                first = std::min(first, mark.header.ingest_sequence);
+                last = std::max(last, mark.header.ingest_sequence);
+            }
+            if (auto stale = repository_->live_stream_writer_refusal(stream, first, last)) {
+                return market_data_unavailable(MarketStateUnavailable{
+                    .code = MarketStateUnavailableCode::SourceUnavailable,
+                    .message = std::move(*stale),
+                });
+            }
         }
         PaperAccountView view = account_view(*session);
         view.owning_deployment = repository_->account_owner(account_id);

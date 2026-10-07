@@ -116,6 +116,20 @@ struct NewDeploymentDecision {
     std::optional<Quantity> quantity;
 };
 
+// The booked fills of a decision's one order, summed exactly. Read only on
+// decision pages; a decision whose order booked nothing has none.
+struct DecisionFill {
+    std::int64_t count{0};
+    Quantity quantity;
+    Money notional;
+    Money fees;
+    // Market time, as the fills record it.
+    Timestamp first_filled_at;
+    Timestamp last_filled_at;
+    // Exactly when there was one fill; no average is computed.
+    std::optional<Price> price;
+};
+
 struct DeploymentDecisionRecord {
     NewDeploymentDecision decision;
     std::int64_t decision_sequence{0};
@@ -130,6 +144,8 @@ struct DeploymentDecisionRecord {
     std::optional<Timestamp> execution_receive;
     std::optional<Timestamp> resolved_at_market;
     std::string created_at;
+    // On decision pages only; absent elsewhere and when nothing was booked.
+    std::optional<DecisionFill> fill{};
 };
 
 // How a deployment order ended, recorded with it in one transaction.

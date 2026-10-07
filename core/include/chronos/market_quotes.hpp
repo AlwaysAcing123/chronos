@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 
 namespace chronos {
@@ -24,6 +25,10 @@ struct MarketStateUnavailable {
     MarketStateUnavailableCode code;
     std::string message;
 };
+
+// The stable name the API and deployment conditions share, such as
+// "awaiting_fresh_quote".
+[[nodiscard]] std::string_view market_state_unavailable_name(MarketStateUnavailableCode code) noexcept;
 
 using InstrumentQuote = std::variant<TopOfBookEvent, MarketStateUnavailable>;
 

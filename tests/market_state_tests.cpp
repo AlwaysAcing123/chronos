@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -579,10 +580,101 @@ void test_time_can_advance_before_any_event() {
     require_step(state.apply(require_valid(top_of_book(0, 500))));
 }
 
+// A live stream continued by a new process or after a refused publication
+// (ADR 0020): the jump is declared while suspended, only forward, and a
+// fresh quote is required after it. Undeclared gaps still interrupt.
+void test_a_declared_continuation_moves_only_forward_while_suspended() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    // Never while quotes are available.
+    const auto available = state.continue_at(1'000);
+    REQUIRE(available.has_value());
+    REQUIRE(available->code == MarketStateUpdateErrorCode::ContinuationRefused);
+
+    state.suspend();
+    REQUIRE(!state.continue_at(1'000));
+    state.resume();
+    require_step(state.apply(require_valid(top_of_book(1'000, 100))));
+    require_step(state.apply(require_valid(top_of_book(1'001, 200, "SPY"))));
+    REQUIRE(state.status().last_ingest_sequence == std::optional<std::uint64_t>(1'001));
+
+    // A new run of the same process jumps further; the quote from before
+    // it is never executable after it.
+    state.suspend();
+    const auto backward = state.continue_at(1'001);
+    REQUIRE(backward.has_value());
+    REQUIRE(backward->code == MarketStateUpdateErrorCode::ContinuationRefused);
+    REQUIRE(!state.continue_at(1'002));  // where it already was: no change
+    REQUIRE(!state.continue_at(5'000));
+    state.resume();
+    require_unavailable(state.execution_quote(InstrumentId("AAPL")), MarketStateUnavailableCode::AwaitingFreshQuote);
+    // The last accepted event cannot come back, even as a duplicate.
+    require_update_error(state.apply(require_valid(top_of_book(1'001, 300, "SPY"))), MarketStateUpdateErrorCode::ReplayRejected);
+}
+
+// Codex's review of ADR 0020, finding 4: what a process began its stream
+// with is kept, so a reset that later "catches up" past the durable history
+// is still visible after the fact.
+void test_the_first_accepted_sequence_is_kept_for_the_states_lifetime() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    REQUIRE(!state.status().first_ingest_sequence.has_value());
+    state.suspend();
+    REQUIRE(!state.continue_at(1'000));
+    // A declared jump is not an accepted event.
+    REQUIRE(!state.status().first_ingest_sequence.has_value());
+    state.resume();
+    require_step(state.apply(require_valid(top_of_book(1'000, 100))));
+    require_step(state.apply(require_valid(top_of_book(1'001, 200))));
+    state.suspend();
+    REQUIRE(!state.continue_at(9'000));
+    state.resume();
+    require_step(state.apply(require_valid(top_of_book(9'000, 300))));
+    const auto status = state.status();
+    REQUIRE(status.first_ingest_sequence == std::optional<std::uint64_t>(1'000));
+    REQUIRE(status.last_ingest_sequence == std::optional<std::uint64_t>(9'000));
+    // A rejected event leaves it alone.
+    require_update_error(state.apply(require_valid(top_of_book(9'005, 400))), MarketStateUpdateErrorCode::ReplayRejected);
+    REQUIRE(state.status().first_ingest_sequence == std::optional<std::uint64_t>(1'000));
+}
+
+void test_an_undeclared_gap_after_a_continuation_still_interrupts() {
+    MarketState state{MarketDataStreamId(std::string(kStream))};
+    state.suspend();
+    REQUIRE(!state.continue_at(7));
+    state.resume();
+    require_step(state.apply(require_valid(top_of_book(7, 100))));
+    require_update_error(state.apply(require_valid(top_of_book(9, 200))), MarketStateUpdateErrorCode::ReplayRejected);
+    REQUIRE(state.status().interruption.has_value());
+    // An interrupted state stays interrupted; no continuation repairs it.
+    state.suspend();
+    const auto refused = state.continue_at(100);
+    REQUIRE(refused.has_value());
+    REQUIRE(refused->code == MarketStateUpdateErrorCode::StreamInterrupted);
+}
+
+void test_an_exhausted_stream_cannot_continue() {
+    constexpr std::uint64_t kLast = std::numeric_limits<std::uint64_t>::max();
+    MarketState state{MarketDataStreamId(std::string(kStream)), kLast};
+    require_step(state.apply(require_valid(top_of_book(kLast, 100))));
+    state.suspend();
+    const auto refused = state.continue_at(kLast);
+    REQUIRE(refused.has_value());
+    REQUIRE(refused->code == MarketStateUpdateErrorCode::ContinuationRefused);
+}
+
 }  // namespace
 
 int main() {
     return chronos::test::run_tests({
+        {
+            "a declared continuation moves only forward while suspended",
+            test_a_declared_continuation_moves_only_forward_while_suspended,
+        },
+        {
+            "an undeclared gap after a continuation still interrupts",
+            test_an_undeclared_gap_after_a_continuation_still_interrupts,
+        },
+        {"an exhausted stream cannot continue", test_an_exhausted_stream_cannot_continue},
+        {"the first accepted sequence is kept for the state's lifetime", test_the_first_accepted_sequence_is_kept_for_the_states_lifetime},
         {"empty state has no quote", test_empty_state_has_no_quote_or_time},
         {
             "trade alone is not an execution quote",

@@ -154,7 +154,7 @@ struct Rig {
               service,
               hub,
               enabled ? std::unique_ptr<InferenceProvider>(std::make_unique<FakeProvider>(model)) : nullptr,
-              runtime_options(),
+              with_source(runtime_options()),
               std::move(log)
           ) {
         service.set_trading_status_view(&hub);
@@ -162,9 +162,24 @@ struct Rig {
 
     // Publishes an AAPL quote received `offset` after the open.
     void quote(std::int64_t offset, std::string_view ask = "101", std::string instrument = "AAPL") {
-        publish(MarketEvent(chronos::test::quote(
-            next_sequence, offset, std::move(instrument), QuoteLevels{.ask_price = ask}
-        )));
+        quote_levels(offset, QuoteLevels{.ask_price = ask}, std::move(instrument));
+    }
+
+    void quote_levels(std::int64_t offset, QuoteLevels levels, std::string instrument = "AAPL") {
+        publish(MarketEvent(chronos::test::quote(next_sequence, offset, std::move(instrument), levels)));
+    }
+
+    // The source the status reports, as the server reads its own.
+    DeploymentRuntimeOptions with_source(DeploymentRuntimeOptions options) {
+        options.source_status = [this] {
+            if (status_read_hook) {
+                status_read_hook();
+            }
+            market_data::MarketDataSourceStatus status;
+            status.state = source_state.load();
+            return status;
+        };
+        return options;
     }
 
     void status(std::int64_t offset, TradingStatus value) {
@@ -227,6 +242,9 @@ struct Rig {
     DeploymentHub hub;
     market_data::MarketStateFeed feed;
     PaperTradingService service;
+    // Delivering unless a test says otherwise.
+    std::atomic<market_data::MarketDataSourceState> source_state{market_data::MarketDataSourceState::Running};
+    std::function<void()> status_read_hook;
     DeploymentManager manager;
     std::uint64_t next_sequence{0};
 };
@@ -1135,6 +1153,254 @@ void test_without_the_opt_in_nothing_can_be_created_or_started() {
     REQUIRE(call(rig, "POST", "/api/v1/deployments/kill-switch", "{}").status == 200);
 }
 
+
+// ---------------------------------------------------------------------------
+// What a deployment is doing, and how long it took (ADR 0019)
+
+using chronos::paper_trading::DeploymentCondition;
+
+DeploymentCondition condition_of(Rig& rig) { return rig.status_of().condition; }
+
+Timestamp after_open(std::int64_t offset) { return Timestamp::from_nanoseconds(kMarketOpenNanoseconds + offset); }
+
+// An order's execution quote can still be queued after the order commits,
+// and then it is a candidate like any other. An interval longer than the
+// latency skips it whichever way the runner and the feed interleave, so
+// every decision below is on a quote the test chose.
+constexpr std::int64_t kSpacedInterval = 5 * kMillisecond;
+
+DeploymentCreateRequest spaced_request() {
+    DeploymentCreateRequest request = create_request();
+    request.decision_interval_ns = kSpacedInterval;
+    return request;
+}
+
+void test_the_condition_follows_the_run_and_falls_back_to_the_lifecycle() {
+    const ScratchSchema schema;
+    auto model = std::make_shared<FakeModel>();
+    {
+        Rig rig(schema, model);
+        created(rig, spaced_request());
+        started(rig);
+        // No quote yet: the instrument has no top of book.
+        const auto before = condition_of(rig);
+        REQUIRE(before.code == "quote_unavailable");
+        REQUIRE(before.reason == std::optional<std::string>("no_top_of_book"));
+
+        rig.quote(kCutoffOffset - kMillisecond);
+        rig.wait_for([&] { return condition_of(rig).code == "before_training_cutoff"; }, "the cutoff wait");
+        const auto cutoff = condition_of(rig);
+        REQUIRE(cutoff.training_cutoff == std::optional(after_open(kCutoffOffset)));
+        REQUIRE(cutoff.observation_receive == std::optional(after_open(kCutoffOffset - kMillisecond)));
+        REQUIRE(cutoff.observed_at_market == std::optional(after_open(kCutoffOffset - kMillisecond)));
+        REQUIRE(cutoff.observed_at_wall.has_value());
+
+        rig.quote(kCutoffOffset);
+        rig.wait_for([&] {
+            const auto found = condition_of(rig);
+            return found.code == "order_pending" && found.reason == std::optional<std::string>("awaiting_latency");
+        }, "the latency wait");
+        const auto pending = condition_of(rig);
+        REQUIRE(pending.decision_sequence == std::optional<std::int64_t>(1));
+        REQUIRE(pending.not_before_receive == std::optional(after_open(kCutoffOffset + 2 * kMillisecond)));
+        REQUIRE(pending.expires_at == std::optional(after_open(kCutoffOffset + 100 * kMillisecond)));
+
+        rig.quote(kCutoffOffset + 3 * kMillisecond);
+        rig.wait_for([&] { return rig.counters().orders_recorded == 1; }, "the order");
+        REQUIRE(condition_of(rig).code != "order_pending");
+
+        model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Flat); });
+        const std::int64_t held_at = kCutoffOffset + kSpacedInterval;
+        rig.quote(held_at);
+        rig.wait_for([&] { return rig.counters().holds == 1; }, "a hold");
+        const auto watching = condition_of(rig);
+        REQUIRE(watching.code == "watching");
+        REQUIRE(watching.reason == std::optional<std::string>("decided_hold"));
+        // Half the interval after the latest decision: the next eligible
+        // receive time is exact.
+        rig.quote(held_at + kSpacedInterval / 2);
+        rig.wait_for([&] { return condition_of(rig).code == "waiting_for_decision_interval"; }, "the interval wait");
+        REQUIRE(condition_of(rig).next_eligible_receive == std::optional(after_open(held_at + kSpacedInterval)));
+
+        // Present market facts outrank the latest outcome.
+        rig.source_state = market_data::MarketDataSourceState::Paused;
+        REQUIRE(condition_of(rig).code == "source_paused");
+        rig.source_state = market_data::MarketDataSourceState::Completed;
+        REQUIRE(condition_of(rig).code == "source_completed");
+        rig.source_state = market_data::MarketDataSourceState::Running;
+        rig.quote(kCutoffOffset + 2'000 * kMillisecond, "101", "SPY");
+        const auto stale = condition_of(rig);
+        REQUIRE(stale.code == "quote_stale");
+        REQUIRE(rig.status_of().market->quote.age_ns ==
+            std::optional<std::int64_t>(kCutoffOffset + 2'000 * kMillisecond - held_at - kSpacedInterval / 2));
+        rig.status(kCutoffOffset + 2'001 * kMillisecond, TradingStatus::Halted);
+        REQUIRE(condition_of(rig).code == "instrument_not_trading");
+
+        // And the lifecycle outranks everything.
+        static_cast<void>(rig.manager.stop("dep-1"));
+        const auto stopped = condition_of(rig);
+        REQUIRE(stopped.code == "stopped");
+        REQUIRE(stopped.reason == std::optional<std::string>("stop_requested"));
+        // The ended run's latest outcomes stay readable in this process.
+        REQUIRE(rig.status_of().activity.has_value());
+    }
+    // After a restart, only durable facts remain.
+    Rig restarted(schema, model);
+    restarted.manager.recover();
+    const auto status = restarted.status_of();
+    REQUIRE(!status.activity.has_value());
+    REQUIRE(!status.run.has_value());
+    REQUIRE(status.condition.code == "stopped");
+    REQUIRE(status.condition.reason == std::optional<std::string>("stop_requested"));
+    REQUIRE(decisions(restarted).size() == 2);
+}
+
+void test_quote_age_and_market_time_share_one_snapshot() {
+    const ScratchSchema schema;
+    Rig rig(schema, std::make_shared<FakeModel>());
+    created(rig);
+    rig.quote(kCutoffOffset);
+    // Advance between the initial market-status read and the quote read.
+    // No runner or scheduling race is needed to reproduce the inconsistency.
+    const Timestamp later = Timestamp::from_nanoseconds(kMarketOpenNanoseconds + kCutoffOffset + kMillisecond);
+    rig.status_read_hook = [&] { REQUIRE(!rig.market->advance_time(later)); };
+    const auto status = rig.status_of();
+    rig.status_read_hook = {};
+    REQUIRE(status.market->market_time == std::optional(later));
+    REQUIRE(status.market->quote.age_ns == std::optional(kMillisecond));
+}
+
+std::string duration_of(const nlohmann::json& timing, const char* name) {
+    const auto& duration = timing.at(name);
+    REQUIRE(duration.at("clock") == "market");
+    return duration.contains("nanoseconds") ? "ns:" + duration.at("nanoseconds").get<std::string>()
+                                            : "unavailable:" + duration.at("unavailable").get<std::string>();
+}
+
+void test_decision_timing_and_fills_are_exact_and_name_their_clock() {
+    const ScratchSchema schema;
+    auto model = std::make_shared<FakeModel>();
+    Rig rig(schema, model);
+    created(rig, spaced_request());
+    started(rig);
+    std::int64_t at = kCutoffOffset;
+    // Each decision on one quote, executed on another 3 ms later; the next
+    // decision is a full interval on.
+    const auto decide_then_execute = [&](std::uint64_t decisions_made, QuoteLevels execution) {
+        rig.quote(at);
+        rig.wait_for([&] { return rig.counters().order_decisions == decisions_made; }, "an order decision");
+        rig.quote_levels(at + 3 * kMillisecond, execution);
+        rig.wait_for([&] { return rig.counters().orders_recorded == decisions_made; }, "its order");
+        at += kSpacedInterval;
+    };
+    decide_then_execute(1, QuoteLevels{.ask_price = "101"});
+    model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Down); });
+    // Half a share of bid: the sell fills half and cancels the rest.
+    decide_then_execute(2, QuoteLevels{.bid_price = "99", .bid_quantity = "0.5"});
+    model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Up); });
+    // An ask the account cannot afford: recorded, rejected, nothing booked.
+    decide_then_execute(3, QuoteLevels{.ask_price = "20000"});
+    model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Flat); });
+    rig.quote(at);
+    rig.wait_for([&] { return rig.counters().holds == 1; }, "a hold");
+
+    const auto page = call(rig, "GET", "/api/v1/deployments/dep-1/decisions");
+    REQUIRE(page.status == 200);
+    const auto& rows = page.body.at("decisions");
+    REQUIRE(rows.size() == 4);
+    const auto& hold = rows[0];
+    const auto& rejected = rows[1];
+    const auto& partial = rows[2];
+    const auto& filled = rows[3];
+
+    REQUIRE(duration_of(filled.at("timing"), "signal_to_decision") == "ns:0");
+    REQUIRE(duration_of(filled.at("timing"), "execution_quote_offset") == "ns:3000000");
+    REQUIRE(duration_of(filled.at("timing"), "signal_to_resolution") == "ns:3000000");
+    REQUIRE(duration_of(filled.at("timing"), "signal_to_fill") == "ns:3000000");
+    REQUIRE(filled.at("fill") == nlohmann::json({
+        {"count", "1"}, {"quantity", "1"}, {"notional", "101"}, {"fees", "0.01"}, {"price", "101"},
+        {"first_filled_at", "2026-09-25T13:30:00.013000000Z"}, {"last_filled_at", "2026-09-25T13:30:00.013000000Z"},
+    }));
+
+    REQUIRE(partial.at("resolution") == "partially_filled_and_cancelled");
+    REQUIRE(partial.at("fill").at("quantity") == "0.5");
+    REQUIRE(partial.at("fill").at("price") == "99");
+    REQUIRE(partial.at("fill").at("notional") == "49.5");
+    REQUIRE(duration_of(partial.at("timing"), "signal_to_fill") == "ns:3000000");
+
+    // Recorded is not filled.
+    REQUIRE(rejected.at("state") == "recorded");
+    REQUIRE(rejected.at("resolution").get<std::string>().starts_with("risk_rejected:"));
+    REQUIRE(rejected.at("fill").is_null());
+    REQUIRE(duration_of(rejected.at("timing"), "execution_quote_offset") == "ns:3000000");
+    REQUIRE(duration_of(rejected.at("timing"), "signal_to_fill") == "unavailable:no_fill");
+
+    REQUIRE(hold.at("state") == "held");
+    REQUIRE(duration_of(hold.at("timing"), "signal_to_decision") == "ns:0");
+    for (const char* name : {"execution_quote_offset", "signal_to_resolution", "signal_to_fill"}) {
+        REQUIRE(duration_of(hold.at("timing"), name) == "unavailable:no_order");
+    }
+
+    // A pending decision, then one abandoned at an impossible time: the
+    // durations say so instead of going negative or zero.
+    model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Down); });
+    at += kSpacedInterval;
+    rig.quote(at);
+    rig.wait_for([&] { return rig.counters().order_decisions == 4; }, "a pending sell");
+    const auto pending = call(rig, "GET", "/api/v1/deployments/dep-1/decisions").body.at("decisions")[0];
+    REQUIRE(pending.at("state") == "pending");
+    for (const char* name : {"execution_quote_offset", "signal_to_resolution", "signal_to_fill"}) {
+        REQUIRE(duration_of(pending.at("timing"), name) == "unavailable:not_resolved");
+    }
+    REQUIRE(rig.service.abandon_deployment_decision("dep-1", 5, "stopped", Timestamp::from_nanoseconds(0)));
+    const auto abandoned = call(rig, "GET", "/api/v1/deployments/dep-1/decisions").body.at("decisions")[0];
+    REQUIRE(abandoned.at("state") == "abandoned");
+    REQUIRE(duration_of(abandoned.at("timing"), "signal_to_resolution") == "unavailable:inconsistent_clock");
+    REQUIRE(duration_of(abandoned.at("timing"), "execution_quote_offset") == "unavailable:no_execution");
+    REQUIRE(duration_of(abandoned.at("timing"), "signal_to_fill") == "unavailable:no_fill");
+}
+
+// Every row a status read could touch, in one fingerprint.
+std::string durable_fingerprint(const ScratchSchema& schema) {
+    return scalar(schema,
+        "SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM ("
+        "  SELECT model_deployments::text AS row_text FROM model_deployments"
+        "  UNION ALL SELECT model_deployment_decisions::text FROM model_deployment_decisions"
+        "  UNION ALL SELECT paper_accounts::text FROM paper_accounts"
+        "  UNION ALL SELECT paper_order_records::text FROM paper_order_records"
+        "  UNION ALL SELECT paper_fills::text FROM paper_fills) AS all_rows");
+}
+
+void test_status_reads_change_nothing() {
+    const ScratchSchema schema;
+    auto model = std::make_shared<FakeModel>();
+    Rig rig(schema, model);
+    created(rig, spaced_request());
+    started(rig);
+    rig.quote(kCutoffOffset);
+    rig.wait_for([&] { return rig.counters().order_decisions == 1; }, "an order decision");
+    rig.quote(kCutoffOffset + 3 * kMillisecond);
+    rig.wait_for([&] { return rig.counters().orders_recorded == 1; }, "its order");
+    model->answer_with([](const InferenceRequest&) { return predicted(PredictedClass::Flat); });
+    rig.quote(kCutoffOffset + kSpacedInterval);
+    rig.wait_for([&] { return rig.counters().holds == 1; }, "a hold");
+    // Idle now: no pending order, and no new quote.
+    const std::string before = durable_fingerprint(schema);
+    for (int index = 0; index < 25; ++index) {
+        REQUIRE(call(rig, "GET", "/api/v1/deployments/dep-1").status == 200);
+        REQUIRE(call(rig, "GET", "/api/v1/deployments").status == 200);
+        REQUIRE(call(rig, "GET", "/api/v1/deployments/dep-1/decisions").status == 200);
+    }
+    REQUIRE(durable_fingerprint(schema) == before);
+    // The rendered resource carries the new facts.
+    const auto deployment = call(rig, "GET", "/api/v1/deployments/dep-1").body.at("deployment");
+    REQUIRE(deployment.at("condition").at("code") == "watching");
+    REQUIRE(deployment.at("activity").at("last_candidate").at("code") == "decided_hold");
+    REQUIRE(deployment.at("market").at("source_state") == "running");
+    REQUIRE(deployment.at("market").at("quote").at("available") == true);
+    REQUIRE(deployment.at("market").at("quote").at("maximum_age_ns") == "1000000000");
+}
+
 }  // namespace
 
 int main() {
@@ -1178,5 +1444,15 @@ int main() {
             "without the opt-in nothing can be created or started",
             test_without_the_opt_in_nothing_can_be_created_or_started,
         },
+        {
+            "the condition follows the run and falls back to the lifecycle",
+            test_the_condition_follows_the_run_and_falls_back_to_the_lifecycle,
+        },
+        {
+            "decision timing and fills are exact and name their clock",
+            test_decision_timing_and_fills_are_exact_and_name_their_clock,
+        },
+        {"status reads change nothing", test_status_reads_change_nothing},
+        {"quote age and market time share one snapshot", test_quote_age_and_market_time_share_one_snapshot},
     });
 }

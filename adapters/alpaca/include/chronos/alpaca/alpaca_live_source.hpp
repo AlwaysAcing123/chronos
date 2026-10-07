@@ -4,6 +4,7 @@
 #include "chronos/alpaca/alpaca_normalizer.hpp"
 #include "chronos/alpaca/alpaca_subscription.hpp"
 #include "chronos/alpaca/alpaca_transport.hpp"
+#include "chronos/market_data/live_ingest_sequences.hpp"
 #include "chronos/market_data/market_data_source.hpp"
 #include "chronos/market_data/market_state_feed.hpp"
 #include "chronos/market_data/monotonic_clock.hpp"
@@ -58,7 +59,18 @@ struct AlpacaLiveOptions {
 // each instrument then needs a quote received on the new connection. While
 // Live, every read, including an idle poll, advances market time to the
 // local receive clock, so a silent feed's quotes age and become stale.
-// Ingest sequences continue across reconnects for the life of the process.
+//
+// Ingest sequences come from the stream's issuer (ADR 0020), which holds the
+// stream's durable writer lease. They continue across reconnects and across
+// server restarts, never repeating or moving back. Without the lease the
+// source opens no connection and publishes nothing; each run declares where
+// it begins to the market state while it is still suspended, and every
+// event is published only if its run is still current at that instant.
+// Each session publishes in a run of its own. The source vouches for the
+// market state's quotes only while that run is current, so a lapse ends
+// their use at once, even if no frame arrives; the session then ends at its
+// next read, and only a new session, with a new run and fresh quotes,
+// makes quotes executable again.
 //
 // Credentials go only into the authentication frame. Every diagnostic and
 // log line is passed through the credentials' redaction, and none contains
@@ -72,6 +84,7 @@ public:
         AlpacaCredentials credentials,
         AlpacaSubscription subscription,
         market_data::MarketStateFeed& feed,
+        market_data::LiveIngestSequences& sequences,
         const market_data::MonotonicClock& clock,
         const market_data::MonotonicUtcClock& receive_clock,
         market_data::BackoffJitter jitter,
@@ -112,6 +125,17 @@ private:
 
     class Session;
 
+    // Answers for the market state's quotes: current only while the live
+    // session's run is.
+    class RunAuthority final : public MarketQuoteAuthority {
+    public:
+        explicit RunAuthority(const AlpacaLiveSource& source) : source_(source) {}
+        [[nodiscard]] std::optional<std::string> quote_refusal() const override;
+
+    private:
+        const AlpacaLiveSource& source_;
+    };
+
     void run() noexcept;
     void operate();
     [[nodiscard]] SessionEnd run_session();
@@ -131,6 +155,7 @@ private:
     const AlpacaCredentials credentials_;
     const market_data::MarketDataSourceDescription description_;
     market_data::MarketStateFeed& feed_;
+    market_data::LiveIngestSequences& sequences_;
     const market_data::MonotonicClock& clock_;
     const market_data::MonotonicUtcClock& receive_clock_;
     market_data::ReconnectBackoff backoff_;
@@ -143,6 +168,10 @@ private:
     market_data::MarketDataSourceState state_{market_data::MarketDataSourceState::Connecting};
     std::optional<std::string> diagnostic_;
     std::atomic<bool> stop_requested_{false};
+    // The run the current session publishes in; 0 between sessions. Run IDs
+    // start at 1.
+    std::atomic<std::uint64_t> publishing_run_{0};
+    RunAuthority authority_{*this};
 
     std::once_flag joined_;
     // Started last, after every member it uses exists.

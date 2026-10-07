@@ -77,6 +77,14 @@ public:
         const ValidatedMarketEvent& event
     );
 
+    // Declares that the stream continues at `next_ingest_sequence`: the
+    // sequences before it were issued but will never be delivered. Only
+    // forward, and never after the stream is exhausted: returns false, and
+    // changes nothing, if `next_ingest_sequence` is behind the next expected
+    // sequence. The last accepted sequence is kept, so a later duplicate of
+    // it is still reported as one. Every undeclared gap is still rejected.
+    [[nodiscard]] bool continue_at(std::uint64_t next_ingest_sequence) noexcept;
+
     void reset(std::uint64_t next_expected_ingest_sequence = 0) noexcept;
 
 private:

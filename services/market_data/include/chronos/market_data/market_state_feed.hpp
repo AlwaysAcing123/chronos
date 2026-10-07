@@ -1,5 +1,6 @@
 #pragma once
 
+#include "chronos/market_data/live_ingest_sequences.hpp"
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_event_gate.hpp"
 #include "chronos/market_data/market_event_observer.hpp"
@@ -11,6 +12,16 @@
 #include <string>
 
 namespace chronos::market_data {
+
+// What became of one event published under a permit.
+struct FeedPublication {
+    // The permit refused: the event was not applied, the market state is
+    // unchanged, and nothing was observed or counted.
+    std::optional<IngestSequencesUnavailable> refused;
+    // As for MarketStateFeed::apply: rejected, or applied but not fully
+    // observed.
+    std::optional<std::string> failed;
+};
 
 // Applies one source's events to the server-owned market state, counts
 // them exactly, offers each to an optional observer, and tells subscribers.
@@ -41,6 +52,17 @@ public:
         const ValidatedMarketEvent& event
     );
 
+    // As apply(), but only while `permit` allows events numbered in
+    // publication run `run`. The permit is asked under the gate,
+    // immediately before the event is applied, so a live source whose run
+    // ended while it waited for the gate, however ownership changed
+    // meanwhile, publishes nothing more of it (ADR 0020).
+    [[nodiscard]] FeedPublication publish(
+        const ValidatedMarketEvent& event,
+        const PublicationPermit& permit,
+        std::uint64_t run
+    );
+
     [[nodiscard]] std::uint64_t events_applied() const noexcept {
         return events_applied_.load();
     }
@@ -49,6 +71,12 @@ public:
     [[nodiscard]] MarketDataNotifier& notifier() noexcept { return notifier_; }
 
 private:
+    [[nodiscard]] FeedPublication apply_event(
+        const ValidatedMarketEvent& event,
+        const PublicationPermit* permit,
+        std::uint64_t run
+    );
+
     MarketState& market_state_;
     MarketDataNotifier& notifier_;
     MarketEventObserver* observer_;

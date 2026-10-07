@@ -1,3 +1,4 @@
+#include "chronos/market_data/leased_ingest_sequences.hpp"
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_data_source.hpp"
 #include "chronos/market_data/market_state_feed.hpp"
@@ -12,6 +13,7 @@
 #include "chronos/paper_trading/paper_trading_service.hpp"
 #include "chronos/paper_trading/server_arguments.hpp"
 #include "chronos/paper_trading/working_order_matcher.hpp"
+#include "chronos/postgresql_live_stream_sequences.hpp"
 
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_DATABENTO_REPLAY)
 #include "chronos/databento/equities_mini_mbp1_event_reader.hpp"
@@ -75,10 +77,36 @@ void log_line(std::string_view line) {
     std::cerr << text << std::flush;
 }
 
+// A live stream's ingest sequences, held under its durable writer lease
+// (ADR 0020); absent for a replay or an empty market, whose identities are
+// their own.
+struct LiveStreamSequences {
+    chronos::PostgresIngestSequenceLeaseStore store;
+    market_data::LeasedIngestSequences sequences;
+
+    LiveStreamSequences(
+        const paper_trading::ServerArguments& arguments,
+        std::string_view database_url,
+        const market_data::MonotonicClock& clock
+    )
+        : store(std::string(database_url)),
+          sequences(
+              chronos::MarketDataStreamId(arguments.stream_id),
+              store,
+              market_data::this_process_stream_writer(),
+              clock,
+              market_data::LeasedIngestSequencesOptions{
+                  .adopt_history = arguments.adopt_live_stream_history,
+              },
+              log_line
+          ) {}
+};
+
 // The server's single market-data source, feeding `feed` on its own thread.
 std::unique_ptr<market_data::MarketDataSource> make_source(
     const paper_trading::ServerArguments& arguments,
     market_data::MarketStateFeed& feed,
+    market_data::LiveIngestSequences* live_sequences,
     const market_data::MonotonicClock& clock,
     const market_data::MonotonicUtcClock& receive_clock
 ) {
@@ -104,6 +132,7 @@ std::unique_ptr<market_data::MarketDataSource> make_source(
             std::get<alpaca::AlpacaCredentials>(std::move(credentials)),
             std::get<alpaca::AlpacaSubscription>(std::move(subscription)),
             feed,
+            *live_sequences,
             clock,
             receive_clock,
             market_data::random_backoff_jitter(),
@@ -113,6 +142,7 @@ std::unique_ptr<market_data::MarketDataSource> make_source(
     }
 #else
     static_cast<void>(receive_clock);
+    static_cast<void>(live_sequences);
 #endif
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_DATABENTO_REPLAY)
     if (arguments.replay) {
@@ -244,8 +274,20 @@ int run(const paper_trading::ServerArguments& arguments) {
         clock,
         market_data::system_utc_now()
     );
-    const std::unique_ptr<market_data::MarketDataSource> source =
-        make_source(arguments, feed, clock, receive_clock);
+    // A live stream's sequences outlive its source: the source is destroyed,
+    // and its thread joined, before the lease is released.
+    std::unique_ptr<LiveStreamSequences> live_sequences;
+    if (arguments.alpaca_iex) {
+        live_sequences = std::make_unique<LiveStreamSequences>(arguments, database_url, clock);
+        live_sequences->sequences.start();
+    }
+    const std::unique_ptr<market_data::MarketDataSource> source = make_source(
+        arguments,
+        feed,
+        live_sequences ? &live_sequences->sequences : nullptr,
+        clock,
+        receive_clock
+    );
     // Destroyed before the source, whose destructor joins its thread: if
     // startup fails from here on, a match retrying a lost connection on that
     // thread is ended first, so the join cannot wait for the database.
@@ -289,6 +331,7 @@ int run(const paper_trading::ServerArguments& arguments) {
             .stream = chronos::MarketDataStreamId(arguments.stream_id),
             .tradeable_instruments = arguments.instruments,
             .account_risk_limits = arguments.risk_limits,
+            .source_status = [&source] { return source->status(); },
         },
         log_line
     );
@@ -335,6 +378,11 @@ int run(const paper_trading::ServerArguments& arguments) {
     // it before joining that thread.
     matcher.stop();
     source->stop();
+    // Nothing can publish any more, so the stream may pass to the next
+    // server at once.
+    if (live_sequences) {
+        live_sequences->sequences.close();
+    }
     if (listen_failure) {
         std::rethrow_exception(listen_failure);
     }

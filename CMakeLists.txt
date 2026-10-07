@@ -240,6 +240,7 @@ target_link_libraries(chronos_market_state
 # source lifecycle, and browser change notifications. Provider adapters plug
 # in through core interfaces, so this library needs none of them.
 add_library(chronos_market_data_sources
+    services/market_data/src/leased_ingest_sequences.cpp
     services/market_data/src/market_data_notifier.cpp
     services/market_data/src/market_data_source.cpp
     services/market_data/src/market_state_feed.cpp
@@ -321,6 +322,7 @@ if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
     find_package(PostgreSQL REQUIRED)
 
     add_library(chronos_postgresql_persistence
+        adapters/postgresql/src/postgresql_live_stream_sequences.cpp
         adapters/postgresql/src/postgresql_paper_order_repository.cpp
         adapters/postgresql/src/postgresql_model_deployments.cpp
     )
@@ -332,6 +334,7 @@ if(CHRONOS_ENABLE_POSTGRESQL_ADAPTER)
     target_link_libraries(chronos_postgresql_persistence
         PUBLIC
             chronos_paper_execution
+            chronos_market_data_sources
             PostgreSQL::PostgreSQL
         PRIVATE chronos_build_options
     )
@@ -820,6 +823,24 @@ if(BUILD_TESTING)
         COMMAND chronos_market_data_source_tests
     )
 
+    # A live stream's sequences under a writer lease (ADR 0020), with an
+    # in-memory store: no PostgreSQL.
+    add_executable(chronos_leased_ingest_sequences_tests
+        tests/leased_ingest_sequences_tests.cpp
+    )
+
+    target_link_libraries(chronos_leased_ingest_sequences_tests
+        PRIVATE
+            chronos_market_data_sources
+            chronos_build_options
+            Threads::Threads
+    )
+
+    add_test(
+        NAME chronos_leased_ingest_sequences_tests
+        COMMAND chronos_leased_ingest_sequences_tests
+    )
+
     add_executable(chronos_paper_execution_tests
         tests/paper_execution_tests.cpp
     )
@@ -994,6 +1015,32 @@ if(BUILD_TESTING)
     endif()
 
     if(CHRONOS_ENABLE_PAPER_TRADING_API)
+        # Durable live-stream sequences (ADR 0020) against real PostgreSQL,
+        # with history made by the real service and deployment repository.
+        add_executable(chronos_postgresql_live_stream_sequences_tests
+            tests/postgresql_live_stream_sequences_tests.cpp
+        )
+
+        target_compile_definitions(chronos_postgresql_live_stream_sequences_tests
+            PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+
+        target_link_libraries(chronos_postgresql_live_stream_sequences_tests
+            PRIVATE
+                chronos_paper_trading_service
+                chronos_build_options
+                Threads::Threads
+        )
+
+        add_test(
+            NAME chronos_postgresql_live_stream_sequences_tests
+            COMMAND chronos_postgresql_live_stream_sequences_tests
+        )
+
+        set_tests_properties(chronos_postgresql_live_stream_sequences_tests
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+
         add_executable(chronos_paper_trading_server_arguments_tests
             tests/paper_trading_server_arguments_tests.cpp
         )
@@ -1085,6 +1132,21 @@ if(BUILD_TESTING)
 
         set_tests_properties(chronos_paper_trading_working_order_tests
             PROPERTIES SKIP_RETURN_CODE 77
+        )
+
+        add_executable(chronos_deployment_condition_tests
+            tests/deployment_condition_tests.cpp
+        )
+
+        target_link_libraries(chronos_deployment_condition_tests
+            PRIVATE
+                chronos_paper_trading_deployments
+                chronos_build_options
+        )
+
+        add_test(
+            NAME chronos_deployment_condition_tests
+            COMMAND chronos_deployment_condition_tests
         )
 
         add_executable(chronos_paper_trading_inference_client_tests
@@ -1298,6 +1360,32 @@ if(BUILD_TESTING)
             )
 
             set_tests_properties(chronos_alpaca_deployment_tests
+                PROPERTIES SKIP_RETURN_CODE 77
+            )
+
+            # A live stream continued across a server restart (ADR 0020).
+            add_executable(chronos_live_stream_restart_tests
+                tests/live_stream_restart_tests.cpp
+            )
+
+            target_compile_definitions(chronos_live_stream_restart_tests
+                PRIVATE CHRONOS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+            )
+
+            target_link_libraries(chronos_live_stream_restart_tests
+                PRIVATE
+                    chronos_alpaca_adapter
+                    chronos_paper_trading_deployments
+                    chronos_build_options
+                    Threads::Threads
+            )
+
+            add_test(
+                NAME chronos_live_stream_restart_tests
+                COMMAND chronos_live_stream_restart_tests
+            )
+
+            set_tests_properties(chronos_live_stream_restart_tests
                 PROPERTIES SKIP_RETURN_CODE 77
             )
         endif()

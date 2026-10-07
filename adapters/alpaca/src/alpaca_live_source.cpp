@@ -2,11 +2,9 @@
 
 #include <chrono>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -50,17 +48,8 @@ std::string validation_details(const AlpacaNormalizationError& error) {
     return details;
 }
 
-std::uint64_t next_ingest_sequence(market_data::MarketStateFeed& feed) {
-    const auto last = feed.market_state().status().last_ingest_sequence;
-    if (!last) {
-        return 0;
-    }
-    if (*last == std::numeric_limits<std::uint64_t>::max()) {
-        throw std::overflow_error(
-            "cannot start Alpaca IEX because the ingest sequence is exhausted"
-        );
-    }
-    return *last + 1;
+std::string sequence_diagnostic(const market_data::IngestSequencesUnavailable& unavailable) {
+    return "ingest sequences unavailable: " + unavailable.diagnostic;
 }
 
 }  // namespace
@@ -128,6 +117,22 @@ public:
         if (auto mismatch = subscription.acknowledgement_mismatch(*subscribed)) {
             return fatal(std::move(*mismatch));
         }
+
+        // The run's first sequence, declared to the still-suspended market
+        // state: a later start than the last event applied is a jump no quote
+        // is executable across (ADR 0020).
+        const market_data::BegunRun begun = source_.sequences_.begin_run();
+        if (const auto* unavailable = std::get_if<market_data::IngestSequencesUnavailable>(&begun)) {
+            return sequences_unavailable(*unavailable);
+        }
+        const auto& run = std::get<market_data::PublicationRun>(begun);
+        if (auto refused = source_.feed_.market_state().continue_at(run.first)) {
+            return fatal("the market state refused the stream's next sequence: " + refused->message);
+        }
+        // Everything this session numbers belongs to this run, and is
+        // published, and its quotes served, only while it lasts.
+        run_ = run.id;
+        source_.publishing_run_.store(run.id);
 
         live_ = true;
         source_.enter(MarketDataSourceState::Live, std::nullopt);
@@ -197,6 +202,12 @@ private:
             if (source_.stopping()) {
                 return stopped();
             }
+            // Before every read, after a frame, an empty frame, or an idle
+            // timeout alike: a run that ended, even with nothing to
+            // publish, ends the session.
+            if (auto refused = source_.sequences_.publication_refusal(run_)) {
+                return sequences_unavailable(*refused);
+            }
             TransportRead read = connection_.read();
             // Receipt time is taken before any parsing.
             const Timestamp received = source_.receive_clock_.now();
@@ -256,8 +267,16 @@ private:
         if (auto end = advance_clock(received)) {
             return end;
         }
+        if (data.empty()) {
+            return std::nullopt;
+        }
+        // The whole frame is numbered at once, or none of it.
+        const market_data::IssuedSequence issued = source_.sequences_.issue(run_, data.size());
+        if (const auto* unavailable = std::get_if<market_data::IngestSequencesUnavailable>(&issued)) {
+            return sequences_unavailable(*unavailable);
+        }
         AlpacaNormalizationResult normalized =
-            source_.normalizer_.normalize(data, received);
+            source_.normalizer_.normalize(data, received, std::get<std::uint64_t>(issued));
         if (const auto* error = std::get_if<AlpacaNormalizationError>(&normalized)) {
             return fatal(
                 "Alpaca sent data that violates the Chronos market-data contract: " +
@@ -266,11 +285,22 @@ private:
         }
         for (const ValidatedMarketEvent& event :
              std::get<std::vector<ValidatedMarketEvent>>(normalized)) {
-            if (auto rejected = source_.feed_.apply(event)) {
-                return fatal(std::move(*rejected));
+            market_data::FeedPublication published = source_.feed_.publish(event, source_.sequences_, run_);
+            if (published.refused) {
+                // Not applied. The rest of the frame is never published; the
+                // next run begins after it.
+                return sequences_unavailable(*published.refused);
+            }
+            if (published.failed) {
+                return fatal(std::move(*published.failed));
             }
         }
         return std::nullopt;
+    }
+
+    SessionEnd sequences_unavailable(const market_data::IngestSequencesUnavailable& unavailable) const {
+        return unavailable.permanent ? fatal(sequence_diagnostic(unavailable))
+                                     : transient(sequence_diagnostic(unavailable));
     }
 
     // Moves market time to the local receive clock, so quotes age while
@@ -356,6 +386,8 @@ private:
     AlpacaLiveSource& source_;
     AlpacaConnection& connection_;
     bool live_{false};
+    // The publication run this session began; set before it is live.
+    std::uint64_t run_{0};
     Clock::time_point last_clock_notice_{};
 };
 
@@ -364,6 +396,7 @@ AlpacaLiveSource::AlpacaLiveSource(
     AlpacaCredentials credentials,
     AlpacaSubscription subscription,
     market_data::MarketStateFeed& feed,
+    market_data::LiveIngestSequences& sequences,
     const market_data::MonotonicClock& clock,
     const market_data::MonotonicUtcClock& receive_clock,
     market_data::BackoffJitter jitter,
@@ -374,6 +407,7 @@ AlpacaLiveSource::AlpacaLiveSource(
       credentials_(std::move(credentials)),
       description_(description(subscription)),
       feed_(feed),
+      sequences_(sequences),
       clock_(clock),
       receive_clock_(receive_clock),
       backoff_(options.backoff, std::move(jitter)),
@@ -381,15 +415,29 @@ AlpacaLiveSource::AlpacaLiveSource(
       log_(std::move(log)),
       normalizer_(
           feed.market_state().status().stream,
-          std::move(subscription),
-          next_ingest_sequence(feed)
+          std::move(subscription)
       ) {
     // No quote is current until the first subscription is live.
     feed_.market_state().suspend();
+    feed_.market_state().set_quote_authority(&authority_);
     worker_ = std::thread([this] { run(); });
 }
 
-AlpacaLiveSource::~AlpacaLiveSource() { stop(); }
+AlpacaLiveSource::~AlpacaLiveSource() {
+    stop();
+    feed_.market_state().set_quote_authority(nullptr);
+}
+
+std::optional<std::string> AlpacaLiveSource::RunAuthority::quote_refusal() const {
+    const std::uint64_t run = source_.publishing_run_.load();
+    if (run == 0) {
+        return "no live session is publishing";
+    }
+    if (auto refused = source_.sequences_.publication_refusal(run)) {
+        return std::move(refused->diagnostic);
+    }
+    return std::nullopt;
+}
 
 market_data::MarketDataSourceDescription AlpacaLiveSource::description(
     const AlpacaSubscription& subscription
@@ -488,6 +536,15 @@ void AlpacaLiveSource::operate() {
 }
 
 AlpacaLiveSource::SessionEnd AlpacaLiveSource::run_session() {
+    // Without the stream's writer lease and reserved sequences, nothing could
+    // be published, so no upstream connection is opened either.
+    if (auto unavailable = sequences_.readiness()) {
+        return SessionEnd{
+            .ending = unavailable->permanent ? Ending::Fatal : Ending::Transient,
+            .diagnostic = sequence_diagnostic(*unavailable),
+            .reached_live = false,
+        };
+    }
     enter(MarketDataSourceState::Connecting, "connecting to Alpaca IEX");
     TransportConnectResult connected = transport_->connect();
     if (stopping()) {
@@ -503,6 +560,11 @@ AlpacaLiveSource::SessionEnd AlpacaLiveSource::run_session() {
     // The connection closes when this scope ends, before any reconnect, so
     // at most one upstream WebSocket exists at a time.
     const auto connection = std::get<std::unique_ptr<AlpacaConnection>>(std::move(connected));
+    // However the session ends, its run no longer vouches for any quote.
+    const struct EndRun {
+        std::atomic<std::uint64_t>& run;
+        ~EndRun() { run.store(0); }
+    } end_run{publishing_run_};
     Session session(*this, *connection);
     return session.run();
 }

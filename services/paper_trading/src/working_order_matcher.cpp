@@ -9,6 +9,17 @@
 #include <vector>
 
 namespace chronos::paper_trading {
+namespace {
+
+// The live stream was taken over: this process no longer writes it
+// (ADR 0020). No account is at fault and no retry can help, so observation
+// ends, which suspends the market state and stops the source.
+class LiveStreamWriterDeposed final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+}  // namespace
 
 std::string_view state_name(WorkingOrderMatcherState state) {
     switch (state) {
@@ -100,6 +111,9 @@ std::optional<std::uint64_t> WorkingOrderMatcher::match_account(
     }
     const CommitPaperOrderResult committed = locked->commit_match(match);
     if (const auto* conflict = std::get_if<PaperPersistenceConflict>(&committed)) {
+        if (conflict->code == PaperPersistenceConflictCode::StaleLiveStreamWriter) {
+            throw LiveStreamWriterDeposed("working orders cannot be matched: " + conflict->message);
+        }
         // Only a writer bypassing the account lock could cause this.
         throw std::runtime_error(
             "working-order match conflicted: " + conflict->message
@@ -152,6 +166,8 @@ void WorkingOrderMatcher::observe(const ValidatedMarketEvent& event) {
                     const std::lock_guard lock(mutex_);
                     ++status_.account_matches;
                 } catch (const PaperPersistenceUnavailable&) {
+                    throw;
+                } catch (const LiveStreamWriterDeposed&) {
                     throw;
                 } catch (const std::exception& error) {
                     // A stored state that cannot be recovered or written is a

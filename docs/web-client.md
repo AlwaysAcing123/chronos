@@ -337,9 +337,32 @@ in `src/state/deployments.ts`.
   never through floating point. "Review deployment" freezes the exact request
   and lists what every deployment does. Only "Create deployment" sends it,
   and the deployment is created stopped.
-- **Paper deployments.** Each deployment shows its state and why, its model
-  identity and training cutoff, policy, timing, the run's counts and
-  observed wall times, its latest problem, and its latest decisions.
+- **Paper deployments.** Each deployment card has:
+  - **Now**: the server's condition, in plain words with its machine code,
+    the times it names, and when it was observed, in the market and server
+    clocks;
+  - its latest saved prediction, labelled with its run and its observation
+    time, and with confidence marked as the model's own, not a probability
+    of profit. Decisions and status refresh separately, so one can be a
+    refresh ahead of the other;
+  - its model identity, training cutoff, and policy;
+  - configured timing and the latest order's market-clock timing, and the
+    run's work time in wall-clock time;
+  - counts by reason, in a collapsed detail scoped to the run and this
+    process;
+  - its latest problem, and its latest decisions.
+
+  Each decision row gives its prediction, its intent (Hold, Buy, or Sell
+  with the policy's reason), and its outcome:
+  - booked fills only, from the journal: Filled, Partly filled, Not
+    filled, or Rejected;
+  - otherwise Never placed, with why, or Pending;
+  - with the fill's delay after the signal.
+
+  The rows scroll in a focusable region. When a refresh fails, cached
+  status is marked as possibly out of date, never shown as freshly
+  confirmed. See
+  [model-deployments.md](model-deployments.md#what-it-is-doing-and-how-long-it-took).
   - **Start** needs an explicit confirmation that the model may place
     simulated orders in its account. **Stop** keeps the position.
   - **The kill switch** must be armed before it stops every deployment.
