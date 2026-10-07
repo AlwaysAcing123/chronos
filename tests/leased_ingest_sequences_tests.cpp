@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -365,9 +366,10 @@ void test_ownership_loss_discards_the_lost_block_for_good() {
     REQUIRE(issued(a.begin_run()) == 0);
     // An operator cleared the lease (as if a's process were gone), and b
     // took the stream.
-    auto row = *world.store().row(std::string(kStream));
-    row.writer.reset();
-    world.store().set_row(std::string(kStream), row);
+    auto stored_row = world.store().row(std::string(kStream));
+    REQUIRE(stored_row.has_value());
+    stored_row->writer.reset();
+    world.store().set_row(std::string(kStream), std::move(*stored_row));
     static_cast<void>(b.sequences().maintain());
     REQUIRE(issued(b.begin_run()) == 8);
     REQUIRE(issued(b.issue(1)) == 8);
