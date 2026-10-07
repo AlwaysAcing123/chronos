@@ -362,6 +362,14 @@ jobs:
       - name: Test
         run: python -m pytest
 
+      - name: Check deployment validation tools (no credentials or database)
+        working-directory: .
+        run: |
+          python -m ruff format --check tools/deployment_validation
+          python -m ruff check tools/deployment_validation
+          python -m mypy --strict tools/deployment_validation/validate.py
+          python -m unittest discover -s tools/deployment_validation -p 'test_*.py'
+
   web:
     name: Web client
     runs-on: ubuntu-24.04

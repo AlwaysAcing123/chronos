@@ -111,11 +111,29 @@ Server options and their defaults:
 | `--replay-speed` | `1x` | `1x`, `10x`, `100x`, or `max`; requires `--replay-dbn` |
 | `--replay-autostart` | off | Start playing at once instead of waiting for Start; requires `--replay-dbn` |
 | `--alpaca-iex` | off | Stream live Alpaca IEX trades and quotes (Alpaca builds); at most 30 instruments; not with `--replay-dbn` |
+| `--adopt-live-stream-history` | off | Continue a live stream whose durable history predates migration 006, after the largest sequence it references (ADR 0020); requires `--alpaca-iex` |
 
 Every option except `--instrument` may be given once, and each instrument once.
 An option for a source that is not selected, or not built, is rejected, and
 at most one source may be selected. Switching sources requires a restart;
-use a new stream ID and new accounts for each source and each live session.
+use a new stream ID and new accounts for each source.
+
+A live stream continues across restarts with the same stream ID and
+accounts. Its ingest sequences come from blocks reserved durably under a
+single-writer lease, so they never repeat or move back
+([ADR 0020](decisions/0020-restart-safe-live-stream-identity.md)). They are
+identities, not counts: after a restart they jump by up to 2^20. Until the
+server holds the stream's lease, the source reports `reconnecting` with the
+reason in its diagnostic, and no quote is executable.
+
+Ownership is enforced where it matters, in the database. Every order, fill,
+model decision, and valuation checks that the quote it uses belongs to the
+stream's current writer (migration 007). A server whose stream was taken
+over while it was paused or cut off answers `503 market_data_unavailable` /
+`source_unavailable` for orders and valuations on its quotes, records
+nothing, and consumes no client order ID. Locally, its quotes also stop being
+executable when its lease lapses, even with no new traffic, and stay so
+until a new connection delivers a fresh quote.
 
 Risk limits are server configuration, persisted with each account when it is
 created. Clients cannot choose them, and later configuration changes do not
@@ -283,6 +301,7 @@ make the server unhealthy, but it does block orders.
     "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
     "state": "accepting",
     "last_ingest_sequence": "121302",
+    "first_ingest_sequence": "0",
     "market_time": "2026-09-25T13:39:59.969574414Z",
     "interruption": null
   },
@@ -305,7 +324,11 @@ make the server unhealthy, but it does block orders.
 ```
 
 `state` is `accepting` or `interrupted`; `interruption` then describes the
-rejected event. `market_data_source` summarizes the source; a live feed that
+rejected event. `first_ingest_sequence` is the first event this server
+accepted since it started, kept for its lifetime, or `null` before any.
+Sequences only increase within a server, so for a live stream it shows that
+every quote since the start followed the stream's durable history
+(`validate.py verify-continuity` checks it). `market_data_source` summarizes the source; a live feed that
 is still establishing itself reports `connecting`, `authenticating`, or
 `subscribing` while the server is already healthy. The full source status is
 in `/api/v1/market-data`.
@@ -1035,6 +1058,7 @@ recording after a `10x` replay completed:
       "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
       "state": "accepting",
       "last_ingest_sequence": "121302",
+      "first_ingest_sequence": "0",
       "market_time": "2026-09-25T13:39:59.969574414Z",
       "interruption": null
     },
@@ -1258,7 +1282,7 @@ with the same ID.
 | `position_mark_unavailable` | portfolio | At least one open position cannot be marked; `instruments` gives each one's reason from the rows below |
 | `no_top_of_book` | orders, portfolio | No observation of the instrument has been accepted |
 | `stream_interrupted` | orders, portfolio | The stream rejected an event; see `/health` |
-| `source_unavailable` | orders, portfolio | The active source cannot establish that its last quote is current |
+| `source_unavailable` | orders, portfolio | The active source cannot establish that its last quote is current, or the live stream's quote belongs to an earlier writer (ADR 0020) |
 | `awaiting_fresh_quote` | orders, portfolio | A live source resumed and has not delivered a new quote for the instrument |
 | `missing_best_bid` | portfolio | The current book has no bid to mark the position |
 | `suspect_market_state` | portfolio | The observation is flagged as a potentially invalid book or questionable receive timestamp |
@@ -1271,7 +1295,8 @@ For the portfolio, `stream_interrupted`, `source_unavailable`,
 `awaiting_fresh_quote`, and the rows after them are per-position reasons
 inside `instruments`; `incompatible_market_timeline` is also returned as the
 top-level reason when the account as a whole is on another stream or behind
-its latest fill. `invalid_market_state` and `market_instrument_mismatch`
+its latest fill, and `source_unavailable` when the marks belong to an earlier
+writer of a live stream. `invalid_market_state` and `market_instrument_mismatch`
 cannot occur while `MarketState` enforces its own contract; they are checked
 so the core never values against an unverified observation.
 Orders are journaled, so they report a suspect book or a missing side as
@@ -1785,6 +1810,171 @@ Its first recorded decision. The deployment's latency was 1 ms, yet the order ex
   cause no repeats or gaps. Decision cursors are tied to their deployment.
   A cursor from another deployment or list is `400 invalid_cursor`. Clients
   treat cursors as opaque and return them unchanged.
+
+### What a deployment is doing
+
+Every deployment resource also has `activity`, `market`, and
+`condition` ([ADR 0019](decisions/0019-deployment-observability.md)).
+Reading them changes nothing. Here they are for a deployment stopped after a
+completed replay, while its run's outcomes are still in this process:
+
+```json
+{
+  "activity": {
+    "last_candidate": {
+      "code": "decision_interval",
+      "ingest_sequence": "121297",
+      "observation_received_at": "2026-09-25T13:39:59.960922473Z",
+      "decision_sequence": null,
+      "at_market": "2026-09-25T13:39:59.969574414Z",
+      "at_wall": "2026-10-05T01:53:10.873999000Z"
+    },
+    "last_submission": {
+      "code": "recorded:filled",
+      "ingest_sequence": null,
+      "observation_received_at": null,
+      "decision_sequence": "238",
+      "at_market": "2026-09-25T13:39:57.089980372Z",
+      "at_wall": "2026-10-05T01:53:10.595345000Z"
+    },
+    "pending": null
+  },
+  "market": {
+    "market_time": "2026-09-25T13:39:59.969574414Z",
+    "source_state": "completed",
+    "trading_status": null,
+    "quote": {
+      "available": true,
+      "unavailable_reason": null,
+      "ingest_sequence": "121297",
+      "received_at": "2026-09-25T13:39:59.960922473Z",
+      "age_ns": "8651941",
+      "maximum_age_ns": "5000000000",
+      "stale": false,
+      "suspect": false
+    }
+  },
+  "condition": {
+    "code": "stopped",
+    "reason": "stop_requested",
+    "observation_received_at": null,
+    "training_cutoff": null,
+    "next_eligible_received_at": null,
+    "not_before_received_at": null,
+    "expires_at": null,
+    "decision_sequence": null,
+    "observed_at_market": null,
+    "observed_at_wall": null
+  }
+}
+```
+
+- **`condition`** is what the deployment is doing now, the first that
+  applies of:
+  1. its lifecycle: `stopped`, `stopping`, or `faulted`, with
+     `reason` the lifecycle reason;
+  2. `not_running_here`;
+  3. the source: `no_market_data_source`, `source_not_started`,
+     `source_paused`, `source_completed`, `source_connecting`,
+     `source_reconnecting`, `source_failed`, or `source_stopped`;
+  4. the instrument's quote: `instrument_not_trading`, then
+     `quote_unavailable` with the market state's reason, then
+     `quote_suspect`, then `quote_stale`;
+  5. `order_pending`, with `reason` the latest check, such as
+     `awaiting_latency`, `order_matching_busy`, or `uncertain`;
+  6. the latest candidate of this run: `before_training_cutoff`,
+     `waiting_for_decision_interval`, `not_after_watermark`,
+     `inputs_unavailable` (`reason` names the input), `stale_signal`,
+     `account_unavailable`, `persistence_unavailable`,
+     `decision_refused`, or `watching` after a decision;
+  7. `waiting_for_candidate`.
+
+  Its times, in the market clock, are those that apply:
+  - `training_cutoff`;
+  - `observation_received_at`;
+  - `next_eligible_received_at`;
+  - `not_before_received_at`;
+  - `expires_at`.
+
+  `observed_at_market` and `observed_at_wall` say when the fact behind it
+  was observed. They are null for a lifecycle condition, whose fact is the
+  durable state.
+- **`activity`** holds the runner's latest outcomes, in memory only, so it
+  is null after a restart:
+  - `last_candidate`: a skip reason, `decided_hold`, `decided_order`,
+    `order_pending`, or `inference_failed:<code>`;
+  - `last_submission`: a check (`awaiting_latency`,
+    `market_data_unavailable`, …), `recorded:<resolution>`,
+    `abandoned:<reason>`, `not_pending:<reason>`, or `uncertain`;
+  - the order it is `pending` on.
+
+  `at_market` is the market clock and `at_wall` the server's UTC wall
+  clock when each was recorded.
+- **`market`** is read with the response:
+  - the market clock, and the source's state;
+  - the instrument's latest trading status, or null before any;
+  - its execution quote: whether it is available and why not, its age in
+    the market clock, the account's maximum age, and whether it is stale or
+    suspect.
+
+  It is null for a deployment of another stream.
+
+A decision also has `fill` and `timing`:
+
+```json
+{
+  "decision_sequence": "238",
+  "state": "recorded",
+  "resolution": "filled",
+  "fill": {
+    "count": "1",
+    "quantity": "1",
+    "notional": "335.82",
+    "fees": "0.01",
+    "price": "335.82",
+    "first_filled_at": "2026-09-25T13:39:57.089523133Z",
+    "last_filled_at": "2026-09-25T13:39:57.089523133Z"
+  },
+  "timing": {
+    "signal_to_decision": {
+      "clock": "market",
+      "nanoseconds": "74358"
+    },
+    "execution_quote_offset": {
+      "clock": "market",
+      "nanoseconds": "499367813"
+    },
+    "signal_to_resolution": {
+      "clock": "market",
+      "nanoseconds": "544041796"
+    },
+    "signal_to_fill": {
+      "clock": "market",
+      "nanoseconds": "544041796"
+    }
+  }
+}
+```
+
+- **`fill`** sums the booked fills of the decision's order: exact
+  quantity, notional, and fees, the first and last fill times, and the
+  price when there is exactly one fill. It is null when nothing was booked:
+  a held, pending, or abandoned decision, or a recorded order that was
+  cancelled for lack of liquidity or rejected. Only `fill` says something
+  filled.
+- **`timing`** gives market-clock durations from the signal's receive
+  time, exact in nanoseconds, each derived from saved times:
+  - `signal_to_decision`: to the saved decision.
+  - `execution_quote_offset`: to the receive time of the quote the order
+    used. This is not the order's latency.
+  - `signal_to_resolution`: to the order's acceptance, which is its
+    `submitted_at`, or to the abandonment.
+  - `signal_to_fill`: to the last booked fill.
+
+  A missing duration is `{"clock": "market", "unavailable": <reason>}`,
+  with the reason one of `no_order`, `not_resolved`, `no_execution`,
+  `no_fill`, `inconsistent_clock` (it would be negative), or
+  `overflow`. A duration is never zero by default.
 
 ## Current limitations
 

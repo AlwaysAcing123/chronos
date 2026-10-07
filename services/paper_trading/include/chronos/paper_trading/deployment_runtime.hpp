@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chronos/features/top_of_book_features.hpp"
+#include "chronos/market_data/market_data_source.hpp"
 #include "chronos/market_data/market_event_observer.hpp"
 #include "chronos/paper_trading/deployment_inference.hpp"
 #include "chronos/paper_trading/paper_trading_service.hpp"
@@ -97,6 +98,8 @@ public:
     void observe(const ValidatedMarketEvent& event) override;
 
     [[nodiscard]] bool is_trading(const InstrumentId& instrument) const override;
+    // The instrument's latest trading status, or nullopt before any.
+    [[nodiscard]] std::optional<TradingStatus> trading_status(const InstrumentId& instrument) const;
 
     void subscribe(const std::shared_ptr<CandidateMailbox>& mailbox);
     void unsubscribe(const std::shared_ptr<CandidateMailbox>& mailbox);
@@ -124,6 +127,9 @@ struct DeploymentRuntimeOptions {
     // How often an idle runner checks the market clock, so a pending
     // decision expires on time even without events.
     std::chrono::milliseconds idle_wake{200};
+    // The server's market-data source, read when a status is rendered.
+    // Without it, a status says nothing about the source.
+    std::function<market_data::MarketDataSourceStatus()> source_status{};
 };
 
 // A create request, as validated input.
@@ -190,6 +196,96 @@ struct DeploymentRunCounters {
     std::optional<std::string> last_error;
 };
 
+// The latest outcome of one of a runner's two activities, deciding on a
+// candidate and checking or submitting its pending order, as the runner
+// recorded it (ADR 0019). Kept in memory only.
+struct DeploymentRuntimeOutcome {
+    // A candidate outcome, such as before_training_cutoff, decision_interval,
+    // inputs_unavailable:<reason>, decided_hold, or decided_order; or a
+    // submission outcome, such as awaiting_latency, order_matching_busy,
+    // recorded:<resolution>, abandoned:<reason>, or uncertain.
+    std::string code;
+    // The candidate's observation, for a candidate outcome.
+    std::optional<std::uint64_t> ingest_sequence;
+    std::optional<Timestamp> observation_receive;
+    // The decision, for a decided candidate or a submission outcome.
+    std::optional<std::int64_t> decision_sequence;
+    // When it was recorded: the market clock, if it had started, and the
+    // server's wall clock.
+    std::optional<Timestamp> at_market;
+    Timestamp at_wall;
+};
+
+// The order a runner is waiting to submit, as it holds it.
+struct DeploymentPendingOrder {
+    std::int64_t decision_sequence{0};
+    Timestamp observation_receive;
+    Timestamp not_before_receive;
+    Timestamp expires_at_market;
+};
+
+struct DeploymentActivity {
+    std::optional<DeploymentRuntimeOutcome> last_candidate;
+    std::optional<DeploymentRuntimeOutcome> last_submission;
+    std::optional<DeploymentPendingOrder> pending;
+};
+
+// The deployment instrument's execution quote, read when a status is
+// rendered, in the market clock.
+struct DeploymentQuoteCondition {
+    bool available{false};
+    // MarketState's reason when it is not available, such as
+    // awaiting_fresh_quote.
+    std::optional<std::string> unavailable_reason;
+    std::optional<std::uint64_t> ingest_sequence;
+    std::optional<Timestamp> received_at;
+    // Market time minus the quote's receive time.
+    std::optional<std::int64_t> age_ns;
+    // The account's maximum quote age.
+    std::int64_t maximum_age_ns{0};
+    bool stale{false};
+    bool suspect{false};
+};
+
+struct DeploymentMarketCondition {
+    std::optional<Timestamp> market_time;
+    // Absent when the server gave no source to read.
+    std::optional<market_data::MarketDataSourceState> source_state;
+    // The latest trading status of the instrument, or nullopt before any.
+    std::optional<TradingStatus> trading_status;
+    DeploymentQuoteCondition quote;
+};
+
+// What the deployment is doing now, as one explanation: the first of its
+// lifecycle, the source, the quote, a pending order, and its latest
+// candidate that applies (ADR 0019 gives the precedence).
+struct DeploymentCondition {
+    std::string code;
+    // A more specific stable code: the lifecycle reason, the quote's
+    // unavailability, a pending order's latest check, or a skip's detail.
+    std::optional<std::string> reason;
+    std::optional<Timestamp> observation_receive;
+    std::optional<Timestamp> training_cutoff;
+    std::optional<Timestamp> next_eligible_receive;
+    std::optional<Timestamp> not_before_receive;
+    std::optional<Timestamp> expires_at;
+    std::optional<std::int64_t> decision_sequence;
+    // The provenance of the fact behind it.
+    std::optional<Timestamp> observed_at_market;
+    std::optional<Timestamp> observed_at_wall;
+};
+
+[[nodiscard]] std::string_view source_state_code(market_data::MarketDataSourceState state) noexcept;
+
+// The condition, from what is known. Pure, so every precedence is testable.
+[[nodiscard]] DeploymentCondition deployment_condition(
+    const ModelDeploymentRecord& deployment,
+    bool active,
+    const std::optional<DeploymentActivity>& activity,
+    const std::optional<DeploymentMarketCondition>& market,
+    Timestamp now_wall
+);
+
 struct DeploymentStatus {
     ModelDeploymentRecord deployment;
     // A runner is active for the deployment in this server process.
@@ -197,6 +293,12 @@ struct DeploymentStatus {
     // The current run's counters, while active or after it ended in this
     // process.
     std::optional<DeploymentRunCounters> run;
+    // The runner's latest outcomes, while active or after it ended in this
+    // process; null after a restart.
+    std::optional<DeploymentActivity> activity{};
+    // Read when the status was rendered; absent for another stream.
+    std::optional<DeploymentMarketCondition> market{};
+    DeploymentCondition condition{};
 };
 
 using DeploymentResult = std::variant<DeploymentStatus, DeploymentError>;
@@ -272,6 +374,7 @@ private:
     [[nodiscard]] std::optional<DeploymentError> validate(const DeploymentCreateRequest& request) const;
     [[nodiscard]] DeploymentResult stop_locked(std::string_view deployment_id, std::string_view reason);
     [[nodiscard]] DeploymentStatus status_of(ModelDeploymentRecord record);
+    [[nodiscard]] std::optional<DeploymentMarketCondition> market_condition_of(const ModelDeploymentConfig& config) const;
     void reap_finished_locked();
 
     PaperTradingService& service_;
@@ -284,8 +387,9 @@ private:
     // Guards runners_ for readers; a leaf.
     mutable std::mutex runners_mutex_;
     std::map<std::string, std::unique_ptr<Runner>> runners_;
-    // The counters of runs that ended in this process.
+    // The counters and latest outcomes of runs that ended in this process.
     std::map<std::string, DeploymentRunCounters> finished_runs_;
+    std::map<std::string, DeploymentActivity> finished_activity_;
 };
 
 }  // namespace chronos::paper_trading

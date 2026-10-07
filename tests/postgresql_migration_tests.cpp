@@ -325,7 +325,7 @@ void test_a_fresh_database_gets_the_multi_instrument_schema() {
     REQUIRE(inspector.scalar(
         "SELECT string_agg(version::text, ',' ORDER BY version) "
         "FROM chronos_schema_migrations"
-    ) == "1,2,3,4,5");
+    ) == "1,2,3,4,5,6,7");
     REQUIRE(inspector.scalar(
         "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) "
         "FROM information_schema.columns "
@@ -580,6 +580,8 @@ void test_the_migration_applies_once() {
     apply(store, "003_multi_instrument_accounts.sql");
     apply(store, "004_working_orders.sql");
     apply(store, "005_model_deployments.sql");
+    apply(store, "006_live_stream_sequences.sql");
+    apply(store, "007_live_stream_writer_fence.sql");
     const auto everything = [&] {
         return inspector.scalar(kJournalChecksum) + "/" + inspector.scalar(
             "SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM ("
@@ -593,6 +595,8 @@ void test_the_migration_applies_once() {
             "  UNION ALL SELECT model_deployments::text FROM model_deployments"
             "  UNION ALL SELECT model_deployment_decisions::text"
             "    FROM model_deployment_decisions"
+            "  UNION ALL SELECT live_stream_sequences::text"
+            "    FROM live_stream_sequences"
             "  UNION ALL SELECT chronos_schema_migrations::text"
             "    FROM chronos_schema_migrations) AS all_rows"
         ) + "/" + inspector.scalar(
@@ -607,6 +611,8 @@ void test_the_migration_applies_once() {
     apply(store, "003_multi_instrument_accounts.sql");
     apply(store, "004_working_orders.sql");
     apply(store, "005_model_deployments.sql");
+    apply(store, "006_live_stream_sequences.sql");
+    apply(store, "007_live_stream_writer_fence.sql");
     // Reading the identity advanced it once.
     const std::string rerun = everything();
     REQUIRE(rerun.substr(0, rerun.rfind('/')) ==
@@ -1508,6 +1514,217 @@ void test_deployment_constraints_and_the_ownership_guard_hold() {
     ));
 }
 
+// Migration 006 (ADR 0020) adds one table to a database that already has
+// accounts, fills, working orders, and deployments, and changes none of them.
+void test_migration_006_changes_nothing_that_exists_and_reruns_as_a_no_op() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    apply(store, "005_model_deployments.sql");
+    const std::string before = inspector.scalar(kVersion4Checksum);
+
+    apply(store, "006_live_stream_sequences.sql");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+    // No stream is adopted or started by the migration itself.
+    REQUIRE(inspector.scalar("SELECT count(*) FROM live_stream_sequences") == "0");
+
+    apply(store, "006_live_stream_sequences.sql");
+    store.apply_migration(all_migrations_sql());
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+}
+
+void test_migration_006_requires_migration_005() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+
+    REQUIRE(contains(
+        required_migration_error(store, "006_live_stream_sequences.sql"),
+        "migration 006 requires migration 005"
+    ));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4");
+    REQUIRE(inspector.scalar("SELECT to_regclass('live_stream_sequences') IS NULL") == "t");
+}
+
+// Migration 007 (ADR 0020, revised) adds writer generations to a database
+// that already has live streams, one released and one held, and changes
+// nothing else. The held stream's writer predates the fence: its generation
+// begins at next_sequence, so nothing it numbered passes until it acquires
+// again.
+void test_migration_007_starts_held_streams_at_their_next_sequence_and_reruns_as_a_no_op() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    apply(store, "005_model_deployments.sql");
+    apply(store, "006_live_stream_sequences.sql");
+    inspector.run_script(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) VALUES ('released', 16, 'new');"
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_id, writer_label, "
+        "lease_expires_at) VALUES ('held', 18446744073709551616, 'new', 'w', 'pid 1', "
+        "clock_timestamp() + interval '15 seconds')"
+    );
+    const std::string before = inspector.scalar(kVersion4Checksum);
+    const std::string streams = "SELECT string_agg(stream_id || '=' || next_sequence::text || '/' || "
+        "coalesce(writer_id, '-') || '/' || coalesce(writer_first_sequence::text, '-'), ',' ORDER BY stream_id) "
+        "FROM live_stream_sequences";
+
+    apply(store, "007_live_stream_writer_fence.sql");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+    REQUIRE(inspector.scalar(streams) == "held=18446744073709551616/w/18446744073709551616,released=16/-/-");
+
+    apply(store, "007_live_stream_writer_fence.sql");
+    store.apply_migration(all_migrations_sql());
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7");
+    REQUIRE(inspector.scalar(kVersion4Checksum) == before);
+    REQUIRE(inspector.scalar(streams) == "held=18446744073709551616/w/18446744073709551616,released=16/-/-");
+}
+
+void test_migration_007_requires_migration_006() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    apply(store, "005_model_deployments.sql");
+    REQUIRE(contains(
+        required_migration_error(store, "007_live_stream_writer_fence.sql"),
+        "migration 007 requires migration 006"
+    ));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5");
+}
+
+// What a server from before migration 007 would write, refused: it takes
+// over a stream without beginning a generation, acquires one without a
+// generation, or releases one leaving its generation behind. Each would
+// leave a deposed writer's sequences current, or a stream without a fence.
+void test_a_writer_change_must_begin_a_generation_where_reservations_ended() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    store.apply_migration(all_migrations_sql());
+    PostgresTestConnection inspector(schema.connection());
+    const auto refused = [&](std::string_view sql) {
+        try {
+            inspector.run_script(sql);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    inspector.run_script(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) VALUES ('s', 0, 'new');"
+        "UPDATE live_stream_sequences SET next_sequence = 8, writer_id = 'a', writer_label = 'pid 1', "
+        "lease_expires_at = clock_timestamp(), writer_first_sequence = 0 WHERE stream_id = 's'"
+    );
+    // A takeover that keeps the deposed generation.
+    REQUIRE(contains(refused(
+        "UPDATE live_stream_sequences SET next_sequence = 16, writer_id = 'b', writer_label = 'pid 2', "
+        "lease_expires_at = clock_timestamp() + interval '15 seconds' WHERE stream_id = 's'"
+    ), "must begin its generation at 8"));
+    // One that begins anywhere but where reservations ended.
+    REQUIRE(contains(refused(
+        "UPDATE live_stream_sequences SET next_sequence = 16, writer_id = 'b', writer_label = 'pid 2', "
+        "lease_expires_at = clock_timestamp() + interval '15 seconds', writer_first_sequence = 7 "
+        "WHERE stream_id = 's'"
+    ), "must begin its generation at 8"));
+    // A release that leaves the generation.
+    REQUIRE(contains(refused(
+        "UPDATE live_stream_sequences SET writer_id = NULL, writer_label = NULL, lease_expires_at = NULL "
+        "WHERE stream_id = 's'"
+    ), "live_stream_sequences_generation_complete"));
+    // Renewals and reservations by the same writer keep its generation.
+    inspector.run_script(
+        "UPDATE live_stream_sequences SET next_sequence = 24, lease_expires_at = clock_timestamp() "
+        "WHERE stream_id = 's'"
+    );
+    // A proper release, then an acquisition without a generation.
+    inspector.run_script(
+        "UPDATE live_stream_sequences SET writer_id = NULL, writer_label = NULL, lease_expires_at = NULL, "
+        "writer_first_sequence = NULL WHERE stream_id = 's'"
+    );
+    REQUIRE(contains(refused(
+        "UPDATE live_stream_sequences SET next_sequence = 32, writer_id = 'c', writer_label = 'pid 3', "
+        "lease_expires_at = clock_timestamp() + interval '15 seconds' WHERE stream_id = 's'"
+    ), "must begin its generation at 24"));
+    REQUIRE(inspector.scalar(
+        "SELECT next_sequence::text || '/' || coalesce(writer_id, '-') || '/' || "
+        "coalesce(writer_first_sequence::text, '-') FROM live_stream_sequences"
+    ) == "24/-/-");
+}
+
+// Sequences are exact unsigned 64-bit values: 2^64 marks an exhausted
+// stream and nothing beyond it, or below zero, is stored. A lease is whole
+// or absent, and an adoption records what it followed.
+void test_live_stream_sequence_constraints_hold() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    store.apply_migration(all_migrations_sql());
+    PostgresTestConnection inspector(schema.connection());
+    const auto refused = [&](std::string_view sql) {
+        try {
+            inspector.run_script(sql);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    inspector.run_script(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) "
+        "VALUES ('exhausted', 18446744073709551616, 'new')"
+    );
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) "
+        "VALUES ('beyond', 18446744073709551617, 'new')"
+    ), "live_stream_sequences_next_sequence_check"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) "
+        "VALUES ('negative', -1, 'new')"
+    ), "live_stream_sequences_next_sequence_check"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_id, writer_first_sequence) "
+        "VALUES ('half-lease', 0, 'new', 'w', 0)"
+    ), "live_stream_sequences_lease_complete"));
+    // Migration 007: a writer has a generation, and only a writer does; it
+    // never begins beyond what was reserved.
+    const std::string lease = "'w', 'pid 1', clock_timestamp() + interval '15 seconds'";
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_id, writer_label, "
+        "lease_expires_at) VALUES ('no-generation', 8, 'new', " + lease + ")"
+    ), "live_stream_sequences_generation_complete"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_first_sequence) "
+        "VALUES ('generation-without-writer', 8, 'new', 0)"
+    ), "live_stream_sequences_generation_complete"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_id, writer_label, "
+        "lease_expires_at, writer_first_sequence) VALUES ('ahead', 8, 'new', " + lease + ", 9)"
+    ), "live_stream_sequences_generation_complete"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, writer_id, writer_label, "
+        "lease_expires_at, writer_first_sequence) VALUES ('negative-generation', 8, 'new', " + lease + ", -1)"
+    ), "live_stream_sequences_writer_first_sequence_check"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin) "
+        "VALUES ('unrecorded', 10, 'adopted')"
+    ), "live_stream_sequences_adoption_recorded"));
+    REQUIRE(contains(refused(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, adopted_maximum) "
+        "VALUES ('behind', 10, 'adopted', 10)"
+    ), "live_stream_sequences_adoption_recorded"));
+    inspector.run_script(
+        "INSERT INTO live_stream_sequences (stream_id, next_sequence, origin, adopted_maximum) "
+        "VALUES ('adopted', 1088, 'adopted', 1087)"
+    );
+    REQUIRE(inspector.scalar(
+        "SELECT string_agg(stream_id || '=' || next_sequence::text, ',' ORDER BY stream_id) "
+        "FROM live_stream_sequences"
+    ) == "adopted=1088,exhausted=18446744073709551616");
+}
+
 }  // namespace
 
 int main() {
@@ -1575,5 +1792,20 @@ int main() {
             "deployment constraints and the ownership guard hold",
             test_deployment_constraints_and_the_ownership_guard_hold,
         },
+        {
+            "migration 006 changes nothing that exists and reruns as a no-op",
+            test_migration_006_changes_nothing_that_exists_and_reruns_as_a_no_op,
+        },
+        {"migration 006 requires migration 005", test_migration_006_requires_migration_005},
+        {
+            "migration 007 starts held streams at their next sequence and reruns as a no-op",
+            test_migration_007_starts_held_streams_at_their_next_sequence_and_reruns_as_a_no_op,
+        },
+        {"migration 007 requires migration 006", test_migration_007_requires_migration_006},
+        {
+            "a writer change must begin a generation where reservations ended",
+            test_a_writer_change_must_begin_a_generation_where_reservations_ended,
+        },
+        {"live stream sequence constraints hold", test_live_stream_sequence_constraints_hold},
     });
 }

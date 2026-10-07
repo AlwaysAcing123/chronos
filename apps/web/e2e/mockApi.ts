@@ -24,7 +24,7 @@ import {
   valuedPositionJson,
   workingOrderJson,
 } from '../src/test/fixtures';
-import { decisionJson, deploymentJson } from '../src/test/deploymentFixtures';
+import { conditionJson, decisionJson, deploymentJson } from '../src/test/deploymentFixtures';
 
 // One good-til-cancelled order per account: a buy of 10 AAPL at 336, below
 // the 337 ask, which a later ask of 336 × 4 partially fills.
@@ -345,10 +345,36 @@ export async function mockChronosApi(page: Page, options: MockOptions = {}) {
       return reply(route, 200, { decisions: current.run_generation === '0' ? [] : [decisionJson()], next_cursor: null });
     }
     if (action === 'start' || action === 'stop') {
+      // The server's condition follows: a started deployment has decided
+      // once and is watching; a stopped one says why it stopped.
       const next =
         action === 'start'
-          ? { ...current, state: 'running', state_reason: 'started', active: true, run_generation: '1' }
-          : { ...current, state: 'stopped', state_reason: 'stop_requested', active: false };
+          ? {
+              ...current,
+              state: 'running',
+              state_reason: 'started',
+              active: true,
+              run_generation: '1',
+              condition: conditionJson('watching', {
+                reason: 'decided_order',
+                observation_received_at: '2026-09-25T13:35:20.000100000Z',
+                observed_at_market: '2026-09-25T13:35:20.000100000Z',
+                observed_at_wall: '2026-10-04T21:30:00.000000000Z',
+              }),
+              run: {
+                candidates: '12', superseded: '0', skipped: { before_training_cutoff: '11' }, predictions: '1', holds: '0',
+                order_decisions: '1', orders_recorded: '1', abandoned: '0', waits: { awaiting_latency: '1' },
+                last_inference_us: '312', max_inference_us: '1980', last_submission_us: '4100', max_submission_us: '6100',
+                last_error: null,
+              },
+            }
+          : {
+              ...current,
+              state: 'stopped',
+              state_reason: 'stop_requested',
+              active: false,
+              condition: conditionJson('stopped', { reason: 'stop_requested' }),
+            };
       deployments.set(deploymentId, next);
       return reply(route, 200, { deployment: next });
     }

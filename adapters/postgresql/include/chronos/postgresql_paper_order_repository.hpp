@@ -24,6 +24,10 @@ enum class PaperPersistenceConflictCode {
     VersionConflict,
     // Another order of the account was already cancelled by this request.
     DuplicateCancelRequestId,
+    // The change records live ingest sequences that do not belong to the
+    // stream's current writer generation (ADR 0020): this process was
+    // deposed, or its stream was released. Nothing was written.
+    StaleLiveStreamWriter,
 };
 
 struct PaperPersistenceConflict {
@@ -388,6 +392,17 @@ public:
 
     [[nodiscard]] std::optional<StoredPaperOrderProcessor> load_account(
         std::string_view account_id
+    );
+
+    // Why live ingest sequences `first` to `last` of `stream` do not belong
+    // to the stream's current writer generation (ADR 0020), or nullopt when
+    // they do or the stream is not live. A plain read, for valuations: its
+    // answer was true when it was read. Commits check the same in their own
+    // transaction, under a lock.
+    [[nodiscard]] std::optional<std::string> live_stream_writer_refusal(
+        const MarketDataStreamId& stream,
+        std::uint64_t first,
+        std::uint64_t last
     );
 
     [[nodiscard]] PaperAccountJournalSummary journal_summary(

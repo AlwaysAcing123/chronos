@@ -100,18 +100,56 @@ const std::string& deployment_select() {
     return select;
 }
 
+// The decision columns, each prefixed with `table` (such as "d.").
+std::string decision_columns(std::string_view table) {
+    std::string columns;
+    for (std::string_view column : {
+             "deployment_id", "decision_sequence", "run_generation", "stream_id", "instrument",
+             "observation_ingest_sequence", "observation_event_ns", "observation_receive_ns",
+             "decided_at_market_ns", "inputs_raw", "predicted_class", "probabilities",
+             "confidence_ppb", "position_before_raw", "target_raw", "policy_reason",
+             "client_order_id", "side", "quantity_raw", "not_before_receive_ns",
+             "expires_at_market_ns", "state", "resolution", "execution_ingest_sequence",
+             "execution_receive_ns", "resolved_at_market_ns",
+         }) {
+        columns += std::string(table) + std::string(column) + ", ";
+    }
+    return columns + rendered(std::string(table) + "created_at", "created_at");
+}
+
 const std::string& decision_select() {
-    static const std::string select = std::string(R"SQL(
-        SELECT
-            deployment_id, decision_sequence, run_generation, stream_id, instrument,
-            observation_ingest_sequence, observation_event_ns, observation_receive_ns,
-            decided_at_market_ns, inputs_raw, predicted_class, probabilities,
-            confidence_ppb, position_before_raw, target_raw, policy_reason,
-            client_order_id, side, quantity_raw, not_before_receive_ns,
-            expires_at_market_ns, state, resolution, execution_ingest_sequence,
-            execution_receive_ns, resolved_at_market_ns, )SQL") +
-        rendered("created_at", "created_at") + R"SQL(
-        FROM model_deployment_decisions
+    static const std::string select =
+        "SELECT " + decision_columns("") + " FROM model_deployment_decisions";
+    return select;
+}
+
+// Decision pages also sum each decision's booked fills: through its order
+// (the unique partial index on account and client order ID) to the order's
+// fills (the unique index on order and fill index), so a page costs one
+// bounded query. A held, pending, or abandoned decision has no order; a
+// recorded one whose order booked nothing sums to no fill.
+const std::string& decision_page_select() {
+    static const std::string select = "SELECT " + decision_columns("d.") + R"SQL(,
+            fills.fill_count, fills.fill_quantity_raw, fills.fill_notional_raw,
+            fills.fill_fee_raw, fills.first_filled_at_ns, fills.last_filled_at_ns,
+            fills.single_price_raw
+        FROM model_deployment_decisions AS d
+        JOIN model_deployments AS m ON m.deployment_id = d.deployment_id
+        LEFT JOIN LATERAL (
+            SELECT
+                count(f.fill_record_id) AS fill_count,
+                sum(f.quantity_raw) AS fill_quantity_raw,
+                sum(f.notional_raw) AS fill_notional_raw,
+                sum(f.fee_raw) AS fill_fee_raw,
+                min(f.filled_at_ns) AS first_filled_at_ns,
+                max(f.filled_at_ns) AS last_filled_at_ns,
+                CASE WHEN count(f.fill_record_id) = 1 THEN min(f.price_raw) END AS single_price_raw
+            FROM paper_order_records AS r
+            JOIN paper_fills AS f ON f.order_record_id = r.order_record_id
+            WHERE r.account_id = m.account_id
+              AND r.client_order_id = d.client_order_id
+              AND r.client_order_id <> ''
+        ) AS fills ON true
     )SQL";
     return select;
 }
@@ -747,6 +785,18 @@ std::variant<DeploymentDecisionRecord, DeploymentConflict> PostgresPaperOrderRep
             return refuse("the observation is not after the latest decided one");
         }
     }
+    // The decision and the watermark record the observation's sequence:
+    // only the stream's current writer may. After the deployment row, so
+    // the lock order is deployment, then stream.
+    if (auto stale = impl_->fence.refusal(
+            connection,
+            decision.stream.value(),
+            decision.observation_ingest_sequence,
+            decision.observation_ingest_sequence,
+            true
+        )) {
+        return refuse(std::move(*stale));
+    }
     const std::int64_t sequence = deployment->next_decision_sequence;
     DeploymentDecisionRecord record{
         .decision = decision,
@@ -856,15 +906,28 @@ DecisionPage PostgresPaperOrderRepository::list_decisions(
     parameters.add(static_cast<std::uint64_t>(limit + 1));
     const auto result = execute(
         impl_->connection,
-        decision_select() +
-            " WHERE deployment_id = $1 AND ($2::bigint IS NULL OR decision_sequence < $2::bigint)"
-            " ORDER BY decision_sequence DESC LIMIT $3",
+        decision_page_select() +
+            " WHERE d.deployment_id = $1 AND ($2::bigint IS NULL OR d.decision_sequence < $2::bigint)"
+            " ORDER BY d.decision_sequence DESC LIMIT $3",
         parameters
     );
     require_status(result, PGRES_TUPLES_OK, "list deployment decisions");
     DecisionPage page;
     for (int row = 0; row < result.row_count() && page.decisions.size() < limit; ++row) {
-        page.decisions.push_back(parse_decision(result, row));
+        DeploymentDecisionRecord decision = parse_decision(result, row);
+        if (int64_of(result, row, "fill_count") > 0) {
+            const auto price = optional_int64(result, row, "single_price_raw");
+            decision.fill = DecisionFill{
+                .count = int64_of(result, row, "fill_count"),
+                .quantity = Quantity::from_raw(int64_of(result, row, "fill_quantity_raw")),
+                .notional = Money::from_raw(int64_of(result, row, "fill_notional_raw")),
+                .fees = Money::from_raw(int64_of(result, row, "fill_fee_raw")),
+                .first_filled_at = Timestamp::from_nanoseconds(int64_of(result, row, "first_filled_at_ns")),
+                .last_filled_at = Timestamp::from_nanoseconds(int64_of(result, row, "last_filled_at_ns")),
+                .price = price ? std::optional(Price::from_raw(*price)) : std::nullopt,
+            };
+        }
+        page.decisions.push_back(std::move(decision));
     }
     if (static_cast<std::size_t>(result.row_count()) > limit) {
         page.next_before_sequence = page.decisions.back().decision_sequence;

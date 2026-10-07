@@ -843,6 +843,7 @@ void test_account_and_health_render_without_numbers() {
         .last_ingest_sequence = std::numeric_limits<std::uint64_t>::max(),
         .market_time = Timestamp::from_nanoseconds(kMarketOpenNanoseconds),
         .interruption = std::nullopt,
+        .first_ingest_sequence = 1'049'600,
     };
     const HttpResponse healthy = chronos::paper_trading::render_health(
         PaperTradingHealth{
@@ -865,6 +866,9 @@ void test_account_and_health_render_without_numbers() {
         "18446744073709551615"
     );
     REQUIRE(healthy_body.at("market_data").at("state") == "accepting");
+    REQUIRE(
+        healthy_body.at("market_data").at("first_ingest_sequence") == "1049600"
+    );
 
     market.interruption = MarketReplayError{
         .code = MarketReplayErrorCode::ReceiveTimeMovedBackward,

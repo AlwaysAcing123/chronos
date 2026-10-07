@@ -167,6 +167,59 @@ creation can be retried with the same reviewed request and IDs.
 
 The API is in [paper-trading-api.md](paper-trading-api.md#model-deployments).
 
+## What it is doing, and how long it took
+
+Each deployment card answers what the deployment is doing now, separately
+from what it last decided ([ADR 0019](decisions/0019-deployment-observability.md)).
+
+**Now** is the server's `condition`, the first of these that applies:
+
+1. **Its lifecycle.** A stopped, stopping, or faulted deployment is shown as
+   such, with its reason, whatever its last run saw.
+2. **The source.** The source is not delivering: the replay has not
+   started, is paused, or has finished, or the live feed is connecting,
+   reconnecting, failed, or stopped.
+3. **The quote.** The instrument is halted or closed (only a trading-status
+   event says so), or its quote is unavailable, suspect, or older than the
+   account's maximum quote age. Silence makes a quote stale. It never says
+   the market is closed.
+4. **A pending order.** An order is waiting to be placed, with the latest
+   check's reason (such as the minimum latency, or the market being busy
+   matching), its not-before time, and its expiry.
+5. **The latest candidate of this run.** It was received before the
+   training cutoff (the cutoff is shown), arrived within the decision
+   interval (the next eligible receive time is shown), was already decided
+   on, had no model inputs, or was too old. Otherwise the deployment is
+   watching for the next quote.
+
+Each condition shows when it was observed, in the market clock and the
+server's wall clock. A skipped candidate has no prediction, and none is
+invented. **Latest saved prediction** is always the newest saved decision,
+labelled with its run when that is an earlier one. Confidence is the model's
+own: it is not a probability of profit.
+
+**Timing** keeps clocks apart:
+
+- **Configured timing.** The minimum latency, decision interval, and signal
+  age, all in the market clock. The latency is a minimum, not a promise.
+- **Latest order timing.** Market time from the signal to its decision, to
+  the order's acceptance, and to its fill, and how long after the signal the
+  execution quote was received. They are derived exactly from saved times.
+
+  The execution quote's offset is not the order's latency. In a 10x replay
+  on 2026-10-04, one order's quote was received 116 ms after its signal,
+  while the order was accepted 262 ms after it.
+
+  A recorded order that booked nothing has no fill time; neither does a
+  rejected one. A duration that cannot be derived says why. It is never
+  zero.
+- **Work time.** Inference and the trusted order path, in wall-clock time
+  for this server process, including the order path's waits for the market.
+
+**Counts by reason** sit in a collapsed detail: cumulative for the run in
+this process, not a current state. After a restart, only durable facts
+remain: lifecycle, saved decisions, orders, fills, and the watermark.
+
 ## Authority
 
 The server has no authentication. Ownership is a local application rule
@@ -213,11 +266,259 @@ found every invariant held:
 - every fill at the recorded opposite best price;
 - cash, fees, realized PnL, and position equal to the API's, to the cent.
 
+A second replay on 2026-10-04 checked the observability added by ADR 0019,
+on a fresh database. Its conditions appeared in order:
+- `source_not_started`
+- `before_training_cutoff`
+- trading
+- `source_paused`
+- `waiting_for_decision_interval` and `order_pending`
+- `stopped`
+
+`validate.py audit --recording` independently confirmed both of its
+deployments:
+- 332 decisions, all inputs re-derived from the recording;
+- 106 orders, each with exactly one fill at the opposite best price;
+- cash, fees, realized PnL, and position equal to the API's. The original
+  auditor reported the API's equity but did not independently verify it;
+  the review corrected this limitation.
+
+Six more replays on another fresh database, with the final build, passed
+the same audit: six deployments, 953 decisions, and 301 orders, each with
+one fill. The audit also failed, as it should, on each of five deliberate
+corruptions of a copy of the database. Killing the server (`SIGKILL`) during
+a run left that deployment recorded as running. The restarted server
+stopped it as `server_restarted`, and nothing changed afterwards. That run
+had made no decisions: a replay of data it had already decided on never
+passes its durable watermark.
+
+The isolated Codex browser review independently checked 17 decisions and
+two fills after Stop: all 17 inputs matched the normalized recording,
+cash and equity were both 9999.91, fees were 0.02, gross realized PnL was
+−0.07, and the remaining position and open cost were zero. The corrected
+auditor passed with no problems. Regression fixtures additionally cover
+fractional weighted-average cost removal, half-away notional rounding,
+incorrect equity and unrealized PnL, and incomplete recording coverage.
+
 The policy lost money, as the historical evaluations did. This is evidence
 that the machinery works, not that the model has skill.
 
+## Validating on live data
+
+Automated tests cover the live source with a fake transport: connecting, a
+first and a fresh quote, a disconnect while an order is pending, silence, a
+crossed book, Stop, the kill switch, and restart. Real Alpaca IEX data is
+checked by an operator, with `tools/deployment_validation/`:
+
+1. **Preflight, read-only.** Use a fresh database with migrations 001 to
+   007, and confirm both deployment triggers and their functions are
+   installed:
+   `CHRONOS_VALIDATION_DATABASE_URL=... validate.py preflight`.
+   - Keep evidence databases in persistent storage, not Docker tmpfs, and
+     save a database backup before restarting shared infrastructure. A
+     Docker/VM restart discards tmpfs databases.
+   - It also lists each live stream's reservations, writer lease, and the
+     first sequence of its writer's generation.
+   - A copy of a database from before 006, with history on the stream,
+     needs `CHRONOS_VALIDATION_ADOPT_LIVE_STREAM_HISTORY=1` for its first
+     live start (ADR 0020).
+2. **Start an isolated live server.** Run `start_live_server.sh` with
+   `CHRONOS_VALIDATION_DATABASE_URL` and `CHRONOS_VALIDATION_EVIDENCE` set.
+   - It loads the Keychain credentials into the server's environment only.
+   - It refuses a busy port.
+   - It refuses if another local server already holds the one Alpaca
+     connection: coordinate with its owner rather than stop it.
+3. **Run.**
+   `validate.py run --server http://127.0.0.1:8083 --deployment-id ... --account-id ... --experiment ... --instrument AAPL --minutes 10 --i-understand-this-uses-live-iex-market-data --evidence run.json`
+   - It refuses unless the source is live and a quote is fresh.
+   - It creates the deployment stopped (one share, five orders, two
+     rejections at most), then starts it explicitly.
+   - It records every condition change for a bounded time, stops it, and
+     checks that nothing is decided after Stop.
+   - It uses new deployment/account IDs only. Once Start is attempted,
+     cleanup tries Stop even if a reply is lost or the operator interrupts
+     the tool. If Stop cannot be confirmed after three attempts, it reports
+     an unknown outcome: stop the isolated server before proceeding.
+   - Its verdict is one of: `fill observed`, `orders observed, no fill`,
+     `inference observed, no order`, or `inconclusive`. A closed market or an
+     idle feed is inconclusive, never a pass.
+4. **Restart.** Stop the server with SIGTERM, start it again, and check:
+   - `validate.py verify-stopped --server ... --deployment-id ...`;
+   - with an open position,
+     `validate.py verify-continuity --server ... --account-id ... --instrument AAPL`.
+
+   The second waits for the first quote received after the account's last
+   fill. That quote must follow every durable sequence of the stream, and
+   it must value the open position. A ledger that reconciles is not this:
+   the audit reports `valuation_verified` separately. No fresh quote is
+   inconclusive, never a pass.
+   - The quote judged is the one in the snapshot that was found fresh, and
+     the first one decides: a violation fails at once, and a quote gone
+     before valuation fails.
+   - `proof` says what was shown. `server_first_sequence`: the server's
+     `first_ingest_sequence` also follows the durable history, which covers
+     every quote since it started. `first_observed_quote`: the server did
+     not report it, so earlier quotes were sampled, not proven
+     (`proof_limitation`).
+   - Durable history is read once, when the check begins. Run it before the
+     restarted server trades: rows it already wrote make the check fail,
+     never pass.
+5. **Audit.** Run `validate.py audit --server ... --deployment-id ...`. It
+   rebuilds cash, fees, weighted-average realized PnL, open cost, and
+   position from the fills using independent integer arithmetic and the
+   account's half-away rounding contract. It checks:
+   - every decision's linkage to its one order;
+   - later-quote and latency rules, and expiry;
+   - opposite-side prices, and the position limit.
+   - when valuation is available, best-bid marks, market value, unrealized
+     PnL, equity, and total PnL against the independently rebuilt account.
+
+   With `--recording`, a replay's inputs are also re-derived from the
+   normalized recording. Live triggering quotes are not retained, so for
+   live data the tool says so instead.
+6. **Scan.** `scan_evidence.sh <dir>` counts the evidence files that contain
+   a credential, without printing one. It must print 0 and exit successfully.
+   Missing Keychain credentials, an unreadable directory, or a scan error
+   fail rather than claiming a clean scan. A match exits with status 1;
+   an incomplete scan exits with status 2.
+
+A real disconnect is not forced: nothing scoped to the test's own
+connection can drop it safely, so real reconnect recovery stays covered by
+the fake transport only. Results on 2026-10-04, a Sunday evening:
+
+| Check | Result |
+|---|---|
+| Handshake (connect, authenticate, subscribe, live) | passed |
+| Fresh quote | none (market closed): **inconclusive** |
+| Inference, orders, and fills on live data | not observed |
+| Stop and restart on live data | not exercised, since nothing was created |
+| Credential scan of the evidence | 0 files |
+
+### Market-hours acceptance, 2026-10-05
+
+An isolated server and a fresh migrated database consumed real AAPL IEX
+quotes. No broker order was sent. A verified logistic model recorded 23
+decisions, five orders, and five booked paper fills, then became inactive
+at its five-order limit. An independent audit reproduced cash 9665.89,
+gross realized PnL -0.09, one remaining share, and open cost 334.02. This
+particular acceptance account had zero configured fees; these figures are
+not evidence of profitability or realistic total execution costs.
+
+A separate majority-model deployment verified explicit Stop, reload, and
+quietness. Killing the isolated server while that deployment was running
+and restarting it restored it as inactive, `stopped/server_restarted`.
+Its decisions and account remained unchanged during a ten-second check
+while new live quotes arrived. Browser checks covered the live feed label,
+booked fills, account ownership, controls, and widths 1440, 412, and 360 px.
+
+**Restart continuity failed on the October 5 tree.** The fix was subsequently
+reviewed (ADR 0020) and validated with a fresh position on October 7, below. The
+Alpaca source initializes its ingest counter from process-local market
+state, which is empty after a process restart. The durable account had
+already used quote sequence 1087 on `alpaca-iex-validation`. After another
+restart, a newer, executable live quote on the same stream had sequence 70;
+portfolio valuation correctly refused it with `503` and
+`incompatible_market_timeline`. Waiting until the counter catches up is
+not a continuity guarantee and reuses stream/sequence identities. The
+lineage checks must remain intact; this failure required the durable
+restart-safe identity and writer fence described below.
+
+Live triggering inputs were not independently re-derived because their
+quote history is not retained. A real network disconnect and a crash with
+a pending live order were not exercised in this session. They remain
+covered by automated/fake-transport tests, not this live evidence.
+
+The local evidence is in
+`/private/tmp/chronos-live-acceptance-20261005.0Z3tJO/`, including the run,
+independent audits, Stop/restart checks, the exact failed-continuity
+responses, and browser screenshots. The isolated live server and web copy
+were stopped after the test; the usual development app and accounts were
+not changed. This path is local evidence, not a distributable fixture.
+
+### Restart continuity (ADR 0020)
+
+The failure above is now reproduced deterministically by
+`chronos_live_stream_restart_tests`, with:
+- an account that bought on sequence 1087;
+- one fresh quote after a restart;
+- the real service, repository, and Alpaca source over the fake transport.
+
+On the tree that the acceptance tested, the quote was sequence 0,
+valuation reported "the quote does not continue the instrument's market-data
+timeline", and the sell was refused. After the fix, the quote follows every
+sequence the earlier process reserved, the position is valued at its bid,
+and the sell fills. That holds after a clean stop and after a crash.
+
+On real Alpaca IEX data with the market closed (2026-10-05, 23:22 ET), a
+copy of the acceptance database was upgraded to 006 and checked:
+
+| Check | Result |
+|---|---|
+| Adoption | took the lease after durable history up to **8453** (the control deployment's decisions; fills stopped at 1087), and continued at 8454 |
+| Handshake | connected, authenticated, subscribed, and went live |
+| Clean restart | lease released after the source stopped; taken again at once, from the next block |
+| SIGKILL restart | reported the dead writer and its expiry, opened no Alpaca connection, and took the lease after expiry (about 13 s) |
+| Fresh quote, valuation of the open position | none (market closed): `verify-continuity` **inconclusive** |
+| Credential scan of the evidence | 0 files |
+
+### Market-hours restart validation, 2026-10-07
+
+The October 5 scratch databases used Docker tmpfs and did not survive a
+Docker recovery on October 7. Their saved reports and logs remain, but no
+database backup was found in the scoped evidence directories. The rerun
+therefore used a **new persistent isolated database**, with migrations
+001–007, and a fresh one-share AAPL paper position. It does not prove
+fresh-quote continuity of the lost legacy-adopted account.
+
+| Check | Observed result |
+|---|---|
+| Clean restart | First server sequence 2097152 exceeded durable history 1048623; that quote valued the open position at bid 336.95 |
+| Crash restart | Waited for the old writer lease; first server sequence 3145728 exceeded durable history 2097246; observed fresh quote 3145735 valued the position at bid 336.96 |
+| Trading after each restart | Both one-share sells filled; four paper fills in total, including the initial buy and a new buy before the crash |
+| Duplicate after clean restart | POST returned 409 `duplicate_client_order_id`; GET recovered the original fill, and account/history were unchanged |
+| Majority-model control | Two verified live predictions produced Hold, no orders; explicit Stop stayed quiet, and crash recovery stayed `stopped/server_restarted` |
+| Independent accounting | Flat inventory, cash/equity 9999.82, gross realized PnL −0.18, and fees 0 matched the four fills |
+| Preservation | Development data-only dump fingerprints matched before/after; test writer lease released, owned server stopped |
+| Backup | Isolated database dump restored successfully into a second new isolated database |
+
+The crash check valued the first fresh quote the validator observed, not
+necessarily the process's first quote. Its `server_first_sequence` proof
+also checks that the first accepted sequence follows the durable baseline;
+neither check waits for a restarted counter to catch up. Live decisions
+did not independently re-derive their inputs from retained triggering
+quotes. No real network disconnect or pending-live-order crash was forced.
+
+An initial attempt recorded a safe `suspect_market_state` rejection because
+local receipt preceded the provider timestamp by 136,961 ns. Its account
+and failure evidence were retained. The successful attempt used another
+new account and a quality-aware test helper; no product safety rule changed.
+
+Local evidence and the restored-backup result are documented in
+`/private/tmp/chronos-persistent-live-acceptance-20261007.yukLKf/`.
+No broker order was sent. This is operational evidence, not model skill or
+a public distributable fixture; the ADR remains proposed pending acceptance.
+
 ## Limitations
 
+- **Real-live proof is bounded.** October 7 verified clean/crash restart
+  continuity and trading for a fresh AAPL paper position on IEX. Legacy
+  adoption followed by fresh real quotes, a real network disconnect, and
+  a pending-live-order crash were not exercised in that rerun. Since ADR
+  0020, a live stream's sequences come from durable
+  reservations under an expiring writer lease and continue across restarts,
+  and the database refuses a deposed writer's orders, fills, decisions, and
+  valuations. `chronos_live_stream_restart_tests` reproduces the 2026-10-05
+  failure and Codex's deposed and lapsed writers on the tree before the fix
+  and passes after it. Deterministic and fake-transport coverage is broader
+  than the live session; neither should be presented as the other.
+- **A deposed writer can still display quotes** in its own process until
+  its local lease deadline (at most 12 s after its last renewal). It cannot
+  act on them.
+- **A crash makes the next live start wait** up to 15 s for the old lease,
+  plus the source's reconnect backoff.
+  A stream with history from before migration 006 needs one explicit
+  `--adopt-live-stream-history`. That adoption proves nothing about
+  identities the old process published but never recorded.
 - **The realized latency is much longer than the configured one.** A
   submission waits for the market-event gate. Under a fast replay the feed
   holds the gate for most of the time, applying each event and matching

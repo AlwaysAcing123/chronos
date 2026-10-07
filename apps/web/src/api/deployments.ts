@@ -11,6 +11,7 @@ import { DEFAULT_TRANSPORT } from './client';
 import {
   IdentifierSchema,
   MoneySchema,
+  PriceSchema,
   QuantitySchema,
   SideSchema,
   TimestampSchema,
@@ -44,6 +45,62 @@ export const RunCountersSchema = z.object({
   last_error: z.string().nullable(),
 });
 export type RunCounters = z.infer<typeof RunCountersSchema>;
+
+// A runner's latest outcome, kept by the server in memory (ADR 0019).
+const RuntimeOutcomeSchema = z.object({
+  code: z.string().min(1),
+  ingest_sequence: UnsignedIntegerSchema.nullable(),
+  observation_received_at: TimestampSchema.nullable(),
+  decision_sequence: UnsignedIntegerSchema.nullable(),
+  at_market: TimestampSchema.nullable(),
+  at_wall: TimestampSchema,
+});
+export type RuntimeOutcome = z.infer<typeof RuntimeOutcomeSchema>;
+
+const ActivitySchema = z.object({
+  last_candidate: RuntimeOutcomeSchema.nullable(),
+  last_submission: RuntimeOutcomeSchema.nullable(),
+  pending: z
+    .object({
+      decision_sequence: UnsignedIntegerSchema,
+      observation_received_at: TimestampSchema,
+      not_before_received_at: TimestampSchema,
+      expires_at: TimestampSchema,
+    })
+    .nullable(),
+});
+
+const MarketConditionSchema = z.object({
+  market_time: TimestampSchema.nullable(),
+  source_state: z.string().min(1).nullable(),
+  trading_status: z.string().min(1).nullable(),
+  quote: z.object({
+    available: z.boolean(),
+    unavailable_reason: z.string().min(1).nullable(),
+    ingest_sequence: UnsignedIntegerSchema.nullable(),
+    received_at: TimestampSchema.nullable(),
+    age_ns: UnsignedIntegerSchema.nullable(),
+    maximum_age_ns: UnsignedIntegerSchema,
+    stale: z.boolean(),
+    suspect: z.boolean(),
+  }),
+});
+
+// What the deployment is doing now: the server's one explanation, by the
+// precedence ADR 0019 defines.
+export const ConditionSchema = z.object({
+  code: z.string().min(1),
+  reason: z.string().min(1).nullable(),
+  observation_received_at: TimestampSchema.nullable(),
+  training_cutoff: TimestampSchema.nullable(),
+  next_eligible_received_at: TimestampSchema.nullable(),
+  not_before_received_at: TimestampSchema.nullable(),
+  expires_at: TimestampSchema.nullable(),
+  decision_sequence: UnsignedIntegerSchema.nullable(),
+  observed_at_market: TimestampSchema.nullable(),
+  observed_at_wall: TimestampSchema.nullable(),
+});
+export type Condition = z.infer<typeof ConditionSchema>;
 
 export const DeploymentSchema = z.object({
   trading_mode: z.literal('paper'),
@@ -87,8 +144,20 @@ export const DeploymentSchema = z.object({
   pending_decision: UnsignedIntegerSchema.nullable(),
   version: UnsignedIntegerSchema,
   run: RunCountersSchema.nullable(),
+  // Absent from servers before ADR 0019; null after a restart.
+  activity: ActivitySchema.nullable().default(null),
+  market: MarketConditionSchema.nullable().default(null),
+  condition: ConditionSchema.nullable().default(null),
 });
 export type Deployment = z.infer<typeof DeploymentSchema>;
+
+// A duration between two saved market-clock times, exact, or why there is
+// none.
+const MarketDurationSchema = z.union([
+  z.object({ clock: z.literal('market'), nanoseconds: UnsignedIntegerSchema }),
+  z.object({ clock: z.literal('market'), unavailable: z.string().min(1) }),
+]);
+export type MarketDuration = z.infer<typeof MarketDurationSchema>;
 
 export const DecisionSchema = z.object({
   decision_sequence: UnsignedIntegerSchema,
@@ -123,6 +192,30 @@ export const DecisionSchema = z.object({
   resolution: z.string().nullable(),
   execution: z.object({ ingest_sequence: UnsignedIntegerSchema, received_at: TimestampSchema.nullable() }).nullable(),
   resolved_at: TimestampSchema.nullable(),
+  // The booked fills of its order, from the journal; null when nothing was
+  // booked, which a recorded decision can be. Absent (unknown) from servers
+  // before ADR 0019.
+  fill: z
+    .object({
+      count: UnsignedIntegerSchema,
+      quantity: QuantitySchema,
+      notional: MoneySchema,
+      fees: MoneySchema,
+      price: PriceSchema.nullable(),
+      first_filled_at: TimestampSchema,
+      last_filled_at: TimestampSchema,
+    })
+    .nullable()
+    .optional(),
+  timing: z
+    .object({
+      signal_to_decision: MarketDurationSchema,
+      execution_quote_offset: MarketDurationSchema,
+      signal_to_resolution: MarketDurationSchema,
+      signal_to_fill: MarketDurationSchema,
+    })
+    .nullable()
+    .optional(),
   created_at: TimestampSchema,
 });
 export type Decision = z.infer<typeof DecisionSchema>;

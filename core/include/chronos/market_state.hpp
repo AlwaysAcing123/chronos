@@ -30,6 +30,7 @@ enum class MarketStateUpdateErrorCode {
     ReplayRejected,
     StreamInterrupted,
     TimeMovedBackward,
+    ContinuationRefused,
 };
 
 struct MarketStateUpdateError {
@@ -43,11 +44,29 @@ using MarketStateUpdateResult = std::variant<
     MarketStateUpdateError
 >;
 
+// Whether the source behind a market state still vouches for its quotes.
+// A live source's right to publish its stream can end while no event
+// arrives (ADR 0020); its quotes must stop being current at that instant,
+// not when the next event or read timeout reaches it. The market state asks
+// on every quote read, for execution and valuation alike.
+class MarketQuoteAuthority {
+public:
+    virtual ~MarketQuoteAuthority() = default;
+
+    // Why no quote of the state is current now, or nullopt while they may
+    // be. Called with the market state's lock held: it must be quick and
+    // must not call back into the state.
+    [[nodiscard]] virtual std::optional<std::string> quote_refusal() const = 0;
+};
+
 struct MarketStateStatus {
     MarketDataStreamId stream;
     std::optional<std::uint64_t> last_ingest_sequence;
     std::optional<Timestamp> market_time;
     std::optional<MarketReplayError> interruption;
+    // The first event this state accepted, kept for its lifetime: what a
+    // restarted process began its stream with, not a later sample of it.
+    std::optional<std::uint64_t> first_ingest_sequence{};
 };
 
 // The server-owned current market for one validated stream. A feed or replay
@@ -110,6 +129,11 @@ public:
         Timestamp time
     );
 
+    // Asks `authority`, from now on, before any quote is served; nullptr
+    // stops asking. The authority must outlive its use: clear it before
+    // destroying it. A state has at most one.
+    void set_quote_authority(const MarketQuoteAuthority* authority);
+
     // Makes every quote unavailable until resume(). Idempotent.
     void suspend();
 
@@ -117,13 +141,32 @@ public:
     // quote stays unavailable until a top of book for it is accepted.
     void resume();
 
+    // Declares, while suspended, that the stream's next event has sequence
+    // `next_ingest_sequence` or later: the sequences between were issued by
+    // a live source but never delivered, such as the unused rest of a block
+    // an earlier process reserved (ADR 0020). Only forward. Because the
+    // state is suspended, no quote is executable across the jump, and
+    // resume() requires a new top of book for each instrument. Any gap not
+    // declared this way still interrupts the state. Refused without change
+    // if the state is available, interrupted, or the sequence would move
+    // backward.
+    [[nodiscard]] std::optional<MarketStateUpdateError> continue_at(
+        std::uint64_t next_ingest_sequence
+    );
+
 private:
     [[nodiscard]] std::variant<TopOfBookEvent, MarketStateUnavailable>
-    quote_locked(const InstrumentId& instrument) const;
+    quote_locked(
+        const InstrumentId& instrument,
+        const std::optional<std::string>& source_refusal
+    ) const;
+    [[nodiscard]] std::optional<std::string> source_refusal_locked() const;
 
     mutable std::mutex mutex_;
     MarketReplay replay_;
     std::optional<MarketReplayError> interruption_;
+    std::optional<std::uint64_t> first_ingest_sequence_;
+    const MarketQuoteAuthority* authority_{nullptr};
     bool suspended_{false};
     // Instruments with a top of book accepted since the latest resume().
     // Absent until the first resume(), so a state that is never suspended

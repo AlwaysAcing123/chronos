@@ -228,23 +228,21 @@ private:
 
 AlpacaNormalizer::AlpacaNormalizer(
     MarketDataStreamId stream,
-    AlpacaSubscription subscription,
-    std::uint64_t initial_ingest_sequence
+    AlpacaSubscription subscription
 )
     : stream_(std::move(stream)),
-      subscription_(std::move(subscription)),
-      next_ingest_sequence_(initial_ingest_sequence) {}
+      subscription_(std::move(subscription)) {}
 
 AlpacaNormalizationResult AlpacaNormalizer::normalize(
     const std::vector<AlpacaDataMessage>& messages,
-    Timestamp receive_timestamp
-) {
+    Timestamp receive_timestamp,
+    std::uint64_t first_ingest_sequence
+) const {
     if (messages.empty()) {
         return std::vector<ValidatedMarketEvent>{};
     }
-    if (!next_ingest_sequence_ ||
-        messages.size() - 1 >
-            std::numeric_limits<std::uint64_t>::max() - *next_ingest_sequence_) {
+    if (messages.size() - 1 >
+            std::numeric_limits<std::uint64_t>::max() - first_ingest_sequence) {
         return AlpacaNormalizationError{
             .message = "normalizing this frame would exhaust the Chronos ingest sequence",
             .validation_errors = {},
@@ -252,7 +250,7 @@ AlpacaNormalizationResult AlpacaNormalizer::normalize(
     }
 
     const EventBuilder builder(stream_, subscription_, receive_timestamp);
-    const std::uint64_t first = *next_ingest_sequence_;
+    const std::uint64_t first = first_ingest_sequence;
     std::vector<ValidatedMarketEvent> events;
     events.reserve(messages.size());
     for (std::size_t index = 0; index < messages.size(); ++index) {
@@ -283,11 +281,6 @@ AlpacaNormalizationResult AlpacaNormalizer::normalize(
         }
         events.push_back(std::get<ValidatedMarketEvent>(std::move(validated)));
     }
-
-    const std::uint64_t last = first + (messages.size() - 1);
-    next_ingest_sequence_ = last == std::numeric_limits<std::uint64_t>::max()
-        ? std::nullopt
-        : std::optional<std::uint64_t>(last + 1);
     return events;
 }
 

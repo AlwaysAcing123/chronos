@@ -148,6 +148,25 @@ void test_alpaca_iex_selects_the_live_source() {
     REQUIRE((parsed.instruments == std::vector{InstrumentId("AAPL"), InstrumentId("SPY")}));
 }
 
+// Adopting a live stream's pre-006 history is explicit, and only for a
+// live source (ADR 0020).
+void test_adopting_live_stream_history_is_explicit_and_live_only() {
+    REQUIRE(!parse({"--stream-id", "live", "--instrument", "AAPL", "--alpaca-iex"}).adopt_live_stream_history);
+    REQUIRE(parse({
+        "--stream-id", "live", "--instrument", "AAPL", "--alpaca-iex", "--adopt-live-stream-history",
+    }).adopt_live_stream_history);
+    REQUIRE(rejection({"--stream-id", "s", "--instrument", "AAPL", "--adopt-live-stream-history"}) ==
+            "--adopt-live-stream-history requires --alpaca-iex");
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dbn", "r", "--adopt-live-stream-history",
+    }) == "--adopt-live-stream-history requires --alpaca-iex");
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--alpaca-iex", "--adopt-live-stream-history",
+        "--adopt-live-stream-history",
+    }) == "--adopt-live-stream-history may be provided only once");
+    REQUIRE(chronos::paper_trading::server_usage().find("--adopt-live-stream-history") != std::string::npos);
+}
+
 void test_alpaca_iex_is_exclusive_strict_and_limited() {
     REQUIRE(rejection({
         "--stream-id", "s", "--instrument", "AAPL", "--alpaca-iex", "--replay-dbn", "r",
@@ -210,6 +229,10 @@ int main() {
         {"usage describes every source option", test_usage_describes_every_source_option},
         {"--alpaca-iex selects the live source", test_alpaca_iex_selects_the_live_source},
         {"--alpaca-iex is exclusive, strict, and limited", test_alpaca_iex_is_exclusive_strict_and_limited},
+        {
+            "adopting live stream history is explicit and live only",
+            test_adopting_live_stream_history_is_explicit_and_live_only,
+        },
         {"credentials are never command-line options", test_credentials_are_never_command_line_options},
     });
 }

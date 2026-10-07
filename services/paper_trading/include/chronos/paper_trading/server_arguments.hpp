@@ -45,6 +45,10 @@ struct ServerArguments {
     // Live data from Alpaca's IEX stream. Its credentials come only from
     // the environment.
     bool alpaca_iex{false};
+    // Continue a live stream whose durable history predates durable live
+    // sequences (migration 006), after the largest sequence that history
+    // references (ADR 0020). Only with --alpaca-iex.
+    bool adopt_live_stream_history{false};
     HttpServerOptions http;
     PreTradeRiskLimits risk_limits;
     // Absent unless model deployments were explicitly enabled.

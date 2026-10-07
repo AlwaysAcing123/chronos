@@ -320,6 +320,102 @@ inline std::optional<std::uint64_t> optional_uint64(
     ) : std::nullopt;
 }
 
+// The live-stream writer fence (ADR 0020, migration 007). A change that
+// records live ingest sequences of a stream asks, in its own transaction,
+// whether they belong to the stream's current writer generation: a writer
+// holds the stream, and each sequence lies from writer_first_sequence up to
+// next_sequence. With `lock`, the stream's row stays share-locked until the
+// transaction ends. A takeover, a release, and a reservation update that row,
+// so they wait: the change commits before the next generation begins, or
+// sees it and is refused. Without `lock` it is a plain read, for a valuation,
+// which answers for a generation that was current when it was read.
+//
+// A stream without a row is not live; replays never create one. A database
+// without migration 007 has no generations, and no current server can take
+// a live stream there, because acquisition needs them; nothing is refused.
+// Whether the column exists is looked up until it is found, then
+// remembered: it is never dropped.
+class LiveStreamFence final {
+public:
+    // Why sequences `first` to `last` of `stream` may not be recorded, or
+    // nullopt. Throws PaperPersistenceUnavailable when the check itself
+    // fails, such as on a lock timeout.
+    [[nodiscard]] std::optional<std::string> refusal(
+        PGconn* connection,
+        std::string_view stream,
+        std::uint64_t first,
+        std::uint64_t last,
+        bool lock
+    ) {
+        if (first > last) {
+            throw std::invalid_argument("a fenced range must not be empty");
+        }
+        if (!present_) {
+            const auto found = execute(
+                connection,
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = "
+                "to_regclass('live_stream_sequences') AND attname = 'writer_first_sequence' "
+                "AND NOT attisdropped) AS present"
+            );
+            checked(found, "look up the live-stream fence");
+            if (!parse_boolean(found.value(0, "present"), "present")) {
+                return std::nullopt;
+            }
+            present_ = true;
+        }
+        PostgresParameters parameters;
+        parameters.add(stream);
+        parameters.add(first);
+        parameters.add(last);
+        const auto row = execute(
+            connection,
+            std::string(
+                "SELECT writer_id IS NOT NULL AS held, writer_first_sequence::text AS generation, "
+                "next_sequence::text AS next_sequence, "
+                "coalesce($2::numeric < writer_first_sequence, false) AS earlier, "
+                "(writer_id IS NOT NULL AND $2::numeric >= writer_first_sequence AND "
+                "$3::numeric < next_sequence) AS current "
+                "FROM live_stream_sequences WHERE stream_id = $1"
+            ) + (lock ? " FOR SHARE" : ""),
+            parameters
+        );
+        checked(row, "check the live-stream fence");
+        if (row.row_count() == 0) {
+            return std::nullopt;
+        }
+        if (parse_boolean(row.value(0, "current"), "current")) {
+            return std::nullopt;
+        }
+        const std::string range = first == last
+            ? "ingest sequence " + std::to_string(first)
+            : "ingest sequences " + std::to_string(first) + " to " + std::to_string(last);
+        if (!parse_boolean(row.value(0, "held"), "held")) {
+            return range + " of live stream " + std::string(stream) +
+                " cannot be recorded: no writer holds the stream now";
+        }
+        const std::string generation = row.optional_value(0, "generation").value_or("an unknown sequence");
+        if (parse_boolean(row.value(0, "earlier"), "earlier")) {
+            return range + " of live stream " + std::string(stream) +
+                " belongs to an earlier writer; the stream's current writer began at " + generation +
+                ", so this process no longer writes it";
+        }
+        return range + " of live stream " + std::string(stream) +
+            " was never reserved by its current writer, whose sequences run from " + generation +
+            " to below " + row.value(0, "next_sequence");
+    }
+
+private:
+    static void checked(const PostgresResult& result, std::string_view operation) {
+        if (result.status() != PGRES_TUPLES_OK) {
+            throw PaperPersistenceUnavailable(
+                std::string(operation) + " failed: " + result.error_message()
+            );
+        }
+    }
+
+    bool present_{false};
+};
+
 // Resolves a pending deployment decision as recorded, with its order's
 // outcome, and counts the order against its run, in the caller's
 // transaction (postgresql_model_deployments.cpp). Throws unless exactly one
@@ -407,16 +503,19 @@ struct PostgresPaperOrderRepository::Impl {
     // The matcher runs accounts_to_match for every top of book, so it is
     // planned once per connection.
     bool candidates_prepared{false};
+    postgres_support::LiveStreamFence fence;
 };
 
 struct PaperAccountLock::State {
-    State(PGconn* connection_, std::string account_id_)
+    State(PGconn* connection_, std::string account_id_, postgres_support::LiveStreamFence& fence_)
         : connection(connection_),
           account_id(std::move(account_id_)),
+          fence(fence_),
           transaction(std::in_place, connection_) {}
 
     PGconn* connection;
     std::string account_id;
+    postgres_support::LiveStreamFence& fence;
     // Engaged until the lock commits or is released; resetting it rolls
     // back.
     std::optional<PostgresTransaction> transaction;

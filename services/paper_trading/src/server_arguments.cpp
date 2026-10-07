@@ -101,6 +101,7 @@ ServerArguments parse_server_arguments(
         .instruments = {},
         .replay = std::nullopt,
         .alpaca_iex = false,
+        .adopt_live_stream_history = false,
         .http = HttpServerOptions{},
         .risk_limits = default_risk_limits(),
         .deployments = std::nullopt,
@@ -153,6 +154,8 @@ ServerArguments parse_server_arguments(
             replay_autostart = true;
         } else if (option == "--alpaca-iex") {
             parsed.alpaca_iex = true;
+        } else if (option == "--adopt-live-stream-history") {
+            parsed.adopt_live_stream_history = true;
         } else if (option == "--host") {
             parsed.http.host = cursor.value(option);
         } else if (option == "--port") {
@@ -224,6 +227,9 @@ ServerArguments parse_server_arguments(
             "--research-artifacts require --model-deployments"
         );
     }
+    if (parsed.adopt_live_stream_history && !parsed.alpaca_iex) {
+        throw ServerUsageError("--adopt-live-stream-history requires --alpaca-iex");
+    }
     if (parsed.alpaca_iex) {
         if (recording) {
             throw ServerUsageError(
@@ -288,7 +294,14 @@ std::string server_usage() {
         "                               instruments). IEX is one exchange,\n"
         "                               not SIP or NBBO data. Credentials are\n"
         "                               read only from APCA_API_KEY_ID and\n"
-        "                               APCA_API_SECRET_KEY.\n\n"
+        "                               APCA_API_SECRET_KEY. One server at a\n"
+        "                               time writes a live stream; its ingest\n"
+        "                               sequences continue across restarts.\n"
+        "    --adopt-live-stream-history  Continue a live stream whose\n"
+        "                               accounts or deployments predate\n"
+        "                               migration 006, after the largest\n"
+        "                               sequence they reference. Once per\n"
+        "                               stream; see ADR 0020.\n\n"
         "Model deployments (off unless asked for; see docs/model-deployments.md):\n"
         "  --model-deployments          Allow verified research models to\n"
         "                               trade dedicated paper accounts, each\n"

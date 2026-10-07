@@ -1,5 +1,6 @@
 #include "chronos/alpaca/alpaca_live_source.hpp"
 #include "chronos/alpaca/alpaca_websocket_transport.hpp"
+#include "live_sequence_test_support.hpp"
 #include "market_data_test_support.hpp"
 #include "test_support.hpp"
 
@@ -221,12 +222,14 @@ void test_live_source_over_a_real_websocket() {
     MarketStateFeed feed(market, notifier);
     auto subscription = AlpacaSubscription::create({InstrumentId("AAPL")});
     REQUIRE(std::holds_alternative<AlpacaSubscription>(subscription));
+    chronos::test::ReadyIngestSequences sequences{"alpaca-iex-socket-test"};
 
     AlpacaLiveSource source(
         make_loopback_websocket_transport(server.url(), short_poll()),
         fake_credentials(),
         std::get<AlpacaSubscription>(std::move(subscription)),
         feed,
+        sequences.sequences(),
         clock,
         receive_clock,
         [](MonotonicClock::duration bound) { return bound; }

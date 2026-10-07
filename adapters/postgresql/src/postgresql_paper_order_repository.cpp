@@ -2026,8 +2026,42 @@ void require_working_orders_follow(
     }
 }
 
+// The live sequences a change records anew: the quote a submission
+// executes against and the observation its working orders fill on. A
+// cancellation records none; rows written earlier keep the sequences they
+// were recorded with, which an earlier generation may own.
+struct FencedSequences {
+    std::string_view stream;
+    std::uint64_t first{0};
+    std::uint64_t last{0};
+};
+
+std::optional<FencedSequences> fenced_sequences(const AccountChange& change) {
+    std::optional<FencedSequences> fenced;
+    const auto include = [&](const MarketEventHeader& header) {
+        const std::uint64_t sequence = header.ingest_sequence;
+        if (!fenced) {
+            fenced = FencedSequences{.stream = header.stream.value(), .first = sequence, .last = sequence};
+            return;
+        }
+        if (fenced->stream != header.stream.value()) {
+            throw std::invalid_argument("one account change records quotes of two streams");
+        }
+        fenced->first = std::min(fenced->first, sequence);
+        fenced->last = std::max(fenced->last, sequence);
+    };
+    if (change.market != nullptr) {
+        include(change.market->header);
+    }
+    if (change.match != nullptr && change.match->changed_account()) {
+        include(change.match->observation.header);
+    }
+    return fenced;
+}
+
 CommitPaperOrderResult write_account_change(
     PGconn* connection,
+    postgres_support::LiveStreamFence& fence,
     std::string_view account_id,
     std::int64_t expected_version,
     const AccountChange& change,
@@ -2125,6 +2159,16 @@ CommitPaperOrderResult write_account_change(
         update.value(0, "version"),
         "version"
     );
+    // After the account row, so the lock order is always account, then
+    // stream. On a refusal the caller rolls back.
+    if (const auto fenced = fenced_sequences(change)) {
+        if (auto refused = fence.refusal(connection, fenced->stream, fenced->first, fenced->last, true)) {
+            return CommitPaperOrderResult(conflict(
+                PaperPersistenceConflictCode::StaleLiveStreamWriter,
+                std::move(*refused)
+            ));
+        }
+    }
 
     // The version matched, so the stored rows are exactly state_before. A
     // position references its execution state, so executions go first.
@@ -2380,6 +2424,7 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
     PostgresTransaction transaction(impl_->connection);
     const CommitPaperOrderResult written = write_account_change(
         impl_->connection,
+        impl_->fence,
         account_id,
         expected_version,
         AccountChange{
@@ -2398,6 +2443,15 @@ CommitPaperOrderResult PostgresPaperOrderRepository::commit_order(
         transaction.commit();
     }
     return written;
+}
+
+std::optional<std::string> PostgresPaperOrderRepository::live_stream_writer_refusal(
+    const MarketDataStreamId& stream,
+    std::uint64_t first,
+    std::uint64_t last
+) {
+    impl_->ensure_connected();
+    return impl_->fence.refusal(impl_->connection, stream.value(), first, last, false);
 }
 
 PaperAccountJournalSummary PostgresPaperOrderRepository::journal_summary(
@@ -2999,6 +3053,7 @@ CommitPaperOrderResult commit_locked(
         state.processor->recovery_state();
     const CommitPaperOrderResult written = write_account_change(
         state.connection,
+        state.fence,
         state.account_id,
         state.version,
         change,
@@ -3114,7 +3169,8 @@ std::optional<PaperAccountLock> PostgresPaperOrderRepository::lock_account(
     impl_->ensure_connected();
     auto state = std::make_unique<PaperAccountLock::State>(
         impl_->connection,
-        std::string(account_id)
+        std::string(account_id),
+        impl_->fence
     );
     auto stored = load_account_rows(impl_->connection, account_id, true);
     if (!stored) {

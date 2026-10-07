@@ -63,11 +63,40 @@ most 30 `--instrument` values, and requires a build with
 and `/api/v1/market-data` report `connecting`, `authenticating`,
 `subscribing`, `live`, or `reconnecting` while the feed establishes itself.
 
-Use a new `--stream-id` and new accounts for each live session: ingest
-sequences start at zero in every process, so an account that traded in an
-earlier session is behind the new stream and fails closed
-(`submission_timestamp_moved_backward` or `incompatible_market_timeline`),
-as when switching sources.
+A live stream continues across server restarts with the same `--stream-id`
+and accounts
+([ADR 0020](decisions/0020-restart-safe-live-stream-identity.md)).
+
+- **Sequences come from a durable lease.** The server holds the stream's
+  writer lease in PostgreSQL (`live_stream_sequences`, migration 006). It
+  numbers events from blocks it reserves there, so a sequence never repeats
+  or moves back.
+- **A recovered account trades at once.** Its first fresh quote after a
+  restart values and trades it, with no catching up.
+- **Nothing connects without the lease.** If another server holds the
+  stream, a crashed server's lease has not expired (up to 15 s), or the
+  database is unreachable, the source stays `reconnecting`, says why, and
+  opens no Alpaca connection.
+- **Each connection is one publication run.** A frame is numbered in the
+  run of the connection that received it and is published only while that
+  run lasts. Losing, lapsing, or taking the lease again ends the run, so no
+  part of an older frame is ever published afterwards.
+- **Quotes stop at a lapse, without traffic.** The source vouches for its
+  quotes only while its run is current; the market state asks on every read.
+  A lapse makes them unusable at once, a later renewal does not bring them
+  back, and the session ends at its next read. A new connection and a fresh
+  quote are needed.
+- **A deposed writer records nothing.** The database refuses every order,
+  fill, decision, and valuation on a quote that does not belong to the
+  stream's current writer (migration 007). If the working-order matcher is
+  refused, the source fails and the market state is suspended.
+- **Older history needs one adoption.** A stream whose history predates
+  migration 006 continues after one start with
+  `--adopt-live-stream-history`. Without it the source fails with that
+  advice.
+
+Before the fix, every process started at zero, and a recovered account
+failed closed (`incompatible_market_timeline`) until the counter caught up.
 
 ## Documentation consulted
 
@@ -231,11 +260,22 @@ rejects; no timestamp is adjusted.
 
 Events keep the provider's message order within and across frames. A frame
 is normalized atomically: every data message becomes an event with the next
-contiguous ingest sequence, or, if any message is rejected, none does and the
-sequence does not advance. One sequence runs for the life of the process,
-across reconnects. Alpaca publishes no venue sequence, so Chronos cannot
-detect a gap in what IEX or Alpaca delivered; the ingest sequence only proves
-that Chronos applied what it received in order.
+contiguous ingest sequence issued for the whole frame, or, if any message
+is rejected, none is published.
+
+One sequence runs for the stream, across reconnects and server restarts.
+Each process issues from blocks it reserved durably. Within one connection
+the sequence is contiguous, and any gap still interrupts the market state.
+A new connection or process may start later:
+- after the unused rest of a crashed process's block;
+- after a lease was lost.
+
+That jump is declared while the market state is suspended, so a fresh quote
+is required after it (ADR 0020).
+
+Alpaca publishes no venue sequence, so Chronos cannot detect a gap in what
+IEX or Alpaca delivered; the ingest sequence only proves that Chronos
+applied what it received in order.
 
 ## Freshness and availability
 
@@ -334,6 +374,68 @@ No test uses credentials, the network, or real time:
   backoff, and live streaming, and secret-free logs.
 - `chronos_alpaca_websocket_transport_tests`: the real cpp-httplib transport
   against a WebSocket server on 127.0.0.1 emulating Alpaca's handshake.
+- `chronos_alpaca_deployment_tests`: a model deployment on the live source,
+  with the scripted transport, a held manual clock, and a scratch
+  PostgreSQL, through the real trusted order path. It covers:
+  - orders only after the latency, on a later quote;
+  - no fill on a quote from before a reconnect, and a fresh quote required
+    after one;
+  - expiry in silence;
+  - the deployment's condition through connecting, a first quote, a
+    reconnect, a stale and a suspect quote, and Stop;
+  - the kill switch, manual-order refusal, and no resumption after a
+    restart.
+- The source's sequences under a lease, in the same suite: no connection
+  without the lease; a lapse ending the session until a fresh quote; and a
+  new process continuing after the previous one's block, after a clean
+  stop and after a crash. Codex's review of ADR 0020: a numbered frame held
+  at the real market-event gate while the stream changes hands and comes
+  back publishes nothing; an idle cached quote stops being executable at
+  the lapse, before any read; a late renewal does not revive it.
+- `chronos_leased_ingest_sequences_tests`: the lease keeper against an
+  in-memory store with its own clock and injected faults, without
+  PostgreSQL. It covers:
+  - takeover only after the old writer stopped;
+  - unanswered acquisitions and reservations;
+  - outages, a blocked keeper, and ownership loss;
+  - an obsolete frame refused after takeover and reacquisition, and the
+    exact deadline: publication at deadline − 1 ns, none at the deadline,
+    and a renewal confirmed at the deadline ending the run;
+  - exhaustion at 2^64 − 1;
+  - a 20,000-step randomized run with crashes and releases, in which no
+    sequence is issued twice or out of order.
+- `chronos_postgresql_live_stream_sequences_tests`: the PostgreSQL store,
+  with leases expired by SQL. It covers reservations, conflicts, a race
+  between two writers, the 2^64 boundary, and legacy history made by the
+  real service and deployment repository, refused until adopted. It also
+  covers the writer fence: generations across renewal, takeover, release,
+  and reacquisition; a takeover waiting for a fenced statement in flight;
+  and a database without migration 007.
+- `chronos_live_stream_restart_tests`: the server's wiring, restarted over
+  one database:
+  - the 2026-10-05 failure, after a clean stop and a crash;
+  - manual and GTC orders, and a deployment started again by hand;
+  - a crash with a pending decision;
+  - two instruments, and another stream ID;
+  - reconnects, silence, and forged older or altered quotes;
+  - a second server on the stream, an unreachable database, and
+    exhaustion;
+  - a legacy database;
+  - a deposed writer whose quote cannot trade, be valued, be decided on, or
+    fill a working order, and a lapsed writer whose cached quote serves
+    nothing until a fresh one.
+
+## Model deployments on live data
+
+A deployment trades whatever stream its server reads, so the same runtime
+runs on IEX. What the deployment says it is doing follows this source:
+connecting, reconnecting, waiting for a fresh quote after a reconnect, or a
+stale quote in silence. A stale quote never reads as a closed market.
+
+Real-data validation is an operator's opt-in with
+`tools/deployment_validation/` ([model-deployments.md](model-deployments.md#validating-on-live-data)).
+It uses this adapter, the Keychain credentials in the server's environment
+only, and at most one connection. It never touches an order endpoint.
 
 ## Limitations
 
@@ -343,8 +445,7 @@ No test uses credentials, the network, or real time:
   trade view can show a trade Alpaca later corrected. Execution and
   valuation use quotes only.
 - An account binds to one stream for all its instruments, so it can trade
-  both AAPL and SPY within one live session, but each session needs new
-  accounts.
+  both AAPL and SPY on one live stream, across restarts of the server.
 - No hot swap between sources; restart the server, with a new stream ID and
   accounts, to switch.
 - Alpaca's market-data terms govern display and redistribution; the local,

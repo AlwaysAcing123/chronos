@@ -349,9 +349,27 @@ CHRONOS_POSTGRES_URL='postgresql://chronos:chronos_local@127.0.0.1:55432/chronos
 ```
 
 Chronos consumes Alpaca market data only; orders are still simulated and
-accounted by Chronos. Use a new stream ID and new accounts for each live
-session. See [docs/alpaca-adapter.md](docs/alpaca-adapter.md) for the
-lifecycle, exact numeric mapping, freshness rules, and IEX limitations.
+accounted by Chronos.
+
+A live stream's ingest sequences continue across restarts, so the same
+stream ID and accounts carry on after one
+([ADR 0020](docs/decisions/0020-restart-safe-live-stream-identity.md)):
+- **One writer per stream.** One server at a time holds a live stream's
+  lease in `live_stream_sequences` (migration 006). A second server on the
+  same stream and database waits, and opens no Alpaca connection.
+- **A deposed writer changes nothing.** Every order, fill, model decision,
+  and valuation checks in the database that its quote belongs to the
+  stream's current writer (migration 007). A server that was paused or cut
+  off while another took over may still show quotes for a few seconds, but
+  cannot trade, fill, decide, or value on them.
+- **Crash restarts wait.** After a crash, the next start waits up to 15 s
+  for the old lease to expire.
+- **Older history needs one adoption.** A stream whose accounts or
+  deployments predate migration 006 continues only after one start with
+  `--adopt-live-stream-history`.
+
+See [docs/alpaca-adapter.md](docs/alpaca-adapter.md) for the lifecycle,
+exact numeric mapping, freshness rules, and IEX limitations.
 
 The server binds to `127.0.0.1:8080` by default. It has no authentication
 and is not production-secure. See
@@ -362,8 +380,11 @@ limitations.
 
 A local database volume created before a migration existed needs it applied
 once, in order; each file is idempotent. Migration 003 turns single-instrument
-accounts into multi-instrument ones, and 004 adds working orders and fills:
-stop the server and back up the volume first, as described in
+accounts into multi-instrument ones, 004 adds working orders and fills,
+005 adds model deployments and the guards on the accounts they own, 006
+adds durable live-stream sequences, and 007 adds the fence that refuses a
+deposed live writer. Stop every server on the database and back up the
+volume first, as described in
 [docs/postgresql-persistence.md](docs/postgresql-persistence.md#upgrading-an-existing-volume):
 
 ```sh
@@ -373,7 +394,40 @@ docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/003_multi_instrument_accounts.sql
 docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/004_working_orders.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/005_model_deployments.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/006_live_stream_sequences.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/007_live_stream_writer_fence.sql
 ```
+
+Migration 006 adds one table and changes no existing row. Migration 007
+adds one column, a constraint, and a trigger to that table. A stream that
+has a writer when 007 is applied can record nothing more until a server
+takes it again, which a restart does. A server built before 007 cannot take
+or release a stream on a database that has it.
+
+Before you trust a database with deployments, check what is actually
+installed, not just its version row. An older, unmerged copy of 005 could
+record version 5 without the deferred `paper_order_records_deployment_resolution`
+trigger and its `paper_deployment_order_is_resolved` function. Rerunning the
+released file then does nothing, because it is idempotent. This check is
+read-only:
+
+```sh
+CHRONOS_VALIDATION_DATABASE_URL=postgresql://chronos:<password>@127.0.0.1:55432/chronos \
+  python/.venv/bin/python tools/deployment_validation/validate.py preflight
+```
+
+It lists the migrations (1 to 7 are required), both deployment triggers,
+and their functions. It also lists each live stream's reservations, writer
+lease, and the first sequence of its writer's generation, and any stream
+with durable history but no live-stream record. Such a stream is a replay, or a live stream that needs
+`--adopt-live-stream-history` once. It then reports whether the database
+is safe. If it is not, use a fresh, correctly migrated database for
+deployments: the released migrations are never edited, and nothing repairs
+user data automatically.
 
 ## Run the web workspace
 

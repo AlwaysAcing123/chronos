@@ -1,9 +1,12 @@
 #include "chronos/alpaca/alpaca_live_source.hpp"
+#include "chronos/market_data/market_event_gate.hpp"
 #include "alpaca_test_support.hpp"
+#include "live_sequence_test_support.hpp"
 #include "market_data_test_support.hpp"
 #include "test_support.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -32,6 +35,9 @@ using chronos::alpaca_adapter::AlpacaCredentials;
 using chronos::alpaca_adapter::AlpacaLiveOptions;
 using chronos::alpaca_adapter::AlpacaLiveSource;
 using chronos::alpaca_adapter::AlpacaSubscription;
+using chronos::market_data::LeasedIngestSequences;
+using chronos::market_data::LeasedIngestSequencesOptions;
+using chronos::market_data::LiveIngestSequences;
 using chronos::market_data::MarketDataMode;
 using chronos::market_data::MarketDataNotifier;
 using chronos::market_data::MarketDataSourceState;
@@ -45,6 +51,7 @@ using chronos::test::eventually;
 using chronos::test::FakeLink;
 using chronos::test::FakeTransport;
 using chronos::test::ManualClock;
+using chronos::test::MemoryLeaseStore;
 using namespace std::chrono_literals;
 
 constexpr std::string_view kStream = "alpaca-iex-live-test";
@@ -102,14 +109,18 @@ AlpacaSubscription aapl_and_spy() {
 // market state, with every log line kept for inspection.
 class LiveHarness final {
 public:
-    explicit LiveHarness(AlpacaLiveOptions options = {})
-        : receive_clock_(clock_, Timestamp::from_nanoseconds(kReceiptStart)),
+    // With `sequences`, the source numbers its events from them; otherwise
+    // from ready-made sequences starting at 0.
+    explicit LiveHarness(AlpacaLiveOptions options = {}, LiveIngestSequences* sequences = nullptr)
+        : ready_(sequences == nullptr ? std::make_unique<chronos::test::ReadyIngestSequences>(std::string(kStream))
+                                      : nullptr),
+          receive_clock_(clock_, Timestamp::from_nanoseconds(kReceiptStart)),
           notifier_(clock_, MarketDataNotifier::Options{
               .maximum_subscribers = 2,
               .minimum_interval = MonotonicClock::duration::zero(),
               .heartbeat_interval = 1h,
           }),
-          feed_(market_, notifier_) {
+          feed_(market_, notifier_, 0, nullptr, &gate_) {
         auto transport = std::make_unique<FakeTransport>();
         transport_ = transport.get();
         first_link_ = transport_->accept();
@@ -118,6 +129,7 @@ public:
             fake_credentials(),
             aapl_and_spy(),
             feed_,
+            sequences == nullptr ? ready_->sequences() : *sequences,
             clock_,
             receive_clock_,
             [](MonotonicClock::duration bound) { return bound; },
@@ -140,6 +152,7 @@ public:
     [[nodiscard]] ManualClock& clock() { return clock_; }
     [[nodiscard]] MarketState& market() { return market_; }
     [[nodiscard]] MarketDataNotifier& notifier() { return notifier_; }
+    [[nodiscard]] chronos::market_data::MarketEventGate& gate() { return gate_; }
 
     [[nodiscard]] bool reaches(MarketDataSourceState state) {
         return eventually([&] { return source_->status().state == state; });
@@ -190,10 +203,12 @@ public:
     }
 
 private:
+    std::unique_ptr<chronos::test::ReadyIngestSequences> ready_;
     ManualClock clock_{ManualClock::Mode::Hold};
     MonotonicUtcClock receive_clock_;
     MarketState market_{MarketDataStreamId(std::string(kStream))};
     MarketDataNotifier notifier_;
+    chronos::market_data::MarketEventGate gate_;
     MarketStateFeed feed_;
     FakeTransport* transport_{nullptr};
     std::shared_ptr<FakeLink> first_link_;
@@ -258,40 +273,319 @@ void test_describes_itself_as_iex_only_and_refuses_replay_commands() {
     REQUIRE(std::get<ReplayCommandError>(refused).code == ReplayCommandErrorCode::NotReplay);
 }
 
-void test_refuses_an_exhausted_ingest_sequence_before_connecting() {
-    ManualClock clock(ManualClock::Mode::Hold);
-    const MonotonicUtcClock receive_clock(
-        clock,
-        Timestamp::from_nanoseconds(kReceiptStart)
-    );
-    MarketState market(
-        MarketDataStreamId(std::string(chronos::test::kSourceTestStream)),
-        std::numeric_limits<std::uint64_t>::max()
-    );
-    const auto accepted = market.apply(chronos::test::recorded_quote(
-        std::numeric_limits<std::uint64_t>::max(),
-        0ns
-    ));
-    REQUIRE(std::holds_alternative<chronos::MarketReplayStep>(accepted));
-    MarketDataNotifier notifier(clock, MarketDataNotifier::Options{});
-    MarketStateFeed feed(market, notifier);
-    auto transport = std::make_unique<FakeTransport>();
-
-    try {
-        AlpacaLiveSource source(
-            std::move(transport),
-            fake_credentials(),
-            aapl_and_spy(),
-            feed,
-            clock,
-            receive_clock,
-            [](MonotonicClock::duration bound) { return bound; }
-        );
-        REQUIRE(false);
-    } catch (const std::overflow_error& error) {
-        REQUIRE(std::string_view(error.what()).find("ingest sequence is exhausted") !=
-            std::string_view::npos);
+// Durable sequences of a stream an earlier process used, held under a
+// writer lease in an in-memory store whose clock the test moves.
+class StreamSequences final {
+public:
+    explicit StreamSequences(MemoryLeaseStore& store, std::string writer, std::uint64_t block_size = 8)
+        : sequences_(
+              MarketDataStreamId(std::string(kStream)),
+              store,
+              chronos::market_data::StreamWriter{.id = writer, .label = "pid of " + writer},
+              clock_,
+              LeasedIngestSequencesOptions{.block_size = block_size}
+          ) {
+        sequences_.start();
     }
+
+    LeasedIngestSequences& sequences() { return sequences_; }
+    ManualClock& clock() { return clock_; }
+
+private:
+    ManualClock clock_{ManualClock::Mode::Hold};
+    LeasedIngestSequences sequences_;
+};
+
+void test_an_exhausted_stream_fails_without_connecting() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    store.set_row(std::string(kStream), MemoryLeaseStore::Row{.next = std::nullopt});
+    StreamSequences sequences(store, "this");
+    LiveHarness harness({}, &sequences.sequences());
+    REQUIRE(harness.reaches(MarketDataSourceState::Failed));
+    REQUIRE(contains(harness.diagnostic(), "exhausted"));
+    REQUIRE(harness.transport().connects() == 0U);
+}
+
+// While another process writes the stream, this one waits, opens no
+// upstream connection, and says who holds the stream; once the lease is
+// its own, it connects and continues after everything reserved before.
+void test_opens_no_connection_until_it_holds_the_streams_lease() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    store.set_row(std::string(kStream), MemoryLeaseStore::Row{
+        .next = 1'087,
+        .writer = "other",
+        .label = "pid 80567 on elsewhere",
+        .expires = database.now() + 15s,
+    });
+    StreamSequences sequences(store, "this");
+    LiveHarness harness({}, &sequences.sequences());
+    REQUIRE(harness.reaches(MarketDataSourceState::Reconnecting));
+    REQUIRE(contains(harness.diagnostic(), "pid 80567 on elsewhere"));
+    REQUIRE(harness.transport().connects() == 0U);
+    REQUIRE(harness.unavailable("AAPL") == MarketStateUnavailableCode::SourceUnavailable);
+
+    // The other process's lease expires; the keeper retries a second later.
+    database.advance_to(database.now() + 15s);
+    sequences.clock().advance_to(sequences.clock().now() + 1s);
+    REQUIRE(eventually([&] { return !sequences.sequences().readiness().has_value(); }));
+    REQUIRE(harness.clock().await_waits(1));
+    harness.clock().advance_to(harness.clock().now() + 1s);
+    harness.go_live(harness.link());
+    harness.link().push(quote_frame());
+    REQUIRE(eventually([&] { return !harness.unavailable("AAPL").has_value(); }));
+    REQUIRE(harness.quote("AAPL").top_of_book.header.ingest_sequence == 1'087U);
+    REQUIRE(harness.transport().connects() == 1U);
+}
+
+// The lease's deadline passes while live, because the database cannot be
+// reached: nothing more is numbered or published, quotes stop being
+// executable, and after the lease is renewed a fresh quote is required.
+void test_a_lapsed_lease_ends_the_session_until_a_fresh_quote() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    StreamSequences sequences(store, "this");
+    LiveHarness harness({}, &sequences.sequences());
+    harness.go_live(harness.link());
+    harness.link().push(quote_frame());
+    REQUIRE(eventually([&] { return harness.source().status().events_applied == 1U; }));
+    REQUIRE(harness.quote("AAPL").top_of_book.header.ingest_sequence == 0U);
+
+    // The renewal due at 5 s fails; the lease was taken at 0, so the
+    // deadline is 12 s.
+    store.fail_next(MemoryLeaseStore::Fault::Unavailable);
+    REQUIRE(sequences.clock().await_waits(1));
+    sequences.clock().advance_to(sequences.clock().now() + 12s);
+    REQUIRE(sequences.clock().await_waits(2));
+    harness.link().push(quote_frame("AAPL", "227.35"));
+    REQUIRE(harness.reaches(MarketDataSourceState::Reconnecting));
+    REQUIRE(contains(harness.diagnostic(), "lapsed"));
+    REQUIRE(harness.source().status().events_applied == 1U);
+    REQUIRE(harness.unavailable("AAPL") == MarketStateUnavailableCode::SourceUnavailable);
+
+    // The database returns: the next retry renews the lease.
+    sequences.clock().advance_to(sequences.clock().now() + 1s);
+    REQUIRE(eventually([&] { return !sequences.sequences().readiness().has_value(); }));
+    auto second = harness.transport().accept();
+    REQUIRE(harness.clock().await_waits(1));
+    harness.clock().advance_to(harness.clock().now() + 1s);
+    harness.go_live(*second);
+    REQUIRE(harness.unavailable("AAPL") == MarketStateUnavailableCode::AwaitingFreshQuote);
+    second->push(quote_frame("AAPL", "227.36", "2026-09-28T13:30:15.000000000Z"));
+    REQUIRE(eventually([&] { return !harness.unavailable("AAPL").has_value(); }));
+    // The refused frame was never numbered.
+    REQUIRE(harness.quote("AAPL").top_of_book.header.ingest_sequence == 1U);
+}
+
+// A new process on the same stream, after a clean stop and after a crash,
+// continues after every sequence the earlier one reserved.
+// Records each frame the source numbers, so a test can act while that
+// frame waits to be published.
+class RecordingSequences final : public LiveIngestSequences {
+public:
+    explicit RecordingSequences(LiveIngestSequences& sequences) : sequences_(sequences) {}
+
+    std::optional<chronos::market_data::IngestSequencesUnavailable> readiness() const override {
+        return sequences_.readiness();
+    }
+    chronos::market_data::BegunRun begin_run() override { return sequences_.begin_run(); }
+    chronos::market_data::IssuedSequence issue(std::uint64_t run, std::uint64_t count) override {
+        auto issued = sequences_.issue(run, count);
+        {
+            const std::lock_guard lock(mutex_);
+            if (std::holds_alternative<std::uint64_t>(issued)) {
+                ++issued_;
+            }
+        }
+        changed_.notify_all();
+        return issued;
+    }
+    std::optional<chronos::market_data::IngestSequencesUnavailable> publication_refusal(
+        std::uint64_t run
+    ) const override {
+        return sequences_.publication_refusal(run);
+    }
+
+    [[nodiscard]] bool await_issued(std::size_t count) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return issued_ >= count; });
+    }
+
+private:
+    LiveIngestSequences& sequences_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t issued_{0};
+};
+
+std::string three_quotes() {
+    return R"([{"T":"q","S":"AAPL","bx":"V","bp":227.34,"bs":300,"ax":"V","ap":227.36,"as":100,)"
+           R"("t":"2026-09-28T13:30:00.1Z"},)"
+           R"({"T":"q","S":"SPY","bx":"V","bp":655.10,"bs":300,"ax":"V","ap":655.12,"as":100,)"
+           R"("t":"2026-09-28T13:30:00.1Z"},)"
+           R"({"T":"q","S":"AAPL","bx":"V","bp":227.35,"bs":300,"ax":"V","ap":227.37,"as":100,)"
+           R"("t":"2026-09-28T13:30:00.2Z"}])";
+}
+
+// Codex's review, finding 1: a whole frame is numbered, then waits at the
+// real market-event gate while the stream changes hands and this process
+// takes it back. No event of that frame may be published.
+void test_a_frame_held_at_the_gate_is_never_published_after_its_run_ended() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    StreamSequences old_writer(store, "old");
+    RecordingSequences recording(old_writer.sequences());
+    LiveHarness harness({}, &recording);
+    harness.go_live(harness.link());
+    auto held = harness.gate().hold_market(std::chrono::steady_clock::now() + 30s);
+    REQUIRE(held.has_value());
+    harness.link().push(three_quotes());
+    REQUIRE(recording.await_issued(1));
+
+    // Renewals fail, the lease expires, and a successor takes over.
+    REQUIRE(old_writer.clock().await_waits(1));
+    store.fail_next(MemoryLeaseStore::Fault::Unavailable);
+    database.advance_to(database.now() + 15s);
+    old_writer.clock().advance_to(old_writer.clock().now() + 15s);
+    REQUIRE(old_writer.clock().await_waits(2));
+    const chronos::market_data::StreamWriter successor{.id = "successor", .label = "successor"};
+    REQUIRE(std::holds_alternative<chronos::market_data::LeaseGranted>(
+        store.acquire(MarketDataStreamId(std::string(kStream)), successor, 15s, 8, false)
+    ));
+    // The old keeper finds the stream taken; the successor stops; the old
+    // keeper takes the stream back with a new block.
+    old_writer.clock().advance_to(old_writer.clock().now() + 1s);
+    REQUIRE(old_writer.clock().await_waits(3));
+    store.release(MarketDataStreamId(std::string(kStream)), successor);
+    old_writer.clock().advance_to(old_writer.clock().now() + 1s);
+    REQUIRE(old_writer.clock().await_waits(4));
+    REQUIRE(!old_writer.sequences().readiness().has_value());
+
+    held.reset();
+    REQUIRE(eventually([&] {
+        return harness.source().status().state == MarketDataSourceState::Reconnecting ||
+            harness.source().status().events_applied > 0U;
+    }));
+    REQUIRE(harness.source().status().events_applied == 0U);
+    REQUIRE(!harness.market().status().last_ingest_sequence.has_value());
+}
+
+// Codex's review, finding 2: a quote arrives just before the lease's local
+// deadline; renewals fail; a successor takes the stream; the old source
+// sees only read timeouts. Its quote must not stay executable.
+void test_a_cached_quote_lapses_with_the_lease_without_new_traffic() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    StreamSequences sequences(store, "idle");
+    LiveHarness harness({}, &sequences.sequences());
+    harness.go_live(harness.link());
+    REQUIRE(sequences.clock().await_waits(1));
+    store.fail_next(MemoryLeaseStore::Fault::Unavailable, 2);
+    sequences.clock().advance_to(sequences.clock().now() + 11s);
+    database.advance_to(database.now() + 11s);
+    REQUIRE(sequences.clock().await_waits(2));
+    harness.clock().advance_to(harness.clock().now() + 11s);
+    harness.link().push(quote_frame());
+    REQUIRE(eventually([&] { return harness.source().status().events_applied == 1U; }));
+    REQUIRE(!harness.unavailable("AAPL").has_value());
+    // Idle in its next read before the deadline passes.
+    REQUIRE(harness.link().await_drained());
+
+    // The local deadline (12 s) passes, the lease expires (15 s), and a
+    // successor takes over.
+    sequences.clock().advance_to(sequences.clock().now() + 4s);
+    database.advance_to(database.now() + 4s);
+    REQUIRE(sequences.clock().await_waits(3));
+    REQUIRE(std::holds_alternative<chronos::market_data::LeaseGranted>(store.acquire(
+        MarketDataStreamId(std::string(kStream)),
+        chronos::market_data::StreamWriter{.id = "successor", .label = "successor"},
+        15s,
+        8,
+        false
+    )));
+    // The old source is idle in a read, and its quote is already unusable:
+    // eligibility does not wait for the next frame or timeout.
+    REQUIRE(harness.link().await_drained());
+    REQUIRE(harness.unavailable("AAPL") == MarketStateUnavailableCode::SourceUnavailable);
+    // Only a read timeout reaches it, and that ends the session.
+    harness.clock().advance_to(harness.clock().now() + 4s);
+    harness.link().push_timeout();
+    REQUIRE(eventually([&] { return harness.source().status().state == MarketDataSourceState::Reconnecting; }));
+    REQUIRE(harness.unavailable("AAPL").has_value());
+    REQUIRE(harness.source().status().events_applied == 1U);
+}
+
+// A renewal that succeeds only after the deadline passed: the lease was
+// never taken over, but the cached quote does not become executable again;
+// a new run and a fresh quote are required.
+void test_a_late_renewal_does_not_revive_a_cached_quote() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    StreamSequences sequences(store, "late");
+    LiveHarness harness({}, &sequences.sequences());
+    harness.go_live(harness.link());
+    harness.link().push(quote_frame());
+    REQUIRE(eventually([&] { return harness.source().status().events_applied == 1U; }));
+    REQUIRE(!harness.unavailable("AAPL").has_value());
+
+    // The renewal due at 5 s blocks in the store past the 12 s deadline.
+    // Unblocked on every exit, so a failure cannot leave the keeper stuck.
+    REQUIRE(sequences.clock().await_waits(1));
+    const struct Unblock {
+        MemoryLeaseStore& store;
+        ~Unblock() { store.unblock(); }
+    } unblock{store};
+    store.block_next();
+    sequences.clock().advance_to(sequences.clock().now() + 5s);
+    REQUIRE(store.await_blocked());
+    sequences.clock().advance_to(sequences.clock().now() + 8s);
+    REQUIRE(harness.unavailable("AAPL").has_value());
+    store.unblock();
+    REQUIRE(eventually([&] { return !sequences.sequences().readiness().has_value(); }));
+    // Renewed, yet the old quote stays unusable.
+    REQUIRE(harness.unavailable("AAPL").has_value());
+}
+
+void test_a_new_process_continues_after_the_previous_ones_sequences() {
+    ManualClock database(ManualClock::Mode::Hold);
+    MemoryLeaseStore store(database);
+    {
+        StreamSequences sequences(store, "first");
+        LiveHarness harness({}, &sequences.sequences());
+        harness.go_live(harness.link());
+        harness.link().push(quote_frame());
+        harness.link().push(quote_frame("SPY"));
+        REQUIRE(eventually([&] { return harness.source().status().events_applied == 2U; }));
+        REQUIRE(harness.quote("SPY").top_of_book.header.ingest_sequence == 1U);
+        harness.source().stop();
+        sequences.sequences().close();
+    }
+    {
+        StreamSequences sequences(store, "second");
+        LiveHarness harness({}, &sequences.sequences());
+        harness.go_live(harness.link());
+        harness.link().push(quote_frame("SPY"));
+        REQUIRE(eventually([&] { return !harness.unavailable("SPY").has_value(); }));
+        REQUIRE(harness.quote("SPY").top_of_book.header.ingest_sequence == 8U);
+        // A crash: the release never reaches the store.
+        harness.source().stop();
+        store.fail_next(MemoryLeaseStore::Fault::Unavailable);
+        sequences.sequences().close();
+    }
+    REQUIRE(store.row(std::string(kStream))->writer == std::optional<std::string>("second"));
+    StreamSequences sequences(store, "third");
+    LiveHarness harness({}, &sequences.sequences());
+    REQUIRE(harness.reaches(MarketDataSourceState::Reconnecting));
+    database.advance_to(database.now() + 15s);
+    sequences.clock().advance_to(sequences.clock().now() + 1s);
+    REQUIRE(eventually([&] { return !sequences.sequences().readiness().has_value(); }));
+    REQUIRE(harness.clock().await_waits(1));
+    harness.clock().advance_to(harness.clock().now() + 1s);
+    harness.go_live(harness.link());
+    harness.link().push(quote_frame());
+    REQUIRE(eventually([&] { return !harness.unavailable("AAPL").has_value(); }));
+    REQUIRE(harness.quote("AAPL").top_of_book.header.ingest_sequence == 16U);
 }
 
 void test_rejected_credentials_fail_without_reconnecting() {
@@ -589,11 +883,13 @@ void test_shutdown_during_connection_is_prompt() {
     MarketStateFeed feed(market, notifier);
     auto transport = std::make_unique<FakeTransport>();
     FakeTransport& fake = *transport;
+    chronos::test::ReadyIngestSequences sequences{std::string(kStream)};
     AlpacaLiveSource source(
         std::move(transport),
         fake_credentials(),
         aapl_and_spy(),
         feed,
+        sequences.sequences(),
         clock,
         receive_clock,
         [](MonotonicClock::duration bound) { return bound; }
@@ -663,8 +959,28 @@ int main() {
          test_connects_authenticates_subscribes_and_goes_live},
         {"describes itself as IEX only and refuses replay commands",
          test_describes_itself_as_iex_only_and_refuses_replay_commands},
-        {"refuses an exhausted ingest sequence before connecting",
-         test_refuses_an_exhausted_ingest_sequence_before_connecting},
+        {"an exhausted stream fails without connecting", test_an_exhausted_stream_fails_without_connecting},
+        {
+            "opens no connection until it holds the stream's lease",
+            test_opens_no_connection_until_it_holds_the_streams_lease,
+        },
+        {
+            "a lapsed lease ends the session until a fresh quote",
+            test_a_lapsed_lease_ends_the_session_until_a_fresh_quote,
+        },
+        {
+            "a new process continues after the previous one's sequences",
+            test_a_new_process_continues_after_the_previous_ones_sequences,
+        },
+        {
+            "a frame held at the gate is never published after its run ended",
+            test_a_frame_held_at_the_gate_is_never_published_after_its_run_ended,
+        },
+        {
+            "a cached quote lapses with the lease without new traffic",
+            test_a_cached_quote_lapses_with_the_lease_without_new_traffic,
+        },
+        {"a late renewal does not revive a cached quote", test_a_late_renewal_does_not_revive_a_cached_quote},
         {"rejected credentials fail without reconnecting",
          test_rejected_credentials_fail_without_reconnecting},
         {"insufficient subscription is fatal", test_insufficient_subscription_is_fatal},

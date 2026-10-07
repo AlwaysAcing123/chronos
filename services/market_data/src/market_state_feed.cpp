@@ -24,18 +24,42 @@ MarketStateFeed::MarketStateFeed(
 std::optional<std::string> MarketStateFeed::apply(
     const ValidatedMarketEvent& event
 ) {
+    return apply_event(event, nullptr, 0).failed;
+}
+
+FeedPublication MarketStateFeed::publish(
+    const ValidatedMarketEvent& event,
+    const PublicationPermit& permit,
+    std::uint64_t run
+) {
+    return apply_event(event, &permit, run);
+}
+
+FeedPublication MarketStateFeed::apply_event(
+    const ValidatedMarketEvent& event,
+    const PublicationPermit* permit,
+    std::uint64_t run
+) {
     // Only the source's own thread applies events, so the check and the
     // increment below cannot interleave with another apply.
     if (events_applied_.load() == std::numeric_limits<std::uint64_t>::max()) {
-        return "the applied-event count cannot be represented";
+        return FeedPublication{.refused = std::nullopt, .failed = "the applied-event count cannot be represented"};
     }
     std::optional<std::unique_lock<MarketEventGate::Mutex>> exclusive;
     if (gate_ != nullptr) {
         exclusive.emplace(gate_->apply_event());
     }
+    if (permit != nullptr) {
+        if (auto refused = permit->publication_refusal(run)) {
+            return FeedPublication{.refused = std::move(refused), .failed = std::nullopt};
+        }
+    }
     const MarketStateUpdateResult update = market_state_.apply(event);
     if (const auto* rejected = std::get_if<MarketStateUpdateError>(&update)) {
-        return "market state rejected an event: " + rejected->message;
+        return FeedPublication{
+            .refused = std::nullopt,
+            .failed = "market state rejected an event: " + rejected->message,
+        };
     }
     events_applied_.fetch_add(1);
     std::optional<std::string> observer_failure;
@@ -58,7 +82,7 @@ std::optional<std::string> MarketStateFeed::apply(
     }
     exclusive.reset();
     notifier_.publish();
-    return observer_failure;
+    return FeedPublication{.refused = std::nullopt, .failed = std::move(observer_failure)};
 }
 
 }  // namespace chronos::market_data

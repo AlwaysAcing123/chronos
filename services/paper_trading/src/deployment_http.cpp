@@ -1,5 +1,6 @@
 #include "chronos/paper_trading/deployment_http.hpp"
 
+#include "chronos/datasets/market_event_codec.hpp"
 #include "chronos/features/top_of_book_features.hpp"
 #include "chronos/paper_trading/paper_trading_http_contract.hpp"
 
@@ -106,6 +107,147 @@ ResponseJson counters_json(const DeploymentRunCounters& run) {
     return json;
 }
 
+ResponseJson nullable_text(const std::optional<std::string>& text) {
+    return text ? ResponseJson(*text) : ResponseJson(nullptr);
+}
+
+template <typename Integer>
+ResponseJson nullable_integer(const std::optional<Integer>& value) {
+    return value ? ResponseJson(std::to_string(*value)) : ResponseJson(nullptr);
+}
+
+ResponseJson outcome_json(const std::optional<DeploymentRuntimeOutcome>& outcome) {
+    if (!outcome) {
+        return nullptr;
+    }
+    ResponseJson json = ResponseJson::object();
+    json["code"] = outcome->code;
+    json["ingest_sequence"] = nullable_integer(outcome->ingest_sequence);
+    json["observation_received_at"] = nullable_time(outcome->observation_receive);
+    json["decision_sequence"] = nullable_integer(outcome->decision_sequence);
+    json["at_market"] = nullable_time(outcome->at_market);
+    json["at_wall"] = format_timestamp(outcome->at_wall);
+    return json;
+}
+
+ResponseJson activity_json(const std::optional<DeploymentActivity>& activity) {
+    if (!activity) {
+        return nullptr;
+    }
+    ResponseJson json = ResponseJson::object();
+    json["last_candidate"] = outcome_json(activity->last_candidate);
+    json["last_submission"] = outcome_json(activity->last_submission);
+    if (activity->pending) {
+        ResponseJson pending = ResponseJson::object();
+        pending["decision_sequence"] = std::to_string(activity->pending->decision_sequence);
+        pending["observation_received_at"] = format_timestamp(activity->pending->observation_receive);
+        pending["not_before_received_at"] = format_timestamp(activity->pending->not_before_receive);
+        pending["expires_at"] = format_timestamp(activity->pending->expires_at_market);
+        json["pending"] = std::move(pending);
+    } else {
+        json["pending"] = nullptr;
+    }
+    return json;
+}
+
+ResponseJson market_json(const std::optional<DeploymentMarketCondition>& market) {
+    if (!market) {
+        return nullptr;
+    }
+    const DeploymentQuoteCondition& quote = market->quote;
+    ResponseJson quote_json = ResponseJson::object();
+    quote_json["available"] = quote.available;
+    quote_json["unavailable_reason"] = nullable_text(quote.unavailable_reason);
+    quote_json["ingest_sequence"] = nullable_integer(quote.ingest_sequence);
+    quote_json["received_at"] = nullable_time(quote.received_at);
+    quote_json["age_ns"] = nullable_integer(quote.age_ns);
+    quote_json["maximum_age_ns"] = std::to_string(quote.maximum_age_ns);
+    quote_json["stale"] = quote.stale;
+    quote_json["suspect"] = quote.suspect;
+    ResponseJson json = ResponseJson::object();
+    json["market_time"] = nullable_time(market->market_time);
+    json["source_state"] = market->source_state
+        ? ResponseJson(std::string(market_data::state_name(*market->source_state)))
+        : ResponseJson(nullptr);
+    json["trading_status"] = market->trading_status
+        ? ResponseJson(std::string(datasets::trading_status_name(*market->trading_status)))
+        : ResponseJson(nullptr);
+    json["quote"] = std::move(quote_json);
+    return json;
+}
+
+ResponseJson condition_json(const DeploymentCondition& condition) {
+    ResponseJson json = ResponseJson::object();
+    json["code"] = condition.code;
+    json["reason"] = nullable_text(condition.reason);
+    json["observation_received_at"] = nullable_time(condition.observation_receive);
+    json["training_cutoff"] = nullable_time(condition.training_cutoff);
+    json["next_eligible_received_at"] = nullable_time(condition.next_eligible_receive);
+    json["not_before_received_at"] = nullable_time(condition.not_before_receive);
+    json["expires_at"] = nullable_time(condition.expires_at);
+    json["decision_sequence"] = nullable_integer(condition.decision_sequence);
+    json["observed_at_market"] = nullable_time(condition.observed_at_market);
+    json["observed_at_wall"] = nullable_time(condition.observed_at_wall);
+    return json;
+}
+
+// A market-clock duration from `from` to `to`, exact, or why there is none.
+// A negative or overflowing difference is reported, never clamped.
+ResponseJson market_duration(std::optional<Timestamp> from, std::optional<Timestamp> to, std::string_view missing) {
+    ResponseJson json = ResponseJson::object();
+    json["clock"] = "market";
+    if (!from || !to) {
+        json["unavailable"] = missing;
+        return json;
+    }
+    std::int64_t difference = 0;
+    if (__builtin_sub_overflow(to->nanoseconds(), from->nanoseconds(), &difference)) {
+        json["unavailable"] = "overflow";
+    } else if (difference < 0) {
+        json["unavailable"] = "inconsistent_clock";
+    } else {
+        json["nanoseconds"] = std::to_string(difference);
+    }
+    return json;
+}
+
+ResponseJson decision_timing_json(const DeploymentDecisionRecord& record) {
+    const Timestamp signal = record.decision.observation_receive;
+    const bool ordered = record.client_order_id.has_value();
+    const std::string_view unresolved = !ordered ? "no_order"
+        : record.state == DecisionState::Pending ? "not_resolved"
+        : "no_execution";
+    ResponseJson json = ResponseJson::object();
+    json["signal_to_decision"] = market_duration(signal, record.decision.decided_at_market, "unavailable");
+    json["execution_quote_offset"] = market_duration(
+        signal, record.execution_receive, unresolved
+    );
+    json["signal_to_resolution"] = market_duration(
+        signal, record.resolved_at_market, !ordered ? "no_order" : "not_resolved"
+    );
+    json["signal_to_fill"] = market_duration(
+        signal,
+        record.fill ? std::optional(record.fill->last_filled_at) : std::nullopt,
+        !ordered ? "no_order" : record.state == DecisionState::Pending ? "not_resolved" : "no_fill"
+    );
+    return json;
+}
+
+ResponseJson fill_json(const std::optional<DecisionFill>& fill) {
+    if (!fill) {
+        return nullptr;
+    }
+    ResponseJson json = ResponseJson::object();
+    json["count"] = std::to_string(fill->count);
+    json["quantity"] = fill->quantity.to_string();
+    json["notional"] = fill->notional.to_string();
+    json["fees"] = fill->fees.to_string();
+    json["price"] = fill->price ? ResponseJson(fill->price->to_string()) : ResponseJson(nullptr);
+    json["first_filled_at"] = format_timestamp(fill->first_filled_at);
+    json["last_filled_at"] = format_timestamp(fill->last_filled_at);
+    return json;
+}
+
 ResponseJson deployment_json(const DeploymentStatus& status) {
     const ModelDeploymentRecord& record = status.deployment;
     const ModelDeploymentConfig& config = record.config;
@@ -159,6 +301,9 @@ ResponseJson deployment_json(const DeploymentStatus& status) {
         : ResponseJson(nullptr);
     json["version"] = std::to_string(record.version);
     json["run"] = status.run ? counters_json(*status.run) : ResponseJson(nullptr);
+    json["activity"] = activity_json(status.activity);
+    json["market"] = market_json(status.market);
+    json["condition"] = condition_json(status.condition);
     return json;
 }
 
@@ -208,6 +353,8 @@ ResponseJson decision_json(const DeploymentDecisionRecord& record) {
     json["resolution"] = record.resolution ? ResponseJson(*record.resolution) : ResponseJson(nullptr);
     json["execution"] = std::move(execution);
     json["resolved_at"] = nullable_time(record.resolved_at_market);
+    json["fill"] = fill_json(record.fill);
+    json["timing"] = decision_timing_json(record);
     json["created_at"] = record.created_at;
     return json;
 }

@@ -1,5 +1,6 @@
 #include "chronos/paper_trading/deployment_runtime.hpp"
 
+#include "chronos/datasets/market_event_codec.hpp"
 #include "chronos/sha256.hpp"
 #include "chronos/strategy/long_flat_policy.hpp"
 
@@ -104,6 +105,12 @@ void DeploymentHub::observe(const ValidatedMarketEvent& event) {
     }
 }
 
+std::optional<TradingStatus> DeploymentHub::trading_status(const InstrumentId& instrument) const {
+    const std::lock_guard lock(mutex_);
+    const auto found = statuses_.find(instrument.value());
+    return found == statuses_.end() ? std::nullopt : std::optional(found->second);
+}
+
 bool DeploymentHub::is_trading(const InstrumentId& instrument) const {
     const std::lock_guard lock(mutex_);
     const auto found = statuses_.find(instrument.value());
@@ -120,6 +127,156 @@ void DeploymentHub::subscribe(const std::shared_ptr<CandidateMailbox>& mailbox) 
 void DeploymentHub::unsubscribe(const std::shared_ptr<CandidateMailbox>& mailbox) {
     const std::lock_guard lock(mutex_);
     std::erase(mailboxes_, mailbox);
+}
+
+// ---------------------------------------------------------------------------
+// Conditions (ADR 0019)
+
+std::string_view source_state_code(market_data::MarketDataSourceState state) noexcept {
+    using market_data::MarketDataSourceState;
+    switch (state) {
+        case MarketDataSourceState::None: return "no_market_data_source";
+        case MarketDataSourceState::Ready: return "source_not_started";
+        case MarketDataSourceState::Paused: return "source_paused";
+        case MarketDataSourceState::Completed: return "source_completed";
+        case MarketDataSourceState::Connecting:
+        case MarketDataSourceState::Authenticating:
+        case MarketDataSourceState::Subscribing: return "source_connecting";
+        case MarketDataSourceState::Reconnecting: return "source_reconnecting";
+        case MarketDataSourceState::Failed: return "source_failed";
+        case MarketDataSourceState::Stopped: return "source_stopped";
+        // Delivering events: not a condition of its own.
+        case MarketDataSourceState::Running:
+        case MarketDataSourceState::Live: return "";
+    }
+    return "";
+}
+
+namespace {
+
+DeploymentCondition condition_named(std::string code, std::optional<std::string> reason = std::nullopt) {
+    DeploymentCondition condition;
+    condition.code = std::move(code);
+    condition.reason = std::move(reason);
+    return condition;
+}
+
+// A runtime outcome's own provenance.
+void observed_at(DeploymentCondition& condition, const DeploymentRuntimeOutcome& outcome) {
+    condition.observed_at_market = outcome.at_market;
+    condition.observed_at_wall = outcome.at_wall;
+}
+
+}  // namespace
+
+DeploymentCondition deployment_condition(
+    const ModelDeploymentRecord& deployment,
+    bool active,
+    const std::optional<DeploymentActivity>& activity,
+    const std::optional<DeploymentMarketCondition>& market,
+    Timestamp now_wall
+) {
+    // 1. The durable lifecycle comes first: a stopped or faulted deployment
+    // is not "waiting", whatever its last run saw.
+    if (deployment.state != DeploymentState::Running) {
+        DeploymentCondition condition = condition_named(
+            std::string(deployment_state_name(deployment.state)), deployment.state_reason
+        );
+        return condition;
+    }
+    // 2. Durably running, but not here.
+    if (!active) {
+        return condition_named("not_running_here");
+    }
+    const auto now_market = market ? market->market_time : std::nullopt;
+    const auto observed_now = [&](DeploymentCondition condition) {
+        condition.observed_at_market = now_market;
+        condition.observed_at_wall = now_wall;
+        return condition;
+    };
+    if (market) {
+        // 3. The source, when it is not delivering events.
+        if (market->source_state) {
+            const std::string_view code = source_state_code(*market->source_state);
+            if (!code.empty()) {
+                return observed_now(condition_named(
+                    std::string(code), std::string(market_data::state_name(*market->source_state))
+                ));
+            }
+        }
+        // 4. The instrument and its quote. Silence never reads as a closed
+        // market: only a trading-status event says that.
+        if (market->trading_status &&
+            (*market->trading_status == TradingStatus::Halted || *market->trading_status == TradingStatus::Closed)) {
+            return observed_now(condition_named(
+                "instrument_not_trading", std::string(datasets::trading_status_name(*market->trading_status))
+            ));
+        }
+        if (!market->quote.available) {
+            return observed_now(condition_named("quote_unavailable", market->quote.unavailable_reason));
+        }
+        if (market->quote.suspect) {
+            return observed_now(condition_named("quote_suspect"));
+        }
+        if (market->quote.stale) {
+            return observed_now(condition_named("quote_stale"));
+        }
+    }
+    // 5. An order waiting to be submitted.
+    if (activity && activity->pending) {
+        const DeploymentPendingOrder& pending = *activity->pending;
+        DeploymentCondition condition = condition_named("order_pending");
+        condition.decision_sequence = pending.decision_sequence;
+        condition.observation_receive = pending.observation_receive;
+        condition.not_before_receive = pending.not_before_receive;
+        condition.expires_at = pending.expires_at_market;
+        if (activity->last_submission && activity->last_submission->decision_sequence == pending.decision_sequence) {
+            condition.reason = activity->last_submission->code;
+            observed_at(condition, *activity->last_submission);
+        }
+        return condition;
+    }
+    if (deployment.pending_decision) {
+        DeploymentCondition condition = condition_named("order_pending");
+        condition.decision_sequence = deployment.pending_decision;
+        return condition;
+    }
+    // 6. The latest candidate of this run.
+    if (activity && activity->last_candidate) {
+        const DeploymentRuntimeOutcome& latest = *activity->last_candidate;
+        DeploymentCondition condition;
+        condition.observation_receive = latest.observation_receive;
+        condition.decision_sequence = latest.decision_sequence;
+        observed_at(condition, latest);
+        const std::string& code = latest.code;
+        if (code == "decided_hold" || code == "decided_order" || code == "order_pending") {
+            // Decided, or skipped while an order that has since resolved
+            // was pending: waiting for the next candidate.
+            condition.code = "watching";
+            condition.reason = code;
+        } else if (code == "before_training_cutoff") {
+            condition.code = code;
+            condition.training_cutoff = deployment.config.training_cutoff;
+        } else if (code == "decision_interval") {
+            condition.code = "waiting_for_decision_interval";
+            std::int64_t next = 0;
+            if (deployment.watermark_receive &&
+                !__builtin_add_overflow(deployment.watermark_receive->nanoseconds(), deployment.config.decision_interval_ns, &next)) {
+                condition.next_eligible_receive = Timestamp::from_nanoseconds(next);
+            }
+        } else if (code.starts_with("inputs_unavailable:")) {
+            condition.code = "inputs_unavailable";
+            condition.reason = code.substr(std::string_view("inputs_unavailable:").size());
+        } else {
+            // not_after_watermark, stale_signal, order_pending,
+            // account_unavailable, persistence_unavailable,
+            // decision_refused, inference_failed:<code>.
+            condition.code = code;
+        }
+        return condition;
+    }
+    // 7. Running, with nothing taken yet.
+    return condition_named("waiting_for_candidate");
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +304,14 @@ DeploymentError persistence_error(const std::exception& failure) {
         "persistence_unavailable",
         std::string("PostgreSQL is unavailable: ") + failure.what()
     );
+}
+
+// The server's UTC wall clock, which stamps runtime outcomes only; every
+// observation, decision, and order time is the market clock.
+Timestamp wall_now() {
+    return Timestamp::from_nanoseconds(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count());
 }
 
 std::int64_t elapsed_us(std::chrono::steady_clock::time_point since) {
@@ -220,6 +385,26 @@ public:
         return copy;
     }
 
+    // The latest outcomes and the pending order, copied under the same leaf
+    // mutex as the counters.
+    [[nodiscard]] DeploymentActivity activity() const {
+        const std::lock_guard lock(mutex_);
+        DeploymentActivity copy{
+            .last_candidate = last_candidate_,
+            .last_submission = last_submission_,
+            .pending = std::nullopt,
+        };
+        if (pending_ && pending_->not_before_receive && pending_->expires_at_market) {
+            copy.pending = DeploymentPendingOrder{
+                .decision_sequence = pending_->decision_sequence,
+                .observation_receive = pending_->decision.observation_receive,
+                .not_before_receive = *pending_->not_before_receive,
+                .expires_at_market = *pending_->expires_at_market,
+            };
+        }
+        return copy;
+    }
+
 private:
     void run() {
         try {
@@ -230,7 +415,7 @@ private:
                 }
                 if (has_pending()) {
                     if (taken.candidate) {
-                        skip("order_pending");
+                        skip("order_pending", *taken.candidate);
                     }
                     attempt_submission();
                     continue;
@@ -250,9 +435,42 @@ private:
         return pending_.has_value();
     }
 
-    void skip(const std::string& reason) {
+    // A candidate that was not decided on: counted, and kept as the latest
+    // candidate outcome.
+    void skip(const std::string& reason, const DeploymentCandidate& candidate) {
+        const DeploymentRuntimeOutcome outcome = candidate_outcome(reason, candidate, std::nullopt);
         const std::lock_guard lock(mutex_);
         ++counters_.skipped[reason];
+        last_candidate_ = outcome;
+    }
+
+    [[nodiscard]] DeploymentRuntimeOutcome candidate_outcome(
+        std::string code,
+        const DeploymentCandidate& candidate,
+        std::optional<std::int64_t> decision_sequence
+    ) const {
+        return DeploymentRuntimeOutcome{
+            .code = std::move(code),
+            .ingest_sequence = candidate.ingest_sequence,
+            .observation_receive = candidate.receive_timestamp,
+            .decision_sequence = decision_sequence,
+            .at_market = service_.market_state().status().market_time,
+            .at_wall = wall_now(),
+        };
+    }
+
+    // The latest check or submission of the pending order.
+    void note_submission(std::string code, std::int64_t decision_sequence) {
+        DeploymentRuntimeOutcome outcome{
+            .code = std::move(code),
+            .ingest_sequence = std::nullopt,
+            .observation_receive = std::nullopt,
+            .decision_sequence = decision_sequence,
+            .at_market = service_.market_state().status().market_time,
+            .at_wall = wall_now(),
+        };
+        const std::lock_guard lock(mutex_);
+        last_submission_ = std::move(outcome);
     }
 
     void note_error(std::string message) {
@@ -274,26 +492,27 @@ private:
         }
         const ModelDeploymentConfig& config = deployment_.config;
         if (candidate.receive_timestamp < config.training_cutoff) {
-            return skip("before_training_cutoff");
+            return skip("before_training_cutoff", candidate);
         }
         if (!is_after(candidate, deployment_)) {
-            return skip("not_after_watermark");
+            return skip("not_after_watermark", candidate);
         }
         if (deployment_.watermark_receive &&
             candidate.receive_timestamp.nanoseconds() - deployment_.watermark_receive->nanoseconds() <
                 config.decision_interval_ns) {
-            return skip("decision_interval");
+            return skip("decision_interval", candidate);
         }
         const auto* inputs = std::get_if<std::array<std::int64_t, strategy::kModelInputs>>(&candidate.inputs);
         if (inputs == nullptr) {
             return skip(
                 "inputs_unavailable:" +
-                std::string(features::unavailability_name(std::get<features::Unavailability>(candidate.inputs)))
+                    std::string(features::unavailability_name(std::get<features::Unavailability>(candidate.inputs))),
+                candidate
             );
         }
         const Timestamp decided_at = market_now(candidate.receive_timestamp);
         if (decided_at.nanoseconds() - candidate.receive_timestamp.nanoseconds() > config.max_signal_age_ns) {
-            return skip("stale_signal");
+            return skip("stale_signal", candidate);
         }
 
         const auto started = std::chrono::steady_clock::now();
@@ -309,6 +528,13 @@ private:
         );
         const std::int64_t took = elapsed_us(started);
         if (const auto* failed = std::get_if<InferenceFailure>(&predicted)) {
+            const DeploymentRuntimeOutcome outcome = candidate_outcome(
+                "inference_failed:" + std::string(inference_failure_name(failed->code)), candidate, std::nullopt
+            );
+            {
+                const std::lock_guard lock(mutex_);
+                last_candidate_ = outcome;
+            }
             return fault(std::string(inference_failure_name(failed->code)), failed->message);
         }
         const InferencePrediction& prediction = std::get<InferencePrediction>(predicted);
@@ -322,7 +548,7 @@ private:
         const PaperAccountResult account = service_.get_account(config.account_id);
         if (const auto* failed = std::get_if<PaperTradingError>(&account)) {
             note_error("the account could not be read: " + failed->message);
-            return skip("account_unavailable");
+            return skip("account_unavailable", candidate);
         }
         const Quantity position = std::get<PaperAccountView>(account).state.quantity(config.instrument);
         const strategy::PolicyDecision policy = strategy::decide_long_flat(
@@ -363,7 +589,7 @@ private:
             // Whether it committed is unknown: the database says, so the
             // runner adopts its watermark and any decision it holds.
             note_error(std::string("a decision could not be recorded: ") + failure.what());
-            skip("persistence_unavailable");
+            skip("persistence_unavailable", candidate);
             return resynchronize();
         }
         const auto& recorded = *attempted;
@@ -373,15 +599,20 @@ private:
                 return;
             }
             note_error("a decision was refused: " + refused->message);
-            skip("decision_refused");
+            skip("decision_refused", candidate);
             return resynchronize();
         }
         const DeploymentDecisionRecord& stored = std::get<DeploymentDecisionRecord>(recorded);
         deployment_.watermark_receive = candidate.receive_timestamp;
         deployment_.watermark_ingest_sequence = candidate.ingest_sequence;
         deployment_.next_decision_sequence = stored.decision_sequence + 1;
+        const bool order = stored.state == DecisionState::Pending;
+        const DeploymentRuntimeOutcome outcome = candidate_outcome(
+            order ? "decided_order" : "decided_hold", candidate, stored.decision_sequence
+        );
         const std::lock_guard lock(mutex_);
-        if (stored.state == DecisionState::Pending) {
+        last_candidate_ = outcome;
+        if (order) {
             ++counters_.order_decisions;
             pending_ = stored;
         } else {
@@ -442,11 +673,11 @@ private:
             const ExecutionQuoteResult quote = service_.market_state().execution_quote(config.instrument);
             const auto* current = std::get_if<ExecutionQuote>(&quote);
             if (current == nullptr) {
-                return wait("market_data_unavailable");
+                return wait("market_data_unavailable", pending.decision_sequence);
             }
             if (current->top_of_book.header.ingest_sequence <= pending.decision.observation_ingest_sequence ||
                 current->top_of_book.header.receive_timestamp < *pending.not_before_receive) {
-                return wait("awaiting_latency");
+                return wait("awaiting_latency", pending.decision_sequence);
             }
         }
         const auto submitted = std::chrono::steady_clock::now();
@@ -463,9 +694,11 @@ private:
         }
         switch (attempt.outcome) {
             case DeploymentOrderOutcome::Recorded:
+                note_submission("recorded:" + attempt.reason, pending.decision_sequence);
                 resolved(true);
                 return check_limits();
             case DeploymentOrderOutcome::Abandoned:
+                note_submission("abandoned:" + attempt.reason, pending.decision_sequence);
                 resolved(false);
                 if (attempt.reason == "signal_expired") {
                     // The deployment decides again on a later candidate.
@@ -478,18 +711,21 @@ private:
                 exit_ = true;
                 return;
             case DeploymentOrderOutcome::NotPending:
+                note_submission("not_pending:" + attempt.reason, pending.decision_sequence);
                 return reconcile();
             case DeploymentOrderOutcome::NotYetEligible:
             case DeploymentOrderOutcome::Busy:
-                return wait(attempt.reason);
+                return wait(attempt.reason, pending.decision_sequence);
             case DeploymentOrderOutcome::Unavailable:
                 // Uncertain: the decision says whether its order committed.
+                note_submission("uncertain", pending.decision_sequence);
                 note_error("a deployment order's outcome is uncertain: " + attempt.reason);
                 return reconcile();
         }
     }
 
-    void wait(const std::string& reason) {
+    void wait(const std::string& reason, std::int64_t decision_sequence) {
+        note_submission(reason, decision_sequence);
         const std::lock_guard lock(mutex_);
         ++counters_.waits[reason];
     }
@@ -608,6 +844,9 @@ private:
     mutable std::mutex mutex_;
     std::optional<DeploymentDecisionRecord> pending_;
     DeploymentRunCounters counters_;
+    // The latest outcome of each activity: bounded, overwritten in place.
+    std::optional<DeploymentRuntimeOutcome> last_candidate_;
+    std::optional<DeploymentRuntimeOutcome> last_submission_;
     std::thread thread_;
 };
 
@@ -830,16 +1069,72 @@ DeploymentCreateResult DeploymentManager::create(const DeploymentCreateRequest& 
 }
 
 DeploymentStatus DeploymentManager::status_of(ModelDeploymentRecord record) {
-    const std::lock_guard lock(runners_mutex_);
     DeploymentStatus status{.deployment = std::move(record), .active = false, .run = std::nullopt};
-    const auto runner = runners_.find(status.deployment.config.deployment_id);
-    if (runner != runners_.end()) {
-        status.active = !runner->second->finished();
-        status.run = runner->second->counters();
-    } else if (const auto run = finished_runs_.find(status.deployment.config.deployment_id); run != finished_runs_.end()) {
-        status.run = run->second;
+    {
+        // runners_mutex_, then a runner's leaf mutex, as the counters do.
+        const std::lock_guard lock(runners_mutex_);
+        const std::string& id = status.deployment.config.deployment_id;
+        if (const auto runner = runners_.find(id); runner != runners_.end()) {
+            status.active = !runner->second->finished();
+            status.run = runner->second->counters();
+            status.activity = runner->second->activity();
+        } else {
+            if (const auto run = finished_runs_.find(id); run != finished_runs_.end()) {
+                status.run = run->second;
+            }
+            if (const auto activity = finished_activity_.find(id); activity != finished_activity_.end()) {
+                status.activity = activity->second;
+            }
+        }
     }
+    // Market facts are read with no manager lock held; each takes only its
+    // own component's leaf mutex.
+    status.market = market_condition_of(status.deployment.config);
+    status.condition = deployment_condition(status.deployment, status.active, status.activity, status.market, wall_now());
     return status;
+}
+
+std::optional<DeploymentMarketCondition> DeploymentManager::market_condition_of(const ModelDeploymentConfig& config) const {
+    if (config.stream != options_.stream) {
+        return std::nullopt;
+    }
+    DeploymentMarketCondition market{
+        .market_time = service_.market_state().status().market_time,
+        .source_state = options_.source_status
+            ? std::optional(options_.source_status().state)
+            : std::nullopt,
+        .trading_status = hub_.trading_status(config.instrument),
+        .quote = DeploymentQuoteCondition{
+            .available = false,
+            .unavailable_reason = std::nullopt,
+            .ingest_sequence = std::nullopt,
+            .received_at = std::nullopt,
+            .age_ns = std::nullopt,
+            .maximum_age_ns = config.risk_limits.maximum_quote_age_nanoseconds,
+            .stale = false,
+            .suspect = false,
+        },
+    };
+    const ExecutionQuoteResult quote = service_.market_state().execution_quote(config.instrument);
+    if (const auto* unavailable = std::get_if<MarketStateUnavailable>(&quote)) {
+        market.quote.unavailable_reason = std::string(market_state_unavailable_name(unavailable->code));
+        return market;
+    }
+    const ExecutionQuote& current = std::get<ExecutionQuote>(quote);
+    market.market_time = current.market_time;
+    const MarketEventHeader& header = current.top_of_book.header;
+    market.quote.available = true;
+    market.quote.ingest_sequence = header.ingest_sequence;
+    market.quote.received_at = header.receive_timestamp;
+    market.quote.suspect = header.quality.is_suspect();
+    // The quote and its age come from one market-state read, so the age
+    // uses that read's clock; a checked difference, never clamped.
+    std::int64_t age = 0;
+    if (!__builtin_sub_overflow(current.market_time.nanoseconds(), header.receive_timestamp.nanoseconds(), &age)) {
+        market.quote.age_ns = age;
+        market.quote.stale = age > market.quote.maximum_age_ns;
+    }
+    return market;
 }
 
 DeploymentResult DeploymentManager::get(std::string_view deployment_id) {
@@ -895,6 +1190,7 @@ void DeploymentManager::reap_finished_locked() {
         for (auto entry = runners_.begin(); entry != runners_.end();) {
             if (entry->second->finished()) {
                 finished_runs_[entry->first] = entry->second->counters();
+                finished_activity_[entry->first] = entry->second->activity();
                 finished.push_back(std::move(entry->second));
                 entry = runners_.erase(entry);
             } else {
@@ -1002,6 +1298,7 @@ DeploymentResult DeploymentManager::start(std::string_view deployment_id) {
         {
             const std::lock_guard lock(runners_mutex_);
             finished_runs_.erase(std::string(deployment_id));
+            finished_activity_.erase(std::string(deployment_id));
             runners_.emplace(std::string(deployment_id), std::move(runner));
         }
         if (log_) {
@@ -1048,6 +1345,7 @@ DeploymentResult DeploymentManager::stop_locked(std::string_view deployment_id, 
         pending = runner->pending();
         const std::lock_guard lock(runners_mutex_);
         finished_runs_[std::string(deployment_id)] = runner->counters();
+        finished_activity_[std::string(deployment_id)] = runner->activity();
     }
     runner.reset();
     try {

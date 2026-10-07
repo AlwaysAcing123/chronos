@@ -3,9 +3,34 @@
 import type { Json } from './fixtures';
 import { EXPERIMENT_ID } from './researchFixtures';
 
-// A deployment as the server renders it (deployment_http.cpp).
-export function deploymentJson(overrides: Json = {}): Json {
+// A condition (ADR 0019), every time absent unless given.
+export function conditionJson(code: string, overrides: Json = {}): Json {
   return {
+    code,
+    reason: null,
+    observation_received_at: null,
+    training_cutoff: null,
+    next_eligible_received_at: null,
+    not_before_received_at: null,
+    expires_at: null,
+    decision_sequence: null,
+    observed_at_market: null,
+    observed_at_wall: null,
+    ...overrides,
+  };
+}
+
+// A deployment as the server renders it (deployment_http.cpp). Unless a
+// test gives one, its condition follows its lifecycle: a stopped
+// deployment's is its reason, a running one is watching.
+export function deploymentJson(overrides: Json = {}): Json {
+  const state = typeof overrides.state === 'string' ? overrides.state : 'stopped';
+  const reason = typeof overrides.state_reason === 'string' ? overrides.state_reason : 'created';
+  return {
+    activity: null,
+    market: null,
+    condition:
+      state === 'running' ? conditionJson('watching', { reason: 'decided_hold' }) : conditionJson(state, { reason }),
     trading_mode: 'paper',
     deployment_id: 'spy-logistic',
     account_id: 'model-spy',
@@ -66,6 +91,21 @@ export function decisionJson(overrides: Json = {}): Json {
     resolution: 'filled',
     execution: { ingest_sequence: '72803', received_at: '2026-09-25T13:35:20.002000000Z' },
     resolved_at: '2026-09-25T13:35:20.002000000Z',
+    fill: {
+      count: '1',
+      quantity: '1',
+      notional: '768.94',
+      fees: '0.01',
+      price: '768.94',
+      first_filled_at: '2026-09-25T13:35:20.002000000Z',
+      last_filled_at: '2026-09-25T13:35:20.002000000Z',
+    },
+    timing: {
+      signal_to_decision: { clock: 'market', nanoseconds: '0' },
+      execution_quote_offset: { clock: 'market', nanoseconds: '1900000' },
+      signal_to_resolution: { clock: 'market', nanoseconds: '1900000' },
+      signal_to_fill: { clock: 'market', nanoseconds: '1900000' },
+    },
     created_at: '2026-10-04T15:00:01.000000000Z',
     ...overrides,
   };
