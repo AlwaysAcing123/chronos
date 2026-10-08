@@ -1233,6 +1233,59 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
         crash remain unexercised on real data. No broker order was sent.
 
     Measured limitation: under a fast replay, orders wait for the market-event gate, so the realized signal-to-execution delay (median 0.4–1.1 s of market time at 10x) far exceeds the configured latency, and a few signals expire. Durable live-stream continuity is code-reviewed and fresh-account live-verified, pending milestone acceptance; a fairer gate or matching outside it follows. Several things remain: multi-share and multi-instrument deployments, limit orders, durable run counters, broader real-live reconnect/pending-order acceptance, and authentication.
+14. **Implemented, awaiting Codex review (not committed):** a versioned
+    model library, constrained model imports, fair historical comparisons,
+    and paper deployment of registered versions, on branch
+    `feature/model-registry-import-comparison`
+    ([ADR 0021](docs/decisions/0021-model-registry-imports-and-comparisons.md)).
+    - **A. Model library.** Immutable, content-addressed model versions
+      (`chronos.model_version/1`). The record separates the version ID, the
+      payload checksum, and the source experiment, with immutable name and
+      version bindings and an active or archived lifecycle. Every read is
+      verified. Experiment models register as jobs after their sources are
+      verified again. The Models page lists, registers, inspects, and
+      archives them.
+    - **B. Constrained imports.** One ONNX profile
+      (`chronos.onnx_classifier/1`: the `top_of_book_baseline/1` inputs,
+      three float64 probabilities, eight static operators, bounded size).
+      It is checked and run only in a restricted, pinned Docker sandbox:
+      no network, read-only, unprivileged, bounded memory, CPU, processes,
+      and time, and unavailable rather than weaker without Docker. No
+      container outlives its owner: a supervisor token lets the research
+      service and the paper server remove and verify a killed child's
+      containers, and a per-session watchdog covers an owner that dies with
+      no supervisor left. The
+      upload is bounded and two-step, and the exact reviewed bytes are
+      frozen. A smoke corpus is judged on the host. Declared provenance is
+      kept apart from verified provenance, and a missing cutoff is
+      unavailable, never zero. `export-onnx` writes a logistic version as
+      an import, with a parity report.
+    - **C. Comparisons.** 2 to 6 versions under one frozen spec, each
+      predicted point in time (schedule version 2), run by the C++ engine
+      in its own accounts (strategy run version 2, which names the version
+      and never an experiment), rebuilt, and replayed. Refused and failed
+      members are kept, benchmarks are checked identical, and deltas are
+      exact. Only after every member is predicted are the window's realized
+      labels read. Each member's stored predictions are then scored with the
+      experiment's metric definitions, shown apart from trading results with
+      unscored rows counted by reason. The Comparisons page reviews, starts,
+      and shows both side by side.
+    - **D. Registered-model deployments.** Migration 008 adds an explicit
+      experiment-or-registered variant without loosening migration 005's
+      rules for experiment deployments. Worker protocol 2 and
+      `--onnx-docker` serve a version by its ID, an import only in the
+      sandbox. A deployment is created stopped and re-verified at every
+      Start. Archived versions cannot be newly deployed.
+    - **Proven on real services:** the AAPL recording's logistic version
+      exported and imported through the browser, its parity within 1e-12
+      (largest difference 3.3e-16) with every class and policy signal equal
+      over 27,724 rows; compared with the majority model and refused models; and
+      deployed, started, filled 14 times, stopped, and restarted cleanly and
+      after a crash, on an isolated review database.
+    - **Limits.** Imports need Docker. An import's cutoff is its uploader's
+      declaration and cannot be verified. Only one profile, one instrument,
+      and one target exist. No retraining, champion promotion, or
+      authentication.
 
 The repository currently implements type-specific fixed-point price, money,
 and quantity values; provider-independent market-event types; structured
@@ -1293,11 +1346,13 @@ verifies that whole chain; label-free inference schedules feed a
 deterministic C++ strategy runner that trades one versioned long/flat policy
 through the paper-execution engine beside cash and buy-and-hold benchmarks;
 and a local research service and the workspace's Research view start those
-evaluations and show their results. Chronos does not yet implement
-boosted-tree or temporal models, walk-forward evaluation, a model registry,
-authentication, or the Models, Experiments, and Data areas of the web
-application. A first, controlled model-driven deployment to dedicated paper
-accounts is implemented, as item 13 describes.
+evaluations and show their results. A model library, constrained ONNX
+imports, comparisons, and paper deployments of registered versions are
+implemented and awaiting review, as item 14 describes. Chronos does not yet
+implement boosted-tree or temporal models, walk-forward evaluation,
+authentication, or the Experiments and Data areas of the web application. A
+first, controlled model-driven deployment to dedicated paper accounts is
+implemented, as item 13 describes.
 
 ## 20. Post-submission OCaml learning and translation
 

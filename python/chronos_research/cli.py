@@ -16,6 +16,22 @@
     serve             the local research service (see service.py)
     inference-worker  one model deployment's long-lived inference, for the
                       paper-trading server (see inference_worker.py)
+    register-model    registers one fitted model of a verified experiment,
+                      whose sources chronos_dataset verifies again, as an
+                      immutable model version with a name and version
+    list-models       lists the registered model versions
+    inspect-model     verifies one model version and traces its source
+    set-model-lifecycle  archives or reactivates a model version
+    onnx-sandbox      reports whether the ONNX sandbox can run here, or
+                      builds its pinned image
+    import-model      validates an ONNX model in the sandbox and imports
+                      exactly those bytes as a model version; the research
+                      service runs it as a child job on a staged import
+    export-onnx       writes a registered logistic version as an ONNX model
+                      and an import manifest, with a parity report
+    compare-models    runs a chronos.model_comparison_spec/1 and publishes
+                      the comparison; the research service runs it as a job
+    inspect-comparison  verifies a comparison and replays every member's run
 
 Every option is given at most once, never abbreviated, and never empty.
 Success prints one JSON document on stdout and exits 0; a refused input or
@@ -24,16 +40,32 @@ malformed usage exits 2.
 """
 
 import argparse
+import hashlib
 import json
+import os
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from chronos_research import comparison, model_library
 from chronos_research.artifacts import ArtifactError, is_artifact_id, verify_sources
 from chronos_research.demo import DEFAULT_HORIZON_NS, DemoSource, run_demo
+from chronos_research.encoding import StrictJsonError, strict_json_object
 from chronos_research.experiment import MANIFEST, SCOPE
+from chronos_research.import_staging import StagingError, read_staged_model
 from chronos_research.inspection import InspectionError, verify_experiment
+from chronos_research.model_import import ModelImportError, import_model
+from chronos_research.onnx_profile import MAX_MODEL_BYTES
+from chronos_research.onnx_sandbox import (
+    SUPERVISOR_DIGITS,
+    Sandbox,
+    SandboxFailedError,
+    SandboxRejectedError,
+    SandboxUnavailableError,
+    is_supervisor,
+)
 from chronos_research.pipeline import (
     ArtifactRoots,
     PipelineError,
@@ -47,6 +79,17 @@ from chronos_research.pipeline import (
     verified_sources,
 )
 from chronos_research.publication import PublicationError
+from chronos_research.registry import (
+    EXPERIMENT_FAMILIES,
+    LIFECYCLE_STATES,
+    RegistryError,
+    RegistryRoots,
+    model_version_ids,
+    names_by_version,
+    register_experiment_model,
+    set_lifecycle,
+    verified_model_version,
+)
 from chronos_research.schedule import SCHEDULE_MODELS, WINDOWS, ScheduleError, reproduce_schedule
 
 
@@ -80,6 +123,12 @@ def _positive_integer(text: str) -> int:
 def _artifact_id(text: str) -> str:
     if not is_artifact_id(text):
         raise argparse.ArgumentTypeError("must be a 64-digit lowercase ID")
+    return text
+
+
+def _supervisor(text: str) -> str:
+    if not is_supervisor(text):
+        raise argparse.ArgumentTypeError(f"must be {SUPERVISOR_DIGITS} lowercase hexadecimal digits")
     return text
 
 
@@ -171,10 +220,104 @@ def _parser() -> argparse.ArgumentParser:
         "inference-worker", allow_abbrev=False, help="one deployment's model inference (server use)"
     )
     worker.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the artifact roots")
-    worker.add_argument("--experiment", required=True, type=_artifact_id, action=_Once, help="the experiment")
+    worker.add_argument(
+        "--experiment", type=_artifact_id, action=_Once, help="an experiment's model: the experiment"
+    )
     worker.add_argument("--instrument", required=True, action=_Once, help="the instrument")
-    worker.add_argument("--model", required=True, choices=SCHEDULE_MODELS, action=_Once, help="the model")
+    worker.add_argument(
+        "--model", choices=SCHEDULE_MODELS, action=_Once, help="an experiment's model: the model"
+    )
+    worker.add_argument(
+        "--model-version", type=_artifact_id, action=_Once, help="a registered model version, by its ID"
+    )
     worker.add_argument("--describe", action="store_true", help="report the model's identity and exit")
+    _docker_options(worker, supervised=True)
+    register = commands.add_parser(
+        "register-model", allow_abbrev=False, help="register a verified experiment model as a model version"
+    )
+    for option, help_text in (
+        ("--tools", "the directory of built Chronos tools"),
+        ("--artifacts", "the directory of artifact roots"),
+    ):
+        register.add_argument(option, required=True, type=_path, action=_Once, help=help_text)
+    register.add_argument(
+        "--experiment", required=True, type=_artifact_id, action=_Once, help="the experiment"
+    )
+    register.add_argument("--instrument", required=True, action=_Once, help="the instrument")
+    register.add_argument(
+        "--model", required=True, choices=EXPERIMENT_FAMILIES, action=_Once, help="the model"
+    )
+    register.add_argument("--name", required=True, action=_Once, help="the model name, such as aapl-logistic")
+    register.add_argument("--version", required=True, action=_Once, help="its version, such as 1")
+    listing = commands.add_parser("list-models", allow_abbrev=False, help="list registered model versions")
+    listing.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the artifact roots")
+    inspect_model = commands.add_parser("inspect-model", allow_abbrev=False, help="verify one model version")
+    inspect_model.add_argument(
+        "--artifacts", required=True, type=_path, action=_Once, help="the artifact roots"
+    )
+    inspect_model.add_argument(
+        "--model-version", required=True, type=_artifact_id, action=_Once, help="the model version ID"
+    )
+    _docker_options(inspect_model)
+    lifecycle = commands.add_parser(
+        "set-model-lifecycle", allow_abbrev=False, help="archive or reactivate a model version"
+    )
+    lifecycle.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the artifact roots")
+    lifecycle.add_argument(
+        "--model-version", required=True, type=_artifact_id, action=_Once, help="the model version ID"
+    )
+    lifecycle.add_argument("--state", required=True, choices=LIFECYCLE_STATES, action=_Once, help="the state")
+    lifecycle.add_argument("--reason", required=True, action=_Once, help="why, for the record")
+    sandbox = commands.add_parser("onnx-sandbox", allow_abbrev=False, help="the ONNX sandbox's capability")
+    sandbox.add_argument("action", choices=("status", "build"), help="report its status, or build its image")
+    _docker_options(sandbox)
+    importing = commands.add_parser(
+        "import-model", allow_abbrev=False, help="validate an ONNX model in the sandbox and import it"
+    )
+    importing.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the artifact roots")
+    importing.add_argument("--staged", type=_path, action=_Once, help="a staged import (service use)")
+    importing.add_argument("--manifest", type=_path, action=_Once, help="the chronos.model_import/1 manifest")
+    importing.add_argument("--model", type=_path, action=_Once, help="the ONNX model file")
+    importing.add_argument(
+        "--model-sha256", required=True, type=_artifact_id, action=_Once, help="the reviewed model's SHA-256"
+    )
+    _docker_options(importing, supervised=True)
+    export = commands.add_parser(
+        "export-onnx", allow_abbrev=False, help="export a registered logistic version as an ONNX model"
+    )
+    for option, help_text in (
+        ("--tools", "the directory of built Chronos tools, to verify the parity rows' sources"),
+        ("--artifacts", "the directory of artifact roots"),
+    ):
+        export.add_argument(option, required=True, type=_path, action=_Once, help=help_text)
+    export.add_argument(
+        "--model-version", required=True, type=_artifact_id, action=_Once, help="the logistic version"
+    )
+    export.add_argument("--output", required=True, type=_path, action=_Once, help="a new directory")
+    export.add_argument("--name", required=True, action=_Once, help="the import's model name")
+    export.add_argument("--version", required=True, action=_Once, help="the import's version")
+    _docker_options(export)
+    compare = commands.add_parser(
+        "compare-models", allow_abbrev=False, help="compare registered model versions"
+    )
+    for option, help_text in (
+        ("--tools", "the directory of built Chronos tools"),
+        ("--artifacts", "the directory of artifact roots"),
+    ):
+        compare.add_argument(option, required=True, type=_path, action=_Once, help=help_text)
+    compare.add_argument("--spec", required=True, action=_Once, help="the comparison spec, as JSON")
+    _docker_options(compare, supervised=True)
+    inspect_comparison = commands.add_parser(
+        "inspect-comparison", allow_abbrev=False, help="verify a comparison and replay its members' runs"
+    )
+    for option, help_text in (
+        ("--tools", "the directory of built Chronos tools"),
+        ("--artifacts", "the directory of artifact roots"),
+    ):
+        inspect_comparison.add_argument(option, required=True, type=_path, action=_Once, help=help_text)
+    inspect_comparison.add_argument(
+        "--comparison", required=True, type=_artifact_id, action=_Once, help="the comparison ID"
+    )
     serve = commands.add_parser("serve", allow_abbrev=False, help="the local research service")
     for option, help_text in (
         ("--tools", "the directory of built Chronos tools"),
@@ -192,7 +335,41 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--retain-jobs", type=_positive_integer, action=_Once, help="job records (default 200)"
     )
+    _docker_options(serve)
     return parser
+
+
+def _docker_options(parser: argparse.ArgumentParser, supervised: bool = False) -> None:
+    parser.add_argument("--docker", action=_Once, help="the Docker CLI for the ONNX sandbox (default docker)")
+    parser.add_argument("--docker-host", action=_Once, help="DOCKER_HOST for it, if not the default")
+    if supervised:
+        parser.add_argument(
+            "--sandbox-supervisor",
+            type=_supervisor,
+            action=_Once,
+            help="the token of the process that runs this one, to label its sandbox containers",
+        )
+
+
+def _sandbox(arguments: argparse.Namespace) -> Sandbox:
+    return Sandbox(
+        docker=arguments.docker or "docker",
+        docker_host=arguments.docker_host,
+        supervisor=getattr(arguments, "sandbox_supervisor", None),
+    )
+
+
+def _bounded_file(path: Path, limit: int, what: str) -> bytes:
+    """A regular file of at most `limit` bytes, read once."""
+    with open(path, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise ModelImportError("invalid_upload", f"the {what} is not a regular file")
+        data = file.read(limit + 1)
+    if len(data) > limit:
+        raise ModelImportError(
+            "model_too_large" if what == "model" else "invalid_manifest", f"the {what} exceeds {limit} bytes"
+        )
+    return data
 
 
 # The strategy options a job may set, by their chronos_strategy names.
@@ -234,6 +411,7 @@ def _serve(arguments: argparse.Namespace) -> dict[str, Any]:
         max_queued=arguments.max_queued or 8,
         job_timeout_s=arguments.job_timeout_s or 1800,
         retain_jobs=arguments.retain_jobs or 200,
+        sandbox=_sandbox(arguments),
     )
     serve(configuration)
     return {"stopped": True}
@@ -344,8 +522,150 @@ def _inspect(arguments: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _fail(kind: str, message: str) -> int:
-    print(json.dumps({"error": {"kind": kind, "message": message}}, indent=2), file=sys.stderr)
+def _register_model(arguments: argparse.Namespace) -> dict[str, Any]:
+    tools, roots = Tools(arguments.tools), ArtifactRoots.under(arguments.artifacts)
+    registry = RegistryRoots.under(arguments.artifacts)
+    split_id = experiment_split(roots.experiments, arguments.experiment)
+    sources = verified_sources(tools, roots, split_id, reproduce_features=True)
+    registration = register_experiment_model(
+        registry,
+        roots.experiments,
+        sources,
+        arguments.experiment,
+        arguments.instrument,
+        arguments.model,
+        arguments.name,
+        arguments.version,
+    )
+    version = verified_model_version(registry, registration.model_version_id)
+    names = names_by_version(registry).get(version.model_version_id, [])
+    return {**registration.as_json(), "model": model_library.summary(registry, version, names)}
+
+
+def _list_models(arguments: argparse.Namespace) -> dict[str, Any]:
+    registry = RegistryRoots.under(arguments.artifacts)
+    names = names_by_version(registry)
+    models, invalid = [], []
+    for version_id in model_version_ids(registry):
+        try:
+            version = verified_model_version(registry, version_id)
+            models.append(
+                model_library.listing_entry(
+                    model_library.summary(registry, version, names.get(version_id, []))
+                )
+            )
+        except RegistryError as error:
+            invalid.append({"model_version_id": version_id, "reason": str(error)})
+    return {"invalid_entries": invalid, "models": models}
+
+
+def _inspect_model(arguments: argparse.Namespace) -> dict[str, Any]:
+    registry = RegistryRoots.under(arguments.artifacts)
+    version = verified_model_version(registry, arguments.model_version)
+    names = names_by_version(registry).get(version.model_version_id, [])
+    return {
+        "model": model_library.detail(
+            registry,
+            ArtifactRoots.under(arguments.artifacts).experiments,
+            version,
+            names,
+            _sandbox(arguments).capability(),
+        ),
+        "verified": (
+            "the file set, the canonical manifest and its ID, the payload's size and checksum, the payload "
+            "parsed as a valid model of its family, and its training and provenance records"
+        ),
+    }
+
+
+def _onnx_sandbox(arguments: argparse.Namespace) -> dict[str, Any]:
+    sandbox = _sandbox(arguments)
+    if arguments.action == "build":
+        return {"image": sandbox.build(), "sandbox": sandbox.capability()}
+    return {"reaped": sandbox.reap_stale(), "sandbox": sandbox.capability()}
+
+
+def _import_inputs(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
+    """The manifest and the model bytes, read once; the bytes must be the
+    reviewed ones."""
+    if arguments.staged is not None:
+        if arguments.manifest is not None or arguments.model is not None:
+            raise ModelImportError("invalid_request", "--staged replaces --manifest and --model")
+        return read_staged_model(arguments.staged, arguments.model_sha256)
+    if arguments.manifest is None or arguments.model is None:
+        raise ModelImportError("invalid_request", "give --manifest and --model, or --staged")
+    try:
+        manifest = strict_json_object(_bounded_file(arguments.manifest, 16 * 1024, "manifest"))
+    except StrictJsonError as error:
+        raise ModelImportError("invalid_manifest", f"the manifest: {error}") from error
+    model = _bounded_file(arguments.model, MAX_MODEL_BYTES, "model")
+    if hashlib.sha256(model).hexdigest() != arguments.model_sha256:
+        raise ModelImportError("model_mismatch", "the model file is not the one whose SHA-256 was given")
+    return manifest, model
+
+
+def _import_model(arguments: argparse.Namespace) -> dict[str, Any]:
+    registry = RegistryRoots.under(arguments.artifacts)
+    manifest, model = _import_inputs(arguments)
+    registration = import_model(registry, manifest, model, _sandbox(arguments))
+    version = verified_model_version(registry, registration.model_version_id)
+    names = names_by_version(registry).get(version.model_version_id, [])
+    return {**registration.as_json(), "model": model_library.summary(registry, version, names)}
+
+
+def _export_onnx(arguments: argparse.Namespace) -> dict[str, Any]:
+    from chronos_research.onnx_export import export_logistic
+
+    registry = RegistryRoots.under(arguments.artifacts)
+    version = verified_model_version(registry, arguments.model_version)
+    return export_logistic(
+        Tools(arguments.tools),
+        arguments.artifacts,
+        version,
+        arguments.output,
+        arguments.name,
+        arguments.version,
+        _sandbox(arguments),
+    )
+
+
+def _compare_models(arguments: argparse.Namespace) -> dict[str, Any]:
+    try:
+        spec = strict_json_object(arguments.spec.encode())
+    except StrictJsonError as error:
+        raise comparison.ComparisonError(f"the spec: {error}") from error
+    return comparison.compare(Tools(arguments.tools), arguments.artifacts, spec, _sandbox(arguments))
+
+
+def _inspect_comparison(arguments: argparse.Namespace) -> dict[str, Any]:
+    roots = ArtifactRoots.under(arguments.artifacts)
+    manifest = comparison.verified_comparison(
+        comparison.comparisons_root(arguments.artifacts), arguments.comparison
+    )
+    replays = {
+        member["model_version_id"]: inspect_strategy(
+            Tools(arguments.tools), roots, member["run"]["artifact_id"]
+        )["reproduced"]
+        for member in manifest["members"]
+        if "run" in member
+    }
+    return {
+        "artifacts": comparison.member_artifacts(roots, manifest),
+        "comparison_id": manifest["comparison_id"],
+        "replayed": replays,
+        "status": manifest["status"],
+    }
+
+
+def _set_model_lifecycle(arguments: argparse.Namespace) -> dict[str, Any]:
+    registry = RegistryRoots.under(arguments.artifacts)
+    record = set_lifecycle(registry, arguments.model_version, arguments.state, arguments.reason)
+    return {"lifecycle": record, "model_version_id": arguments.model_version}
+
+
+def _fail(kind: str, message: str, reason: str | None = None) -> int:
+    error = {"kind": kind, "message": message} | ({} if reason is None else {"reason": reason})
+    print(json.dumps({"error": error}, indent=2), file=sys.stderr)
     return 1
 
 
@@ -364,10 +684,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         "inspect-schedule": _inspect_schedule,
         "evaluate-strategy": _evaluate_strategy,
         "serve": _serve,
+        "register-model": _register_model,
+        "list-models": _list_models,
+        "inspect-model": _inspect_model,
+        "set-model-lifecycle": _set_model_lifecycle,
+        "onnx-sandbox": _onnx_sandbox,
+        "import-model": _import_model,
+        "export-onnx": _export_onnx,
+        "compare-models": _compare_models,
+        "inspect-comparison": _inspect_comparison,
     }
     try:
         result = commands[arguments.command](arguments)
-    except (ArtifactError, InspectionError, PipelineError, PublicationError, ScheduleError, OSError) as error:
+    except (
+        ModelImportError,
+        SandboxFailedError,
+        SandboxRejectedError,
+        SandboxUnavailableError,
+        StagingError,
+    ) as error:
+        return _fail(type(error).__name__, str(error), error.reason)
+    except (
+        ArtifactError,
+        comparison.ComparisonError,
+        InspectionError,
+        PipelineError,
+        PublicationError,
+        RegistryError,
+        ScheduleError,
+        OSError,
+    ) as error:
         return _fail(type(error).__name__, str(error))
     except Exception as error:  # Still one JSON document, as the C++ tools give.
         return _fail("internal_error", f"{type(error).__name__}: {error}")

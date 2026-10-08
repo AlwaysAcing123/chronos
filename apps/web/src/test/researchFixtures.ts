@@ -21,9 +21,59 @@ export const DEFAULT_CONFIGURATION = {
   threshold_ppb: '500000000',
 };
 
+// The ONNX import profile and sandbox, as the service reports them.
+export const SANDBOX_LIMITS = {
+  cpus: '1',
+  load_timeout_s: '60',
+  memory: '256m',
+  nofile: '64',
+  pids: '32',
+  predict_timeout_ms: '2000',
+  reply_bytes: '65536',
+};
+
+export const SANDBOX_AVAILABLE: Json = {
+  content_sha256: '0f2742da590ccc4f54a2acc7c8dba6c3d9b52c6d2f5c94e384ef31daaa299f15',
+  image: 'chronos-onnx-sandbox:0f2742da590ccc4f',
+  limits: SANDBOX_LIMITS,
+  status: 'available',
+};
+
+export const SANDBOX_UNAVAILABLE: Json = {
+  detail:
+    'the sandbox image chronos-onnx-sandbox:0f2742da590ccc4f is not built; run python -m chronos_research onnx-sandbox build',
+  limits: SANDBOX_LIMITS,
+  reason: 'image_not_built',
+  status: 'unavailable',
+};
+
+export function importsJson(sandbox: Json = SANDBOX_AVAILABLE): Json {
+  return {
+    profile: {
+      attributes: {
+        Gemm: { alpha: 'FLOAT', beta: 'FLOAT', transA: 'INT', transB: 'INT' },
+        Softmax: { axis: 'INT' },
+      },
+      input: { dtype: 'float64', name: 'inputs', shape: ['1', '5'] },
+      ir_versions: ['7', '10'],
+      max_initializer_elements: '16384',
+      max_initializers: '32',
+      max_model_bytes: '1048576',
+      max_nodes: '64',
+      max_tensor_elements: '4096',
+      operators: ['Add', 'Div', 'Gemm', 'Identity', 'MatMul', 'Mul', 'Softmax', 'Sub'],
+      opsets: ['13', '21'],
+      output: { dtype: 'float64', name: 'probabilities', shape: ['1', '3'] },
+      profile: { name: 'chronos.onnx_classifier', version: '1' },
+    },
+    sandbox,
+  };
+}
+
 export function researchStatusJson(overrides: Json = {}): Json {
   return {
     defaults: DEFAULT_CONFIGURATION,
+    imports: importsJson(),
     jobs: { failed: '0', interrupted: '0', queued: '0', running: '0', succeeded: '0' },
     limits: { job_timeout_s: '1800', max_queued: '8', max_running: '1', retain_jobs: '200' },
     service: 'chronos-research',

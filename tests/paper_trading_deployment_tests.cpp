@@ -254,8 +254,7 @@ DeploymentCreateRequest create_request(std::string id = "dep-1", std::string acc
         .deployment_id = std::move(id),
         .account_id = std::move(account),
         .starting_cash = money("10000"),
-        .experiment_id = std::string(64, 'e'),
-        .model = "logistic",
+        .model = chronos::ExperimentModel{.experiment_id = std::string(64, 'e'), .name = "logistic"},
         .instrument = "AAPL",
         .threshold_ppb = 600'000'000,
         .target_quantity = quantity("1"),
@@ -620,9 +619,73 @@ void test_a_bad_model_fails_closed() {
     REQUIRE(started(rig).deployment.state == DeploymentState::Running);
 }
 
+std::shared_ptr<FakeModel> registered_model() {
+    auto model = std::make_shared<FakeModel>();
+    model->identity.model = chronos::RegisteredModel{.model_version_id = std::string(64, '7')};
+    model->identity.family = "onnx";
+    model->identity.cutoff_basis = "declared";
+    return model;
+}
+
+DeploymentCreateRequest registered_request() {
+    DeploymentCreateRequest request = create_request();
+    request.model = chronos::RegisteredModel{.model_version_id = std::string(64, '7')};
+    return request;
+}
+
+// An experiment deployment's request is the one ADR 0018 defined, byte for
+// byte, so the SHA-256 of every existing deployment's request still holds.
+void test_an_experiment_deployments_request_is_unchanged() {
+    REQUIRE(DeploymentManager::canonical_request(create_request()) ==
+        "chronos.model_deployment_request/1\ndeployment_id=dep-1\naccount_id=model-1\nstarting_cash=10000\n"
+        "experiment_id=" + std::string(64, 'e') + "\nmodel=logistic\ninstrument=AAPL\n"
+        "policy=long_flat_threshold/1\nthreshold_ppb=600000000\ntarget_quantity=1\n"
+        "decision_interval_ns=1000000\nlatency_ns=2000000\nmax_signal_age_ns=100000000\n"
+        "max_orders_per_run=10\nmax_consecutive_rejections=3\n");
+    const std::string registered = DeploymentManager::canonical_request(registered_request());
+    REQUIRE(registered.starts_with("chronos.model_deployment_request/2\n"));
+    REQUIRE(registered.find("model_version_id=" + std::string(64, '7') + "\n") != std::string::npos);
+    REQUIRE(registered.find("experiment_id") == std::string::npos);
+}
+
+// A registered version deploys by its immutable ID with its declared
+// cutoff, stopped, and starts only as the same identity; then it trades
+// through the same policy, latency, and trusted order path.
+void test_a_registered_version_deploys_by_its_id_and_starts_only_as_itself() {
+    const ScratchSchema schema;
+    auto model = registered_model();
+    Rig rig(schema, model);
+    const DeploymentStatus status = created(rig, registered_request());
+    REQUIRE(status.deployment.state == DeploymentState::Stopped);
+    REQUIRE(std::get<chronos::RegisteredModel>(status.deployment.config.model).model_version_id == std::string(64, '7'));
+    REQUIRE(status.deployment.config.family == "onnx");
+    REQUIRE(status.deployment.config.training_cutoff_basis == "declared");
+    REQUIRE(scalar(schema, "SELECT model_reference || '/' || coalesce(experiment_id, '-') || '/' || model_name || '/' "
+                           "|| training_cutoff_basis FROM model_deployments") == "registered/-/onnx/declared");
+    REQUIRE(model->open_sessions.load() == 0);
+    REQUIRE(model->requests.load() == 0);
+    // The same version, but no longer the identity it was created with.
+    ModelIdentity changed = model->identity;
+    changed.cutoff_basis = "verified";
+    model->served_identity = changed;
+    REQUIRE(std::get<DeploymentError>(rig.manager.start("dep-1")).reason == "model_identity_mismatch");
+    REQUIRE(rig.status_of().deployment.state == DeploymentState::Faulted);
+    model->served_identity.reset();
+    REQUIRE(started(rig).deployment.state == DeploymentState::Running);
+    rig.quote(kCutoffOffset - kMillisecond);
+    rig.wait_for([&] { return skipped(rig.counters(), "before_training_cutoff") == 1; }, "a candidate before the cutoff");
+    rig.quote(kCutoffOffset, "101");
+    rig.wait_for([&] { return rig.counters().order_decisions == 1; }, "an order decision");
+    rig.quote(kCutoffOffset + 2 * kMillisecond, "103");
+    rig.wait_for([&] { return rig.counters().orders_recorded == 1; }, "a recorded order");
+    REQUIRE(rig.account().state.quantity(InstrumentId("AAPL")) == quantity("1"));
+}
+
 void test_inference_failures_fault_the_deployment() {
+    // RequestRefused: the worker could not give this row a valid prediction,
+    // such as an imported model's non-finite output.
     for (const auto code : {InferenceFailureCode::Timeout, InferenceFailureCode::WorkerExited,
-                            InferenceFailureCode::ProtocolError}) {
+                            InferenceFailureCode::ProtocolError, InferenceFailureCode::RequestRefused}) {
         const ScratchSchema schema;
         auto model = std::make_shared<FakeModel>();
         Rig rig(schema, model);
@@ -1000,6 +1063,35 @@ std::string create_body(std::string id = "dep-1", std::string account = "model-1
     }.dump();
 }
 
+// A create names its model exactly one way.
+void test_a_registered_versions_create_names_it_alone() {
+    const ScratchSchema schema;
+    Rig rig(schema, registered_model());
+    auto registered = nlohmann::json::parse(create_body());
+    registered.erase("experiment_id");
+    registered.erase("model");
+    registered["model_version_id"] = std::string(64, '7');
+    auto mixed = registered;
+    mixed["experiment_id"] = std::string(64, 'e');
+    const auto refused = call(rig, "POST", "/api/v1/deployments", mixed.dump());
+    REQUIRE(refused.status == 400);
+    REQUIRE(refused.body["error"]["field"] == "experiment_id");
+    auto short_id = registered;
+    short_id["model_version_id"] = "7";
+    REQUIRE(call(rig, "POST", "/api/v1/deployments", short_id.dump()).body["error"]["field"] == "model_version_id");
+    auto neither = registered;
+    neither.erase("model_version_id");
+    REQUIRE(call(rig, "POST", "/api/v1/deployments", neither.dump()).body["error"]["field"] == "experiment_id");
+    const auto made = call(rig, "POST", "/api/v1/deployments", registered.dump());
+    REQUIRE(made.status == 201);
+    const auto& model = made.body["deployment"]["model"];
+    REQUIRE(model["reference"] == "registered");
+    REQUIRE(model["model_version_id"] == std::string(64, '7'));
+    REQUIRE(model["name"] == "onnx");
+    REQUIRE(model["training_cutoff_basis"] == "declared");
+    REQUIRE(!model.contains("experiment_id"));
+}
+
 void test_the_http_routes_follow_the_contract() {
     const ScratchSchema schema;
     Rig rig(schema, std::make_shared<FakeModel>());
@@ -1011,6 +1103,9 @@ void test_the_http_routes_follow_the_contract() {
     REQUIRE(deployment["state_reason"] == "created");
     REQUIRE(deployment["active"] == false);
     REQUIRE(deployment["model"]["parameters_sha256"] == std::string(64, 'f'));
+    REQUIRE(deployment["model"]["reference"] == "experiment");
+    REQUIRE(deployment["model"]["experiment_id"] == std::string(64, 'e'));
+    REQUIRE(deployment["model"]["training_cutoff_basis"] == "verified");
     REQUIRE(deployment["model"]["training_cutoff"] == "2026-09-25T13:30:00.010000000Z");
     REQUIRE(deployment["policy"]["threshold"] == "0.6");
     REQUIRE(deployment["policy"]["target_quantity"] == "1");
@@ -1411,6 +1506,12 @@ int main() {
     }
     connection_string = configured_connection;
     return chronos::test::run_tests({
+        {"an experiment deployment's request is unchanged", test_an_experiment_deployments_request_is_unchanged},
+        {
+            "a registered version deploys by its ID and starts only as itself",
+            test_a_registered_version_deploys_by_its_id_and_starts_only_as_itself,
+        },
+        {"a registered version's create names it alone", test_a_registered_versions_create_names_it_alone},
         {
             "nothing trades before the cutoff, and orders wait for the latency",
             test_nothing_trades_before_the_cutoff_and_orders_wait_for_the_latency,

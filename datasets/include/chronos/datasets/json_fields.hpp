@@ -100,6 +100,15 @@ void require_name_version(
     std::string_view version
 );
 
+// Requires parent[key] to name `name` at one of `versions`, and returns that
+// version; an empty string once an error is recorded.
+[[nodiscard]] std::string require_name_and_one_of_versions(
+    ObjectFields& parent,
+    std::string_view key,
+    std::string_view name,
+    std::initializer_list<std::string_view> versions
+);
+
 // Adds value to total unless the sum would overflow, in which case it
 // returns false and leaves total unchanged.
 [[nodiscard]] inline bool add_count(std::uint64_t& total, std::uint64_t value) noexcept {

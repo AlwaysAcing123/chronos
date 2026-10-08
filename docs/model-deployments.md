@@ -18,9 +18,12 @@ market event -> point-in-time features -> model inputs -> prediction
 
 ## What a deployment is
 
-- **One model.** A verified `logistic` or `majority` model from one research
-  experiment, for one instrument, identified by the SHA-256 of its parameters
-  as the inference worker re-derived them.
+- **One model.** Either a verified `logistic` or `majority` model from one
+  research experiment, identified by the SHA-256 of its parameters as the
+  inference worker re-derived them; or one registered model version from
+  the model library, identified by its immutable version ID and payload
+  checksum ([below](#registered-model-versions)). Either serves one
+  instrument.
 - **One account.** A new paper account, created with the deployment. The
   account belongs to the deployment for good. Manual orders and cancellations
   on it are refused with `409 account_owned_by_deployment`, whatever source
@@ -133,8 +136,13 @@ build/chronos_paper_trading_server \
   --research-artifacts data
 ```
 
-The database must have migration `005_model_deployments.sql` applied. The
-server never applies migrations itself.
+The database must have migrations `005_model_deployments.sql` and
+`008_registered_model_deployments.sql` applied (with 006 and 007 between
+them). The server never applies migrations itself; a database without 008
+fails deployment reads and creates with a message naming the file. To deploy
+imported ONNX models, also give the Docker CLI's absolute path:
+`--onnx-docker /usr/local/bin/docker` (on macOS with Homebrew,
+`/opt/homebrew/bin/docker`).
 
 Without the flag, the deployment routes still list deployments and still
 stop them, so a server cannot be left unable to stop what another started.
@@ -151,8 +159,10 @@ Probability checks use binary64 only for model output, never financial
 arithmetic: the probabilities must be finite, in range, sum to one, and
 agree with the winning class and exact parts-per-billion confidence.
 
-In the web client, Research has a **Deploy to paper** form: choose a model,
-review the frozen request, create it stopped. It also has a **Paper
+In the web client, Research has a **Deploy to paper** form for an
+experiment's model, and a registered version's page under Models has
+**Deploy this version to paper**: review the frozen request, create it
+stopped. It also has a **Paper
 deployments** panel with each deployment's state and reason, its run's
 counts, its latest decisions, Start behind an explicit confirmation, Stop,
 and the kill switch. **Open in trading** shows the account's portfolio,
@@ -166,6 +176,78 @@ Stop, another Start is blocked until Stop is acknowledged. An uncertain
 creation can be retried with the same reviewed request and IDs.
 
 The API is in [paper-trading-api.md](paper-trading-api.md#model-deployments).
+
+## Registered model versions
+
+A deployment can serve a registered model version
+([ADR 0021](decisions/0021-model-registry-imports-and-comparisons.md)):
+a version taken from an experiment, or a constrained ONNX import.
+
+- **The request.** It names the version by `model_version_id` alone, in
+  place of `experiment_id` and `model`; a body with both shapes is
+  `400 malformed_request`. Its canonical form is
+  `chronos.model_deployment_request/2`. An experiment deployment's request
+  is `chronos.model_deployment_request/1`, byte for byte as before, so every
+  existing deployment's `request_sha256` still holds.
+- **The worker.** The server runs `inference-worker --model-version <id>
+  --instrument <symbol>`. With `--onnx-docker` it adds `--docker <path>`
+  and `--sandbox-supervisor <token>`, a fresh random token for this worker.
+  It speaks `chronos.inference_worker/2`, whose ready line is:
+
+  ```json
+  {"cutoff_basis":"declared","family":"onnx","instrument":"AAPL",
+   "model_feature_set":{"name":"top_of_book_baseline","version":"1"},
+   "model_version_id":"5e05c484…","payload_sha256":"2bce7582…",
+   "protocol":"chronos.inference_worker/2","training_cutoff_ns":"1790343319090266460","type":"ready"}
+  ```
+
+  Requests and predictions are protocol 1's. A baseline version predicts
+  with the same row-pure arithmetic as its experiment model, bit for bit.
+  An import's every prediction runs in the ONNX sandbox container, never in
+  the server or the worker.
+- **Creation.** The worker's `--describe` verifies the version, requires
+  the requested instrument and a known information cutoff, and refuses an
+  archived version. For an import it also loads the model in the sandbox.
+  Anything else refuses the create (`422 model_unavailable`,
+  `model_rejected`), and nothing is written. The deployment records the
+  version ID, its family as the model name, the payload checksum, the
+  cutoff, and the cutoff's basis. It never records a name and version, so
+  nothing can retarget it.
+- **Start.** Start re-verifies the version and requires the identical
+  identity: version, instrument, family, payload checksum, feature set,
+  cutoff, and basis. A difference faults it with `model_identity_mismatch`.
+- **Declared cutoffs.** An import's cutoff is its uploader's declaration.
+  The deployment decides only on market data received at or after it, as
+  for any cutoff, and its status and the UI mark it "Declared by uploader,
+  not verified".
+- **Archive.** An archived version cannot be chosen for a new deployment. A
+  deployment that already serves it still starts, because archiving never
+  changes what uses a version.
+- **Failures.** A prediction that is not a valid distribution (wrong shape,
+  not finite, out of range, or not summing to one within 1e-12) is an error
+  line, which faults the deployment with `inference_request_refused`. A
+  sandbox that times out or exits makes the worker report the failure and
+  exit, which faults it with `inference_protocol_error`, or with
+  `inference_timeout` if the server's own deadline passes first. None of
+  these records an order. Without `--onnx-docker`, an import cannot be
+  created or started.
+- **Sandbox containers.** The server's deadlines (30 s to load, 2 s per
+  prediction) can kill a worker before it removes its own sandbox
+  container. So whenever a worker ends, by Stop, a deadline, an exit, or a
+  describe, the server removes every container under the worker's token
+  and checks that Docker lists none. It writes a diagnostic line if it
+  cannot confirm that. Each container's own watchdog also removes it when
+  its worker dies, including when the server dies too (ADR 0021).
+- **Storage.** Migration 008 adds `model_reference` (`experiment` or
+  `registered`), `model_version_id`, and `training_cutoff_basis`. One
+  constraint, `model_deployments_one_model_reference`, keeps an experiment
+  row to migration 005's rules (an experiment ID, no version ID, a logistic
+  or majority model, a verified cutoff), and a registered row to a version
+  ID and no experiment ID. Existing rows become experiment rows, unchanged.
+- **Status.** The deployment resource's `model` has `reference`, and either
+  `experiment_id` or `model_version_id`, with `name` (the family) and
+  `training_cutoff_basis`
+  ([paper-trading-api.md](paper-trading-api.md#the-deployment-resource)).
 
 ## What it is doing, and how long it took
 
@@ -544,5 +626,8 @@ a public distributable fixture; the ADR remains proposed pending acceptance.
   only. Decisions, orders, and the watermark are durable.
 - **One instrument, at most one share, market IOC orders only.** One
   deployment per account.
+- **Imported models need Docker and declare their cutoff.** An import runs
+  only in the ONNX sandbox, so the server needs `--onnx-docker` and the
+  sandbox image. Chronos cannot verify an import's declared cutoff.
 - **No real-broker anything.** An Alpaca deployment uses IEX market data
   only.

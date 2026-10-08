@@ -76,7 +76,8 @@ const std::string& deployment_select() {
     static const std::string select = std::string(R"SQL(
         SELECT
             d.deployment_id, d.creation_sequence, d.account_id, d.request_sha256,
-            d.experiment_id, d.parameters_sha256, d.model_name, d.instrument,
+            d.model_reference, d.experiment_id, d.model_version_id,
+            d.parameters_sha256, d.model_name, d.training_cutoff_basis, d.instrument,
             d.threshold_ppb, d.target_quantity_raw, d.decision_interval_ns,
             d.latency_ns, d.max_signal_age_ns, d.max_orders_per_run,
             d.max_consecutive_rejections, d.training_cutoff_ns, d.stream_id,
@@ -216,9 +217,20 @@ ModelDeploymentRecord parse_deployment(const PostgresResult& result, int row) {
     config.deployment_id = result.value(row, "deployment_id");
     config.account_id = result.value(row, "account_id");
     config.starting_cash = Money::from_raw(int64_of(result, row, "starting_cash_raw"));
-    config.experiment_id = result.value(row, "experiment_id");
+    const std::string reference = result.value(row, "model_reference");
+    if (reference == "experiment") {
+        config.model = ExperimentModel{
+            .experiment_id = result.value(row, "experiment_id"),
+            .name = result.value(row, "model_name"),
+        };
+    } else if (reference == "registered") {
+        config.model = RegisteredModel{.model_version_id = result.value(row, "model_version_id")};
+    } else {
+        throw std::runtime_error("invalid deployment model reference: " + reference);
+    }
+    config.family = result.value(row, "model_name");
     config.parameters_sha256 = result.value(row, "parameters_sha256");
-    config.model_name = result.value(row, "model_name");
+    config.training_cutoff_basis = result.value(row, "training_cutoff_basis");
     config.instrument = InstrumentId(result.value(row, "instrument"));
     config.training_cutoff = Timestamp::from_nanoseconds(int64_of(result, row, "training_cutoff_ns"));
     config.threshold_ppb = uint64_of(result, row, "threshold_ppb");
@@ -327,11 +339,23 @@ DeploymentDecisionRecord parse_decision(const PostgresResult& result, int row) {
     return record;
 }
 
+// A database without migration 008 has no model reference columns: say
+// which migration to apply rather than only that a statement failed.
+void require_deployment_status(const PostgresResult& result, ExecStatusType expected, std::string_view operation) {
+    if (result.status() != expected && result.sql_state() == "42703") {
+        throw std::runtime_error(
+            std::string(operation) + " failed: the database has no registered model deployments; apply "
+            "migrations/008_registered_model_deployments.sql"
+        );
+    }
+    require_status(result, expected, operation);
+}
+
 std::optional<ModelDeploymentRecord> select_deployment(PGconn* connection, std::string_view deployment_id) {
     PostgresParameters parameters;
     parameters.add(deployment_id);
     const auto result = execute(connection, deployment_select() + " WHERE d.deployment_id = $1", parameters);
-    require_status(result, PGRES_TUPLES_OK, "read deployment");
+    require_deployment_status(result, PGRES_TUPLES_OK, "read deployment");
     if (result.row_count() == 0) {
         return std::nullopt;
     }
@@ -594,9 +618,14 @@ std::variant<CreatedDeployment, DeploymentConflict> PostgresPaperOrderRepository
         deployment.add(config.deployment_id);
         deployment.add(config.account_id);
         deployment.add(config.request_sha256);
-        deployment.add(config.experiment_id);
+        const auto* experiment = std::get_if<ExperimentModel>(&config.model);
+        const auto* registered = std::get_if<RegisteredModel>(&config.model);
+        deployment.add(experiment != nullptr ? "experiment" : "registered");
+        deployment.add(experiment != nullptr ? std::optional(experiment->experiment_id) : std::nullopt);
+        deployment.add(registered != nullptr ? std::optional(registered->model_version_id) : std::nullopt);
         deployment.add(config.parameters_sha256);
-        deployment.add(config.model_name);
+        deployment.add(config.family);
+        deployment.add(config.training_cutoff_basis);
         deployment.add(config.instrument.value());
         deployment.add(config.threshold_ppb);
         deployment.add(config.target_quantity.raw());
@@ -613,22 +642,23 @@ std::variant<CreatedDeployment, DeploymentConflict> PostgresPaperOrderRepository
             connection,
             R"SQL(
                 INSERT INTO model_deployments (
-                    deployment_id, account_id, request_sha256, experiment_id,
-                    parameters_sha256, model_name, instrument, threshold_ppb,
+                    deployment_id, account_id, request_sha256, model_reference,
+                    experiment_id, model_version_id, parameters_sha256, model_name,
+                    training_cutoff_basis, instrument, threshold_ppb,
                     target_quantity_raw, decision_interval_ns, latency_ns,
                     max_signal_age_ns, max_orders_per_run, max_consecutive_rejections,
                     training_cutoff_ns, stream_id, model_feature_set, policy,
                     state, state_reason
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, 'stopped', 'created'
+                    $15, $16, $17, $18, $19, $20, $21, 'stopped', 'created'
                 )
                 ON CONFLICT (deployment_id) DO NOTHING
                 RETURNING deployment_id
             )SQL",
             deployment
         );
-        require_status(inserted, PGRES_TUPLES_OK, "create deployment");
+        require_deployment_status(inserted, PGRES_TUPLES_OK, "create deployment");
         if (inserted.row_count() == 1) {
             transaction.commit();
             auto record = select_deployment(connection, config.deployment_id);
@@ -666,7 +696,7 @@ DeploymentPage PostgresPaperOrderRepository::list_deployments(
             " ORDER BY d.creation_sequence DESC LIMIT $2",
         parameters
     );
-    require_status(result, PGRES_TUPLES_OK, "list deployments");
+    require_deployment_status(result, PGRES_TUPLES_OK, "list deployments");
     DeploymentPage page;
     for (int row = 0; row < result.row_count() && page.deployments.size() < limit; ++row) {
         page.deployments.push_back(parse_deployment(result, row));

@@ -64,3 +64,46 @@ def canonical_json(document: object) -> bytes:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class StrictJsonError(ValueError):
+    """A document is not strict JSON; why is its reason."""
+
+    def __init__(self, reason: str, message: str, field: str | None = None) -> None:
+        super().__init__(message)
+        self.reason, self.field = reason, field
+
+
+def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for key, value in pairs:
+        if key in document:
+            raise StrictJsonError("duplicate_field", f"{key} appears more than once", key)
+        document[key] = value
+    return document
+
+
+def _refuse_number(text: str) -> object:
+    raise StrictJsonError("invalid_type", "numbers are written as strings")
+
+
+def strict_json_object(data: bytes) -> dict[str, object]:
+    """One UTF-8 JSON object with no duplicate keys and no numbers, as
+    requests and uploaded manifests must be."""
+    try:
+        document = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_no_duplicates,
+            parse_float=_refuse_number,
+            parse_int=_refuse_number,
+            parse_constant=_refuse_number,
+        )
+    except UnicodeDecodeError as error:
+        raise StrictJsonError("invalid_json", "the body is not UTF-8") from error
+    except StrictJsonError:
+        raise
+    except ValueError as error:
+        raise StrictJsonError("invalid_json", f"the body is not JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise StrictJsonError("invalid_type", "the body must be one JSON object")
+    return document

@@ -51,6 +51,10 @@ from chronos_research.model_data import exact_inputs, to_floats
 from chronos_research.models import LogisticModel, MajorityModel, Unevaluable
 
 SCHEMA = {"name": "chronos.inference_schedule", "version": "1"}
+# A registered model version's schedule (ADR 0021; registered_schedule.py).
+# It names the version, never an experiment, and its model's information
+# cutoff, verified or declared, which must be at or before the window.
+REGISTERED_SCHEMA = {"name": "chronos.inference_schedule", "version": "2"}
 ROW_RECORD = {"name": "chronos.inference_row", "version": "1"}
 MANIFEST = "manifest.json"
 ROWS = "schedule.ndjson"
@@ -67,6 +71,19 @@ INFERENCE = {
     "rows": "every feature row of the instrument available in the window, labelled or not",
     "unavailable": "a row whose model inputs are unavailable has no prediction from any model",
     "window": "start_at_ns <= available_at_ns, and available_at_ns < end_at_ns when the window has an end",
+}
+REGISTERED_INFERENCE = {
+    **INFERENCE,
+    "class": "the model version's own class rule, stated in model.runtime.class",
+}
+CUTOFF_BASES = ("verified", "declared")
+_REGISTERED_MODEL_KEYS = {
+    "family",
+    "instrument",
+    "model_feature_set",
+    "model_version_id",
+    "payload_sha256",
+    "runtime",
 }
 
 
@@ -202,27 +219,37 @@ def _predict(
     return logistic_predictions(model, inputs)
 
 
-def build_schedule(
-    sources: VerifiedSources, experiment_directory: Path, instrument: str, model_name: str, window_name: str
-) -> Schedule:
-    window = evaluation_window(sources, window_name)
-    through = training_labels_available_through(sources)
-    require_training_precedes(window, through)
-    experiment_id, model, entry = _stored_model(experiment_directory, sources, instrument, model_name)
-
+def window_rows(sources: VerifiedSources, instrument: str, window: Window) -> list[FeatureRow]:
+    """Every feature row of the instrument available in the window."""
     rows = [
         row
         for row in read_feature_rows(sources.features)
         if row.identity.instrument == instrument and window.contains(row.available_at_ns)
     ]
-    inputs = [exact_inputs(row) for row in rows]
-    available = [value for value in inputs if not isinstance(value, Unavailable)]
-    classes, probabilities = _predict(model, available)
+    if not rows:
+        raise ScheduleError(f"{instrument} has no feature rows in the {window.name} window")
+    return rows
 
+
+@dataclass(frozen=True)
+class ScheduledRows:
+    contents: bytes
+    counts: dict[str, Any]
+
+
+def scheduled_rows(
+    rows: Sequence[FeatureRow],
+    inputs: Sequence[tuple[int, ...] | Unavailable],
+    predictions: Sequence[tuple[int, Sequence[float]]],
+) -> ScheduledRows:
+    """The schedule file and its counts. `predictions` holds one predicted
+    class index and its probabilities for each row whose inputs are
+    available, in order."""
     records: list[bytes] = []
     unavailable: dict[str, int] = {}
     class_counts = [0] * len(CLASS_ORDER)
-    predicted = 0
+    predicted = iter(predictions)
+    count = 0
     for row, value in zip(rows, inputs, strict=True):
         record: dict[str, Any] = {
             "available_at_ns": str(row.available_at_ns),
@@ -235,33 +262,66 @@ def build_schedule(
             record["inputs"] = {"unavailable": value.reason}
             record["prediction"] = {"unavailable": reason}
         else:
-            index = int(classes[predicted])
-            row_probabilities = [float(p) for p in probabilities[predicted]]
-            predicted += 1
+            index, probabilities = next(predicted)
+            count += 1
             class_counts[index] += 1
             record["inputs"] = {"raw": [str(raw) for raw in value]}
             record["prediction"] = {
                 "class": CLASS_ORDER[index],
-                "confidence_ppb": str(confidence_ppb(row_probabilities[index])),
-                "probabilities": [encode_float(p) for p in row_probabilities],
+                "confidence_ppb": str(confidence_ppb(float(probabilities[index]))),
+                "probabilities": [encode_float(float(p)) for p in probabilities],
             }
         records.append(canonical_json(record))
-    if not rows:
-        raise ScheduleError(f"{instrument} has no feature rows in the {window.name} window")
+    if next(predicted, None) is not None:
+        raise ScheduleError("there are more predictions than rows with available inputs")
+    return ScheduledRows(
+        contents=b"".join(records),
+        counts={
+            "classes": {name: str(n) for name, n in zip(CLASS_ORDER, class_counts, strict=True)},
+            "predicted": str(count),
+            "rows": str(len(rows)),
+            "unavailable": {reason: str(n) for reason, n in sorted(unavailable.items())},
+        },
+    )
 
-    contents = b"".join(records)
+
+def schedule_files(manifest: dict[str, Any], scheduled: ScheduledRows) -> Schedule:
+    """The published files of a manifest without its ID or files entry."""
+    manifest = {
+        **manifest,
+        "counts": scheduled.counts,
+        "files": {
+            "schedule": {
+                "name": ROWS,
+                "sha256": sha256_hex(scheduled.contents),
+                "size_bytes": str(len(scheduled.contents)),
+            }
+        },
+    }
+    schedule_id = schedule_identity(manifest)
+    return Schedule(
+        schedule_id=schedule_id,
+        files={ROWS: scheduled.contents, MANIFEST: canonical_json({**manifest, "artifact_id": schedule_id})},
+    )
+
+
+def build_schedule(
+    sources: VerifiedSources, experiment_directory: Path, instrument: str, model_name: str, window_name: str
+) -> Schedule:
+    window = evaluation_window(sources, window_name)
+    through = training_labels_available_through(sources)
+    require_training_precedes(window, through)
+    experiment_id, model, entry = _stored_model(experiment_directory, sources, instrument, model_name)
+    rows = window_rows(sources, instrument, window)
+    inputs = [exact_inputs(row) for row in rows]
+    available = [value for value in inputs if not isinstance(value, Unavailable)]
+    classes, probabilities = _predict(model, available)
+    scheduled = scheduled_rows(
+        rows, inputs, [(int(index), list(row)) for index, row in zip(classes, probabilities, strict=True)]
+    )
     manifest = {
         "class_order": list(CLASS_ORDER),
-        "counts": {
-            "classes": {name: str(count) for name, count in zip(CLASS_ORDER, class_counts, strict=True)},
-            "predicted": str(predicted),
-            "rows": str(len(rows)),
-            "unavailable": {reason: str(count) for reason, count in sorted(unavailable.items())},
-        },
         "environment": environment(),
-        "files": {
-            "schedule": {"name": ROWS, "sha256": sha256_hex(contents), "size_bytes": str(len(contents))}
-        },
         "inference": INFERENCE,
         "model": {
             "experiment_id": experiment_id,
@@ -277,11 +337,7 @@ def build_schedule(
         "training": {"label_available_through_ns": str(through), "split": "train"},
         "window": window.as_json(),
     }
-    schedule_id = schedule_identity(manifest)
-    return Schedule(
-        schedule_id=schedule_id,
-        files={ROWS: contents, MANIFEST: canonical_json({**manifest, "artifact_id": schedule_id})},
-    )
+    return schedule_files(manifest, scheduled)
 
 
 def schedule_identity(manifest: Mapping[str, Any]) -> str:
@@ -334,6 +390,27 @@ def _check_prediction(prediction: Any, inputs: Any, what: str) -> str | None:
     return str(prediction["class"])
 
 
+def require_cutoff_precedes(window: Window, information_cutoff_ns: int) -> None:
+    if information_cutoff_ns > window.start_at_ns:
+        raise ScheduleError(
+            f"the model's information cutoff {information_cutoff_ns} is after the {window.name} window "
+            f"begins at {window.start_at_ns}"
+        )
+
+
+def _check_registered_model(model: Any, training: Any, window: Window) -> None:
+    _require_keys(model, _REGISTERED_MODEL_KEYS, "the registered model")
+    _require_keys(model["runtime"], {"class", "name", "version"}, "the model's runtime")
+    if not is_artifact_id(model["model_version_id"]) or not is_artifact_id(model["payload_sha256"]):
+        raise ScheduleError("a registered model is named by its version ID and payload checksum")
+    if not all(isinstance(text, str) and text for text in (model["family"], *model["runtime"].values())):
+        raise ScheduleError("the model's family and runtime must be named")
+    _require_keys(training, {"basis", "information_cutoff_ns"}, "the model's training")
+    if training["basis"] not in CUTOFF_BASES:
+        raise ScheduleError("an information cutoff is verified or declared")
+    require_cutoff_precedes(window, decode_integer(training["information_cutoff_ns"]))
+
+
 def verify_schedule(directory: Path) -> dict[str, Any]:
     """Checks a schedule's files, identity, checksum, and every row, and
     returns its manifest. It does not recompute the predictions; see
@@ -358,10 +435,13 @@ def _verify(directory: Path) -> dict[str, Any]:
             raise ScheduleError(f"{name} must be a regular file")
     manifest = _canonical((directory / MANIFEST).read_bytes(), MANIFEST)
     _require_keys(manifest, _MANIFEST_KEYS, MANIFEST)
-    if manifest["schema"] != SCHEMA or manifest["row"] != ROW_RECORD or manifest["scope"] != SCOPE:
-        raise ScheduleError("unsupported schedule schema, row record, or scope")
-    if manifest["inference"] != INFERENCE or manifest["class_order"] != list(CLASS_ORDER):
-        raise ScheduleError("unsupported inference definition or class order")
+    if manifest["schema"] not in (SCHEMA, REGISTERED_SCHEMA) or manifest["row"] != ROW_RECORD:
+        raise ScheduleError("unsupported schedule schema or row record")
+    registered = manifest["schema"] == REGISTERED_SCHEMA
+    if manifest["scope"] != SCOPE or manifest["class_order"] != list(CLASS_ORDER):
+        raise ScheduleError("unsupported scope or class order")
+    if manifest["inference"] != (REGISTERED_INFERENCE if registered else INFERENCE):
+        raise ScheduleError("unsupported inference definition")
     if schedule_identity(manifest) != manifest["artifact_id"] or manifest["artifact_id"] != directory.name:
         raise ScheduleError("the schedule ID does not match the manifest's content or the directory name")
     window = Window(
@@ -373,10 +453,15 @@ def _verify(directory: Path) -> dict[str, Any]:
     )
     if window.name not in WINDOWS or (window.end_at_ns is None) != (window.name == "test"):
         raise ScheduleError(f"unsupported window {manifest['window']}")
-    require_training_precedes(window, decode_integer(manifest["training"]["label_available_through_ns"]))
     model = manifest["model"]
-    if model["name"] not in SCHEDULE_MODELS or model["model_feature_set"] != model_feature_set_json():
-        raise ScheduleError("unsupported model or model feature set")
+    if registered:
+        _check_registered_model(model, manifest["training"], window)
+    else:
+        require_training_precedes(window, decode_integer(manifest["training"]["label_available_through_ns"]))
+        if model["name"] not in SCHEDULE_MODELS:
+            raise ScheduleError("unsupported model")
+    if model["model_feature_set"] != model_feature_set_json():
+        raise ScheduleError("unsupported model feature set")
 
     digest = hashlib.sha256()
     count = predicted = 0

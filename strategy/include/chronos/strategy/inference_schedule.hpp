@@ -31,7 +31,10 @@
 namespace chronos::strategy {
 
 inline constexpr std::string_view kScheduleSchemaName = "chronos.inference_schedule";
-inline constexpr std::string_view kScheduleSchemaVersion = "1";
+// Version 1 schedules a verified experiment's model; version 2 a registered
+// model version (ADR 0021). Both stay readable, with their own meaning.
+inline constexpr std::string_view kExperimentScheduleVersion = "1";
+inline constexpr std::string_view kRegisteredScheduleVersion = "2";
 inline constexpr std::string_view kScheduleRowRecordName = "chronos.inference_row";
 inline constexpr std::string_view kScheduleRowRecordVersion = "1";
 inline constexpr std::string_view kScheduleRowsFileName = "schedule.ndjson";
@@ -63,6 +66,29 @@ struct ScheduleWindow {
     friend bool operator==(const ScheduleWindow&, const ScheduleWindow&) = default;
 };
 
+// The model of a version 1 schedule: a verified experiment's fitted model,
+// trained on labels all known before the window.
+struct ExperimentScheduleModel {
+    std::string experiment_id;
+    std::string name;
+    std::string parameters_sha256;
+    Timestamp training_labels_available_through;
+};
+
+// The model of a version 2 schedule: a registered model version, whose
+// information cutoff is at or before the window's start. A declared cutoff
+// is the uploader's claim, which the run records as such.
+struct RegisteredScheduleModel {
+    std::string model_version_id;
+    std::string family;
+    std::string payload_sha256;
+    Timestamp information_cutoff;
+    // "verified" or "declared".
+    std::string cutoff_basis;
+};
+
+using ScheduleModel = std::variant<ExperimentScheduleModel, RegisteredScheduleModel>;
+
 struct ScheduleManifest {
     std::string artifact_id;
     // The verified sources the model was trained and evaluated on.
@@ -73,14 +99,9 @@ struct ScheduleManifest {
     std::string label_artifact_id;
     std::string split_artifact_id;
     std::int64_t horizon_ns{0};
-    // The model.
-    std::string experiment_id;
     InstrumentId instrument;
-    std::string model_name;
-    std::string parameters_sha256;
+    ScheduleModel model;
     ScheduleWindow window;
-    // The latest time any training label became available; before the window.
-    Timestamp training_labels_available_through;
     std::uint64_t rows{0};
     std::uint64_t predicted{0};
     datasets::FileDigest schedule;

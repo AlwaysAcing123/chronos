@@ -265,7 +265,8 @@ Entries, in processing order, are:
 The manifest holds:
 - the sources: dataset and events checksum, schedule and rows checksum,
   experiment, features, labels, split, model, parameters, stream, and the
-  training labels' bound;
+  training labels' bound (a version 2 run names a model version instead;
+  see [below](#registered-model-versions));
 - the window, the configuration, the assumptions, and the definitions;
 - the runner's name and version, and the build environment (compiler,
   platform, architecture);
@@ -280,6 +281,71 @@ The ID is the SHA-256 of the canonical manifest without its ID, as for the
 C++ derived artifacts. The environment is part of it, so another compiler
 gives another ID for the same economics. Publication is atomic and never
 replaces an entry.
+
+## Registered model versions
+
+A registered model version from the model library
+([ADR 0021](decisions/0021-model-registry-imports-and-comparisons.md)) is
+evaluated through the same runner, under explicit new versions. Version 1
+schedules and runs keep their exact bytes and meaning.
+
+### Schedule version 2
+
+`registered_schedule.py` publishes `chronos.inference_schedule/2`, a
+version 1 schedule in everything but its model:
+- **The model.** `model_version_id`, `family`, `payload_sha256`, and
+  `runtime {class, name, version}`; never an experiment ID, even for a
+  version taken from an experiment.
+- **The cutoff.** `training` is `{basis, information_cutoff_ns}`, with basis
+  `verified` or `declared`. A version without a cutoff is refused
+  (`cutoff_unavailable`), and one whose cutoff is after the window's start
+  is refused (`cutoff_after_window_start`).
+- **The class rule.** The inference definition's `class` is "the model
+  version's own class rule, stated in model.runtime.class". For an import
+  that is the first largest probability.
+- **Prediction.** Each row is predicted alone through the registered-model
+  adapter that deployments use: a baseline by the row-pure arithmetic
+  above, an import only in the ONNX sandbox. A row with no valid prediction
+  refuses the schedule with its reason.
+- **Rebuilding.** Rebuilding gives identical bytes. A baseline version's
+  rows are byte-identical to its experiment model's version 1 rows. An
+  import's environment records the ONNX Runtime version and the sandbox's
+  content digest, so it rebuilds only with the same image.
+
+### Strategy run version 2
+
+`chronos_strategy` reads both schedule versions. A version 2 schedule gives
+`chronos.strategy_run/2`, whose `source` names:
+- `model_version_id`, `family`, and `payload_sha256`;
+- `information_cutoff {at_ns, basis}`;
+- the dataset, features, labels, split, stream, and schedule, as before.
+
+It has no experiment, model name, or parameters field, and no training
+labels' bound. A cutoff after the window's start is refused as
+`LabelLeakage`. The same predictions give the same results under either
+version.
+
+### Comparisons
+
+```sh
+cd python
+.venv/bin/python -m chronos_research compare-models --tools ../build --artifacts ../data \
+  --spec '{"schema":{"name":"chronos.model_comparison_spec","version":"1"},"model_version_ids":["…","…"],
+           "split_artifact_id":"…","instrument":"AAPL","window":"test","configuration":{…}}' \
+  [--docker docker]
+.venv/bin/python -m chronos_research inspect-comparison --tools ../build --artifacts ../data --comparison <ID>
+```
+
+A comparison runs 2 to 6 versions under one frozen spec: one split,
+instrument, window, and configuration. Each member is checked, scheduled,
+rebuilt, run in its own accounts, and replayed; a refused or failed member
+stays in the result with its reason. The result,
+`data/comparisons/<comparison-id>/manifest.json`
+(`chronos.model_comparison/1`), holds every member's accounts, the
+benchmarks (checked identical across members), and exact deltas against
+cash, buy and hold, and the first completed member. `inspect-comparison`
+verifies it and replays every member's run. The research service runs the
+same as a `comparison` job ([research-service.md](research-service.md#comparisons)).
 
 ## Hand-checked example
 
@@ -319,6 +385,10 @@ The same check passes for the other three runs.
 - **Artifacts.** Deterministic journals; publication, verification,
   reproduction, and reuse; tampered runs and schedules, including a
   training label known in the window.
+- **Registered versions.** A version 2 schedule gives a version 2 run that
+  names the version and no experiment, with the same results as version 1;
+  a cutoff after the window's start is refused; a version 2 schedule that
+  names an experiment is refused.
 
 `python/tests/test_schedule.py` covers:
 - complete windows with the unlabelled tail;
@@ -327,6 +397,13 @@ The same check passes for the other three runs.
 - per-row predictions, and the majority model;
 - refused models, instruments, windows, and experiments;
 - training chronology, tampering, the CLI, and decisions on tail rows.
+
+`python/tests/test_comparison.py` compares versions over the synthetic
+market: independent accounts per member, every account recomputed from its
+journal alone in exact fractions (`tests/accounting.py`), exact deltas,
+refused and failed members kept, a comparison with no completed member,
+spec validation, tampering, and, with the sandbox, an exported ONNX model
+that trades exactly as the logistic model it came from.
 
 ## Limitations
 

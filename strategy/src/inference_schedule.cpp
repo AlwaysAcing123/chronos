@@ -27,16 +27,25 @@ using datasets::ObjectFields;
 constexpr std::array<std::string_view, 3> kClassOrder = {"down", "flat", "up"};
 
 // What the runner relies on a schedule's rows to mean. A schedule that
-// defines them differently is a different contract and is refused.
-const json::Value& inference_definition() {
-    static const json::Value definition(json::Object{
-        {"class", "the model's predicted class: the largest logit, ties to the earliest class in class_order"},
+// defines them differently is a different contract and is refused. Only
+// the class rule differs by version: a registered model's is its runtime's.
+json::Value inference_definition_with_class(std::string_view class_rule) {
+    return json::Value(json::Object{
+        {"class", class_rule},
         {"confidence_ppb", "floor(1e9 x the predicted class's probability), exact from its binary64 value"},
         {"rows", "every feature row of the instrument available in the window, labelled or not"},
         {"unavailable", "a row whose model inputs are unavailable has no prediction from any model"},
         {"window", "start_at_ns <= available_at_ns, and available_at_ns < end_at_ns when the window has an end"},
     });
-    return definition;
+}
+
+const json::Value& inference_definition(bool registered) {
+    static const json::Value experiment = inference_definition_with_class(
+        "the model's predicted class: the largest logit, ties to the earliest class in class_order"
+    );
+    static const json::Value version =
+        inference_definition_with_class("the model version's own class rule, stated in model.runtime.class");
+    return registered ? version : experiment;
 }
 
 const json::Value& model_feature_set() {
@@ -79,6 +88,50 @@ void require_value(ObjectFields& fields, std::string_view key, const json::Value
     }
 }
 
+ExperimentScheduleModel experiment_model(ObjectFields& entry) {
+    ExperimentScheduleModel model{
+        .experiment_id = entry.sha256("experiment_id"),
+        .name = entry.string("name"),
+        .parameters_sha256 = entry.sha256("parameters_sha256"),
+        .training_labels_available_through = {},
+    };
+    if (entry.ok() && model.name != "logistic" && model.name != "majority") {
+        entry.fail(DatasetErrorCode::UnsupportedVersion, "name", "must be logistic or majority");
+    }
+    return model;
+}
+
+RegisteredScheduleModel registered_model(ObjectFields& entry) {
+    RegisteredScheduleModel model{
+        .model_version_id = entry.sha256("model_version_id"),
+        .family = entry.string("family"),
+        .payload_sha256 = entry.sha256("payload_sha256"),
+        .information_cutoff = {},
+        .cutoff_basis = {},
+    };
+    if (entry.ok() && model.family.empty()) {
+        entry.fail(DatasetErrorCode::InvalidValue, "family", "must not be empty");
+    }
+    datasets::NestedFields runtime(entry, "runtime", {"class", "name", "version"});
+    for (std::string_view key : {"class", "name", "version"}) {
+        if (runtime.fields().string(key).empty() && runtime.fields().ok()) {
+            runtime.fields().fail(DatasetErrorCode::InvalidValue, key, "must not be empty");
+        }
+    }
+    runtime.finish();
+    return model;
+}
+
+// The model block's instrument and feature set, which both versions share.
+InstrumentId model_instrument(ObjectFields& entry) {
+    require_value(entry, "model_feature_set", model_feature_set(), "is not top_of_book_baseline version 1");
+    const std::string instrument = entry.string("instrument");
+    if (entry.ok() && instrument.empty()) {
+        entry.fail(DatasetErrorCode::InvalidValue, "instrument", "must not be empty");
+    }
+    return InstrumentId(instrument.empty() ? std::string("unset") : instrument);
+}
+
 struct ParsedManifest {
     ScheduleManifest manifest;
     std::map<std::string, std::uint64_t> classes;
@@ -92,18 +145,19 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
     }
     const json::Value& value = std::get<json::Value>(document);
     ObjectFields fields(value, "manifest");
-    if (fields.ok()) {
-        datasets::require_name_version(fields, "schema", kScheduleSchemaName, kScheduleSchemaVersion);
-        if (!fields.ok()) {
-            return *fields.error();
-        }
+    const std::string version = datasets::require_name_and_one_of_versions(
+        fields, "schema", kScheduleSchemaName, {kExperimentScheduleVersion, kRegisteredScheduleVersion}
+    );
+    if (!fields.ok()) {
+        return *fields.error();
     }
+    const bool registered = version == kRegisteredScheduleVersion;
     fields.require_keys({
         "artifact_id", "class_order", "counts", "environment", "files", "inference", "model", "row", "schema",
         "scope", "source", "training", "window",
     });
     datasets::require_name_version(fields, "row", kScheduleRowRecordName, kScheduleRowRecordVersion);
-    require_value(fields, "inference", inference_definition(), "is not the inference definition this runner reads");
+    require_value(fields, "inference", inference_definition(registered), "is not the inference definition this runner reads");
     if (fields.ok() && fields.string_array("class_order") != std::vector<std::string>(kClassOrder.begin(), kClassOrder.end())) {
         fields.fail(DatasetErrorCode::UnsupportedVersion, "class_order", "must be down, flat, up");
     }
@@ -128,12 +182,9 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
             .label_artifact_id = {},
             .split_artifact_id = {},
             .horizon_ns = 0,
-            .experiment_id = {},
             .instrument = InstrumentId("unset"),
-            .model_name = {},
-            .parameters_sha256 = {},
+            .model = {},
             .window = {},
-            .training_labels_available_through = {},
             .rows = 0,
             .predicted = 0,
             .schedule = {},
@@ -173,24 +224,19 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
         }
         source.finish();
     }
-    {
+    if (registered) {
+        datasets::NestedFields model(fields, "model", {
+            "family", "instrument", "model_feature_set", "model_version_id", "payload_sha256", "runtime",
+        });
+        manifest.model = registered_model(model.fields());
+        manifest.instrument = model_instrument(model.fields());
+        model.finish();
+    } else {
         datasets::NestedFields model(fields, "model", {
             "experiment_id", "instrument", "model_feature_set", "name", "parameters_sha256",
         });
-        ObjectFields& entry = model.fields();
-        manifest.experiment_id = entry.sha256("experiment_id");
-        manifest.parameters_sha256 = entry.sha256("parameters_sha256");
-        manifest.model_name = entry.string("name");
-        if (entry.ok() && manifest.model_name != "logistic" && manifest.model_name != "majority") {
-            entry.fail(DatasetErrorCode::UnsupportedVersion, "name", "must be logistic or majority");
-        }
-        require_value(entry, "model_feature_set", model_feature_set(), "is not top_of_book_baseline version 1");
-        const std::string instrument = entry.string("instrument");
-        if (entry.ok() && !instrument.empty()) {
-            manifest.instrument = InstrumentId(instrument);
-        } else if (entry.ok()) {
-            entry.fail(DatasetErrorCode::InvalidValue, "instrument", "must not be empty");
-        }
+        manifest.model = experiment_model(model.fields());
+        manifest.instrument = model_instrument(model.fields());
         model.finish();
     }
     {
@@ -217,16 +263,33 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
         }
         window.finish();
     }
-    {
+    if (auto* experiment_model = std::get_if<ExperimentScheduleModel>(&manifest.model)) {
         datasets::NestedFields training(fields, "training", {"label_available_through_ns", "split"});
         training.fields().constant("split", "train");
-        manifest.training_labels_available_through = training.fields().timestamp("label_available_through_ns");
+        experiment_model->training_labels_available_through = training.fields().timestamp("label_available_through_ns");
         training.finish();
-        if (fields.ok() && manifest.training_labels_available_through >= manifest.window.start_at) {
+        if (fields.ok() && experiment_model->training_labels_available_through >= manifest.window.start_at) {
             fields.fail(
                 DatasetErrorCode::LabelLeakage,
                 "training",
                 "a training label becomes available at or after the window begins"
+            );
+        }
+    } else {
+        auto& registered_model = std::get<RegisteredScheduleModel>(manifest.model);
+        datasets::NestedFields training(fields, "training", {"basis", "information_cutoff_ns"});
+        registered_model.cutoff_basis = training.fields().string("basis");
+        registered_model.information_cutoff = training.fields().timestamp("information_cutoff_ns");
+        if (training.fields().ok() && registered_model.cutoff_basis != "verified" &&
+            registered_model.cutoff_basis != "declared") {
+            training.fields().fail(DatasetErrorCode::InvalidValue, "basis", "must be verified or declared");
+        }
+        training.finish();
+        if (fields.ok() && registered_model.information_cutoff > manifest.window.start_at) {
+            fields.fail(
+                DatasetErrorCode::LabelLeakage,
+                "training",
+                "the model's information cutoff is after the window begins"
             );
         }
     }

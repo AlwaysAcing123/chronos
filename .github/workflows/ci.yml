@@ -370,6 +370,60 @@ jobs:
           python -m mypy --strict tools/deployment_validation/validate.py
           python -m unittest discover -s tools/deployment_validation -p 'test_*.py'
 
+  python-onnx-sandbox:
+    name: ONNX imports in the sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # Imported models run only in the ONNX sandbox container (ADR 0021), so
+    # this job builds its pinned image and runs every ONNX, import,
+    # comparison, and registered-worker test with a missing sandbox or
+    # missing onnx package as a failure, never a skip.
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CHRONOS_DATASET: ${{ github.workspace }}/build/chronos_dataset
+      CHRONOS_SYNTHETIC_DATASET: ${{ github.workspace }}/build/chronos_synthetic_dataset
+      CHRONOS_REQUIRE_TOOLS: "1"
+      CHRONOS_REQUIRE_ONNX_SANDBOX: "1"
+
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: python/.python-version
+
+      - name: Build the C++ verifier, synthetic-dataset tool, and strategy runner
+        working-directory: .
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+          cmake --build build --parallel --target chronos_dataset chronos_synthetic_dataset chronos_strategy_cli
+
+      - name: Install pinned dependencies, with the optional ONNX packages
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements.lock
+          python -m pip install --require-hashes --no-deps -r requirements-onnx.lock
+
+      - name: Type-check with the ONNX packages present
+        run: python -m mypy
+
+      - name: Build the ONNX sandbox image
+        run: |
+          python -m chronos_research onnx-sandbox build
+          python -m chronos_research onnx-sandbox status
+
+      - name: Test
+        run: python -m pytest
+
   web:
     name: Web client
     runs-on: ubuntu-24.04

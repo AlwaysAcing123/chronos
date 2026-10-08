@@ -69,8 +69,9 @@ order and fill histories span the full width below. On a phone the panels form
 one column with section links, and every table becomes a card of labelled
 values.
 
-It has no charts, models, authentication, or account list, because the API
-does not provide them yet.
+The trading workspace has no charts, authentication, or account list,
+because the API does not provide them yet. Models, Comparisons, and Research
+are separate views (below).
 
 ## Architecture
 
@@ -301,9 +302,9 @@ responses must carry `X-Chronos-Service: research`.
 
 ## Research
 
-The header's primary navigation switches between Trading and Research. The
-switch is a URL hash: `#/research`, or `#/research/results/<run-id>` for one
-result. A reload or a link reopens the same view, and the workspace's section
+The header's primary navigation switches between Trading, Models,
+Comparisons, and Research. The switch is a URL hash: `#/research`, or
+`#/research/results/<run-id>` for one result. A reload or a link reopens the same view, and the workspace's section
 links keep working. Research changes the account selection only when asked
 to open a deployment's account ("Open … in trading"), so returning to
 Trading otherwise finds the same account open. Research is loaded only when
@@ -380,6 +381,84 @@ in `src/state/deployments.ts`.
   order ticket it says which deployment trades the account, because the
   server refuses manual orders there.
 
+## Models and comparisons
+
+**Models** (`#/models`, and `#/models/<model-version-id>` for one version)
+is the research service's model library
+([research-service.md](research-service.md#the-model-library)). Like
+Research, it loads only when opened and never changes the account
+selection. It uses the `ResearchClient` with its decoders in
+`src/api/modelSchemas.ts` and the hooks in `src/state/models.ts`.
+
+- **Library.** Model versions, active, archived, or all, with each
+  version's family, instrument, origin (verified experiment or import with
+  declared provenance), and information cutoff with its basis: "Verified by
+  Chronos", "Declared by uploader, not verified", or "Unavailable" with its
+  reason. Versions that do not verify are listed apart, never as usable.
+- **Register.** Choose a verified experiment, instrument, fitted model,
+  name, and version; review; register. The job is followed until it
+  publishes, and a taken name says so.
+- **Import an ONNX model.** Choose a `chronos.model_import/1` manifest and
+  a model file of at most 1 MiB. The browser reads both once and computes
+  the model's SHA-256. Review shows the contract, the declared training,
+  source, cutoff, and what it covers, and that SHA-256. "Validate and
+  import" sends:
+  1. the manifest's own text;
+  2. the model's own bytes, as `application/octet-stream`;
+  3. the reviewed digest.
+
+  Nothing later is sent when a step is refused, and the step is named. If
+  the service received other bytes than were reviewed, validation is not
+  started. Without the sandbox the button is disabled and the reason shown.
+- **Version detail.** It has:
+  - identity, with the payload checksum and an archive or restore control
+    that needs a reason;
+  - inputs and outputs;
+  - training provenance: for an experiment model, what Chronos verified
+    and its source experiment's state; for an import, the declarations
+    under "Declared by the uploader, not verified", apart from the sandbox
+    validation and the "Not verified" list;
+  - inference compatibility and limitations.
+- **Deploy this version to paper.** For a version compatible with
+  deployment, when the deployments client is configured, the same fields as
+  Research's form create a stopped deployment of exactly that version, by
+  its ID. A declared cutoff is called out before review. The deployment is
+  then started under Research's Paper deployments, where its card links
+  the version and marks a declared cutoff.
+
+**Comparisons** (`#/comparisons`, and `#/comparisons/<comparison-id>`)
+compares registered versions (`src/api/comparisonSchemas.ts`,
+`src/state/comparisons.ts`).
+
+- **Form.** Choose a split, instrument, and window, then 2 to 6 active
+  versions of that instrument. A version whose known cutoff is after the
+  window's start is marked as one that will be refused. The policy,
+  capital, costs, and risk are the same for every member. Review lists the
+  frozen spec, the members in order (the first completed one is the
+  reference), every assumption, and the fairness rules; only "Start
+  comparison" sends it. The job is followed until it publishes.
+- **Detail.** It has:
+  - the comparison's identity, spec digest, split, stream, window, member
+    counts, and why it is fair;
+  - a side-by-side table, one column per member, of the strategy account's
+    PnL, return, the service's exact differences from buy and hold, cash,
+    and the reference, fees, drawdown, fills, orders, turnover, and
+    predictions;
+  - a separate prediction-quality table, against the window's realized
+    labels, as the service scored it: accuracy, balanced accuracy, log loss,
+    Brier score, recall per class, the rows scored, and the rows not scored
+    with the split's reasons. An undefined metric or an unscored member
+    says why, and the page states that classification quality is not
+    trading performance;
+  - the benchmarks, marked identical for every member or not;
+  - each member's reproducibility: schedule rebuilt, run replayed, and each
+    artifact verified again now, with links to the version and to the run
+    in Research.
+
+  A refused or failed member's figures say so, never zero, and its reason
+  is shown. A declared-cutoff member makes the page say its result rests on
+  that declaration.
+
 ## Tests
 
 ```sh
@@ -417,6 +496,11 @@ Before the first browser run: `npx playwright install chromium`.
   an empty catalog, axe, and a stricter overflow check against the client
   width. `e2e/research-live.spec.ts` is the opt-in run against a real
   research service (`CHRONOS_WEB_LIVE_RESEARCH=1`).
+- **Models and comparisons browser tests** (`e2e/models.spec.ts`,
+  `e2e/comparisons.spec.ts`) register, open, and archive a version; import
+  an ONNX model through review; and compare two versions through review to
+  the side-by-side table, keyboard-only where it matters, with axe and the
+  overflow check on desktop and mobile.
 - **Live acceptance** (`e2e/live.spec.ts`) is skipped unless
   `CHRONOS_WEB_LIVE_API=1`. With the C++ server running on the recording, it
   trades through the preview proxy, adds a model-attributed order through the
@@ -448,6 +532,8 @@ database, credentials, or market data; the live spec is skipped there.
 - Manual orders use the fixed source ID `web-ticket`.
 - Deployments are listed with their latest ten decisions only; the full
   history is in the API.
+- Comparisons have no chart; the side-by-side table scrolls inside its
+  panel on a phone.
 - Working orders can be cancelled but not replaced or amended. No price
   chart or valuation history for paper accounts; the only chart is a
   historical evaluation's equity curve in Research.

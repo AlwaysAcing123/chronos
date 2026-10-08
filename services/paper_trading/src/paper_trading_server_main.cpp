@@ -223,11 +223,15 @@ int run(const paper_trading::ServerArguments& arguments) {
                 "--research-artifacts has no experiments directory: " + paths.artifacts.string()
             );
         }
+        if (paths.onnx_docker && !std::filesystem::is_regular_file(*paths.onnx_docker)) {
+            throw paper_trading::ServerUsageError("--onnx-docker is not a file: " + paths.onnx_docker->string());
+        }
         signal(SIGPIPE, SIG_IGN);
         inference = std::make_unique<paper_trading::PythonInferenceProvider>(paper_trading::PythonWorkerCommand{
             .python = std::filesystem::absolute(paths.python),
             .python_root = std::filesystem::absolute(paths.python_root),
             .artifacts = std::filesystem::absolute(paths.artifacts),
+            .docker = paths.onnx_docker,
         });
     }
 

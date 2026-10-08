@@ -110,6 +110,7 @@ ServerArguments parse_server_arguments(
     std::optional<std::string> research_python;
     std::optional<std::string> research_python_root;
     std::optional<std::string> research_artifacts;
+    std::optional<std::string> onnx_docker;
     std::optional<std::string> stream_id;
     std::optional<std::string> recording;
     std::optional<ReplaySpeed> replay_speed;
@@ -196,6 +197,8 @@ ServerArguments parse_server_arguments(
             research_python_root = cursor.value(option);
         } else if (option == "--research-artifacts") {
             research_artifacts = cursor.value(option);
+        } else if (option == "--onnx-docker") {
+            onnx_docker = cursor.value(option);
         } else {
             throw ServerUsageError("unknown option: " + std::string(option));
         }
@@ -207,7 +210,7 @@ ServerArguments parse_server_arguments(
         );
     }
     parsed.stream_id = std::move(*stream_id);
-    const bool any_research = research_python || research_python_root || research_artifacts;
+    const bool any_research = research_python || research_python_root || research_artifacts || onnx_docker;
     if (model_deployments) {
         if (!research_python || !research_python_root || !research_artifacts ||
             research_python->empty() || research_python_root->empty() || research_artifacts->empty()) {
@@ -216,15 +219,19 @@ ServerArguments parse_server_arguments(
                 "--research-python-root, and --research-artifacts"
             );
         }
+        if (onnx_docker && !std::filesystem::path(*onnx_docker).is_absolute()) {
+            throw ServerUsageError("--onnx-docker must be an absolute path");
+        }
         parsed.deployments = DeploymentArguments{
             .python = std::move(*research_python),
             .python_root = std::move(*research_python_root),
             .artifacts = std::move(*research_artifacts),
+            .onnx_docker = onnx_docker ? std::optional<std::filesystem::path>(*onnx_docker) : std::nullopt,
         };
     } else if (any_research) {
         throw ServerUsageError(
-            "--research-python, --research-python-root, and "
-            "--research-artifacts require --model-deployments"
+            "--research-python, --research-python-root, --research-artifacts, "
+            "and --onnx-docker require --model-deployments"
         );
     }
     if (parsed.adopt_live_stream_history && !parsed.alpaca_iex) {
@@ -310,7 +317,10 @@ std::string server_usage() {
         "                               dependencies, such as python/.venv/bin/python.\n"
         "    --research-python-root <DIR>  The repository's python directory.\n"
         "    --research-artifacts <DIR> The research artifacts directory,\n"
-        "                               holding experiments/.\n\n"
+        "                               holding experiments/ and models/.\n"
+        "    --onnx-docker <PATH>       The Docker CLI, by absolute path, that\n"
+        "                               runs imported models in the ONNX\n"
+        "                               sandbox; without it they cannot deploy.\n\n"
         "Serves the paper-trading API. Simulated trading only; no order is\n"
         "ever sent to a broker or exchange. The API has no authentication\n"
         "and is not production-secure; keep it on localhost.\n";

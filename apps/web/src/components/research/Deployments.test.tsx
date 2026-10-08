@@ -360,6 +360,30 @@ describe('what a deployment is doing, and what it decided', () => {
     expect(found).toHaveTextContent('trusted order path up to 61.8 ms, including waits for the market');
     expect(found).toHaveTextContent('inference up to 2.1 ms');
   });
+
+  it('names a registered version’s deployment by its version, with its declared cutoff', async () => {
+    const version = '5'.repeat(64);
+    const { card: found } = await card(
+      deploymentJson({
+        model: {
+          reference: 'registered',
+          model_version_id: version,
+          name: 'onnx',
+          instrument: 'AAPL',
+          parameters_sha256: 'b'.repeat(64),
+          feature_set: 'top_of_book_baseline/1',
+          training_cutoff: '2026-09-25T13:35:19.090266460Z',
+          training_cutoff_basis: 'declared',
+        },
+      }),
+    );
+    expect(within(found).getByRole('link', { name: `version ${version.slice(0, 12)}…` })).toHaveAttribute(
+      'href',
+      `#/models/${version}`,
+    );
+    expect(within(found).getByText('Imported ONNX classifier', { exact: false })).toBeInTheDocument();
+    expect(within(found).getByText('Declared by uploader, not verified')).toBeInTheDocument();
+  });
 });
 
 describe('an account owned by a deployment', () => {

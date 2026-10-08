@@ -3,8 +3,31 @@
 // queued, then running, then finished on later polls.
 import type { Page, Route } from '@playwright/test';
 
+import {
+  COMPARISON_ID,
+  COMPARISON_JOB_ID,
+  comparisonDetailJson,
+  comparisonJobJson,
+  comparisonPageJson,
+} from '../src/test/comparisonFixtures';
 import { errorJson } from '../src/test/fixtures';
 import type { Json } from '../src/test/fixtures';
+import {
+  IMPORTED_VERSION_ID,
+  IMPORT_ID,
+  IMPORT_JOB_ID,
+  importJobJson,
+  importedDetailJson,
+  importedListingJson,
+  stagedImportJson,
+} from '../src/test/importFixtures';
+import {
+  MODEL_VERSION_ID,
+  REGISTRATION_JOB_ID,
+  modelDetailJson,
+  modelListingJson,
+  registrationJobJson,
+} from '../src/test/modelFixtures';
 import {
   RUN_ID,
   decisionsJson,
@@ -26,6 +49,8 @@ export interface ResearchMockOptions {
   readonly failJob?: boolean;
   // The result's journal does not match its manifest.
   readonly corruptResult?: boolean;
+  // The library already holds a registered and an imported AAPL version.
+  readonly seededLibrary?: boolean;
 }
 
 function reply(route: Route, status: number, body: unknown) {
@@ -41,6 +66,19 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
   let job: Json | null = null;
   let polls = 0;
   const published = () => job !== null && job.state === 'succeeded';
+  // The model library: a registration is queued, then running, then done.
+  let registration: Json | null = null;
+  let registrationPolls = 0;
+  let lifecycle: Json = { state: 'active', reason: null, changed_at: null };
+  const registered = () => registration !== null && registration.state === 'succeeded';
+  // An import: staged, its bytes uploaded and hashed here, then validated.
+  let uploaded: Json | null = null;
+  let importJob: Json | null = null;
+  let importPolls = 0;
+  const imported = () => importJob !== null && importJob.state === 'succeeded';
+  // A comparison: queued, running, then published.
+  let comparisonJob: Json | null = null;
+  let comparisonPolls = 0;
 
   await page.route('**/api/v1/research/**', async (route) => {
     if (options.unreachable === true) {
@@ -78,6 +116,115 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
         }
       }
       return reply(route, 200, { runs: job === null ? [] : [job], next_cursor: null });
+    }
+    if (path === '/models' && request.method() === 'POST') {
+      registration = registrationJobJson({ request: request.postDataJSON() as Json });
+      registrationPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: registration });
+    }
+    if (path === '/models') {
+      const state = url.searchParams.get('state') ?? 'active';
+      const listed = (registered() || options.seededLibrary === true) && (state === 'all' || state === lifecycle.state);
+      return reply(route, 200, {
+        models: [
+          ...(listed ? [modelListingJson({ lifecycle })] : []),
+          ...((imported() || options.seededLibrary === true) && state !== 'archived' ? [importedListingJson()] : []),
+        ],
+        invalid_entries: [],
+        next_cursor: null,
+      });
+    }
+    if (path === '/comparisons' && request.method() === 'POST') {
+      comparisonJob = comparisonJobJson({
+        request: request.postDataJSON() as Json,
+        state: 'queued',
+        result: null,
+        started_at: null,
+        finished_at: null,
+      });
+      comparisonPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: comparisonJob });
+    }
+    if (path === '/comparisons') {
+      const page = comparisonPageJson();
+      return reply(route, 200, comparisonJob?.state === 'succeeded' ? page : { ...page, comparisons: [] });
+    }
+    if (path === `/jobs/${COMPARISON_JOB_ID}` && comparisonJob !== null) {
+      comparisonPolls += 1;
+      comparisonJob =
+        comparisonPolls === 1
+          ? { ...comparisonJob, state: 'running', started_at: '2026-10-07T22:00:01.000000000Z' }
+          : comparisonJobJson({ request: comparisonJob.request });
+      return reply(route, 200, { job: comparisonJob });
+    }
+    if (path === `/comparisons/${COMPARISON_ID}`) {
+      return reply(route, 200, comparisonDetailJson());
+    }
+    if (path === '/imports' && request.method() === 'POST') {
+      uploaded = null;
+      return reply(route, 201, stagedImportJson());
+    }
+    if (path === `/imports/${IMPORT_ID}/model` && request.method() === 'PUT') {
+      const bytes = request.postDataBuffer() ?? Buffer.alloc(0);
+      const digest = Buffer.from(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes))).toString('hex');
+      uploaded = { sha256: digest, size_bytes: String(bytes.length), uploaded_at: '2026-10-07T21:00:01.000000000Z' };
+      return reply(route, 201, stagedImportJson(uploaded));
+    }
+    if (path === `/imports/${IMPORT_ID}/validation` && request.method() === 'POST' && uploaded !== null) {
+      const body = request.postDataJSON() as Json;
+      if (body.model_sha256 !== uploaded.sha256) {
+        return reply(route, 409, errorJson('model_mismatch', 'the staged model is not the one reviewed'));
+      }
+      importJob = importJobJson({ request: { ...(importJobJson().request as Json), model_sha256: uploaded.sha256 } });
+      importPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: importJob });
+    }
+    if (path === `/jobs/${IMPORT_JOB_ID}` && importJob !== null) {
+      importPolls += 1;
+      importJob =
+        importPolls === 1
+          ? { ...importJob, state: 'running', started_at: '2026-10-07T21:00:03.000000000Z' }
+          : {
+              ...importJob,
+              state: 'succeeded',
+              finished_at: '2026-10-07T21:00:05.000000000Z',
+              result: {
+                model_version_id: IMPORTED_VERSION_ID,
+                outcome: 'published',
+                binding_outcome: 'published',
+                binding_id: 'b'.repeat(64),
+              },
+            };
+      return reply(route, 200, { job: importJob });
+    }
+    if (path === `/models/${IMPORTED_VERSION_ID}`) {
+      return reply(route, 200, { model: importedDetailJson() });
+    }
+    if (path === `/jobs/${REGISTRATION_JOB_ID}` && registration !== null) {
+      registrationPolls += 1;
+      registration =
+        registrationPolls === 1
+          ? { ...registration, state: 'running', started_at: '2026-10-07T20:00:01.000000000Z' }
+          : {
+              ...registration,
+              state: 'succeeded',
+              finished_at: '2026-10-07T20:00:04.000000000Z',
+              result: {
+                model_version_id: MODEL_VERSION_ID,
+                outcome: 'published',
+                binding_outcome: 'published',
+                binding_id: 'b'.repeat(64),
+              },
+            };
+      return reply(route, 200, { job: registration });
+    }
+    if (path === `/models/${MODEL_VERSION_ID}`) {
+      return reply(route, 200, { model: modelDetailJson({ lifecycle }) });
+    }
+    if (path === `/models/${MODEL_VERSION_ID}/lifecycle` && request.method() === 'POST') {
+      const body = request.postDataJSON() as Json;
+      lifecycle = { state: body.state, reason: body.reason, changed_at: '2026-10-07T20:01:00.000000000Z' };
+      return reply(route, 200, { model_version_id: MODEL_VERSION_ID, lifecycle });
     }
     if (path === '/results') {
       return reply(route, 200, { results: published() ? [resultListingJson()] : [], invalid_entries: [], next_cursor: null });

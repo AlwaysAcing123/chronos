@@ -195,6 +195,61 @@ def _unevaluable(document: Any, what: str) -> Unevaluable:
     return Unevaluable(reason=document["reason"], detail=document["detail"])
 
 
+def stored_majority(document: Any, what: str) -> MajorityModel | Unevaluable:
+    """A majority model as stored, or why it is unevaluable; its
+    probabilities and class must follow from its counts."""
+    if isinstance(document, dict) and document.get("status") == "unevaluable":
+        return _unevaluable(document, what)
+    _keys(document, {"class_counts", "majority_class", "probabilities"}, what)
+    _keys(document["class_counts"], set(CLASS_ORDER), f"{what} class counts")
+    counts = tuple(_count(document["class_counts"][name], "a class count") for name in CLASS_ORDER)
+    if sum(counts) == 0:
+        raise _fail(f"{what}: a fitted majority model has training rows")
+    majority = MajorityModel(counts)
+    if majority.as_json() != document:
+        raise _fail(f"{what}: the majority model's probabilities or class do not follow from its counts")
+    return majority
+
+
+def stored_logistic(
+    document: Any, what: str, configuration: LogisticConfiguration
+) -> LogisticModel | Unevaluable:
+    """A logistic model as stored, or why it is unevaluable: finite
+    parameters of the fixed shape, positive scales, a canonical spelling, and
+    a converged iteration count."""
+    if not isinstance(document, dict):
+        # Reported, as before, as a malformed experiment by the caller.
+        raise TypeError(f"{what} must be an object")
+    if document.get("status") == "unevaluable":
+        return _unevaluable(document, what)
+    if document.get("status") != "fitted":
+        raise _fail(f"{what}: unknown logistic status {document.get('status')!r}")
+    _keys(document, {"coefficients", "intercepts", "iterations", "scaler", "status"}, what)
+    _keys(document["scaler"], {"mean", "scale"}, f"{what} scaler")
+    _keys(document["coefficients"], set(CLASS_ORDER), f"{what} coefficients")
+    _keys(document["intercepts"], set(CLASS_ORDER), f"{what} intercepts")
+    classes, inputs = len(CLASS_ORDER), len(INPUTS)
+    logistic = LogisticModel(
+        mean=_floats(document["scaler"]["mean"], inputs, f"{what} scaler mean"),
+        scale=_floats(document["scaler"]["scale"], inputs, f"{what} scaler scale"),
+        coefficients=np.stack(
+            [
+                _floats(document["coefficients"][name], inputs, f"{what} {name} coefficients")
+                for name in CLASS_ORDER
+            ]
+        ),
+        intercepts=_floats([document["intercepts"][name] for name in CLASS_ORDER], classes, "intercepts"),
+        iterations=decode_integer(document["iterations"]),
+    )
+    if (
+        not np.all(logistic.scale > 0)
+        or logistic.as_json() != document
+        or not 0 < logistic.iterations < configuration.maximum_iterations
+    ):
+        raise _fail(f"{what}: the logistic model's parameters are malformed")
+    return logistic
+
+
 def _models(
     document: Mapping[str, Any], configuration: LogisticConfiguration
 ) -> dict[str, dict[str, MajorityModel | LogisticModel | Unevaluable]]:
@@ -208,60 +263,13 @@ def _models(
         if not instrument:
             raise _fail("a model instrument must not be empty")
         _keys(entry, {"logistic", "majority"}, f"{MODEL} {instrument}")
-        majority_json = entry["majority"]
-        majority: MajorityModel | Unevaluable
-        if majority_json.get("status") == "unevaluable":
-            majority = _unevaluable(majority_json, f"{instrument} majority")
-        else:
-            _keys(
-                majority_json, {"class_counts", "majority_class", "probabilities"}, f"{instrument} majority"
-            )
-            _keys(majority_json["class_counts"], set(CLASS_ORDER), f"{instrument} majority class counts")
-            counts = tuple(
-                _count(majority_json["class_counts"][name], "a class count") for name in CLASS_ORDER
-            )
-            if sum(counts) == 0:
-                raise _fail(f"{instrument}: a fitted majority model has training rows")
-            majority = MajorityModel(counts)
-            if majority.as_json() != majority_json:
-                raise _fail(
-                    f"{instrument}: the majority model's probabilities or class do not follow from its counts"
-                )
-        logistic_json = entry["logistic"]
-        logistic: LogisticModel | Unevaluable
-        if logistic_json["status"] == "unevaluable":
-            logistic = _unevaluable(logistic_json, f"{instrument} logistic")
-        elif logistic_json["status"] == "fitted":
-            classes, inputs = len(CLASS_ORDER), len(INPUTS)
-            logistic = LogisticModel(
-                mean=_floats(logistic_json["scaler"]["mean"], inputs, f"{instrument} scaler mean"),
-                scale=_floats(logistic_json["scaler"]["scale"], inputs, f"{instrument} scaler scale"),
-                coefficients=np.stack(
-                    [
-                        _floats(
-                            logistic_json["coefficients"][name], inputs, f"{instrument} {name} coefficients"
-                        )
-                        for name in CLASS_ORDER
-                    ]
-                ),
-                intercepts=_floats(
-                    [logistic_json["intercepts"][name] for name in CLASS_ORDER], classes, "intercepts"
-                ),
-                iterations=decode_integer(logistic_json["iterations"]),
-            )
-            if (
-                not np.all(logistic.scale > 0)
-                or logistic.as_json() != logistic_json
-                or not 0 < logistic.iterations < configuration.maximum_iterations
-            ):
-                raise _fail(f"{instrument}: the logistic model's parameters are malformed")
-            if (
-                not isinstance(majority, MajorityModel)
-                or min(majority.class_counts) < configuration.minimum_training_rows_per_class
-            ):
-                raise _fail(f"{instrument}: a fitted logistic model lacks training class support")
-        else:
-            raise _fail(f"{instrument}: unknown logistic status {logistic_json['status']!r}")
+        majority = stored_majority(entry["majority"], f"{instrument} majority")
+        logistic = stored_logistic(entry["logistic"], f"{instrument} logistic", configuration)
+        if isinstance(logistic, LogisticModel) and (
+            not isinstance(majority, MajorityModel)
+            or min(majority.class_counts) < configuration.minimum_training_rows_per_class
+        ):
+            raise _fail(f"{instrument}: a fitted logistic model lacks training class support")
         models[instrument] = {"majority": majority, "logistic": logistic}
     return models
 

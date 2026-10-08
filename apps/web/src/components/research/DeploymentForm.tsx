@@ -1,6 +1,6 @@
 import { useId, useState } from 'react';
 
-import type { DeploymentRequest } from '../../api/deployments';
+import type { Deployment, DeploymentSettings, ExperimentDeploymentRequest } from '../../api/deployments';
 import { isUncertainDeploymentControl } from '../../api/deployments';
 import { ChronosApiError } from '../../api/errors';
 import { isValidIdentifier } from '../../api/identifiers';
@@ -25,7 +25,7 @@ export const DEPLOYMENT_RULES = [
   'Stop and the kill switch end trading and keep the position; nothing is liquidated.',
 ] as const;
 
-type Draft = Omit<DeploymentRequest, 'experiment_id' | 'instrument' | 'model'>;
+export type Draft = Omit<DeploymentSettings, 'instrument'>;
 
 interface FieldSpec {
   readonly key: keyof Draft;
@@ -33,7 +33,7 @@ interface FieldSpec {
   readonly hint?: (value: string) => string | null;
 }
 
-const FIELDS: readonly FieldSpec[] = [
+export const FIELDS: readonly FieldSpec[] = [
   { key: 'deployment_id', label: 'Deployment ID', hint: () => 'Up to 32 letters, digits, dots, dashes, or underscores' },
   { key: 'account_id', label: 'New paper account ID', hint: () => 'Must not exist yet' },
   { key: 'starting_cash', label: 'Starting cash (USD)' },
@@ -75,7 +75,7 @@ function millisecondsOf(nanoseconds: string, fallback: string): string {
     : fallback;
 }
 
-function initialDraft(defaults: RunConfiguration | undefined): Draft {
+export function initialDraft(defaults: RunConfiguration | undefined): Draft {
   return {
     deployment_id: '',
     account_id: '',
@@ -90,8 +90,60 @@ function initialDraft(defaults: RunConfiguration | undefined): Draft {
   };
 }
 
-function rejectedField(error: unknown): string | null {
+export function rejectedField(error: unknown): string | null {
   return error instanceof ChronosApiError && error.failure.kind === 'api_error' ? error.failure.error.field : null;
+}
+
+// What became of a creation request: refused, uncertain, or created stopped.
+export function DeploymentCreationNotice({
+  error,
+  created,
+}: {
+  readonly error: Error | null;
+  readonly created: { readonly deployment: Deployment; readonly created: boolean } | undefined;
+}) {
+  return (
+    <>
+      {error !== null && (
+        <div className={styles.section}>
+          <Alert
+            tone={isUncertainDeploymentControl(error) ? 'caution' : 'negative'}
+            title={isUncertainDeploymentControl(error) ? 'Creation outcome unknown' : 'Creation request rejected'}
+            live
+          >
+            {isUncertainDeploymentControl(error) && (
+              <p>
+                The server may have created the deployment. Check Paper deployments or retry this same reviewed request
+                with the same IDs; nothing trades until Start is explicitly requested.
+              </p>
+            )}
+            {error instanceof ChronosApiError && error.failure.kind === 'api_error' ? (
+              <p>
+                {error.failure.error.message} <Code>{error.failure.error.reason ?? error.failure.error.code}</Code>
+              </p>
+            ) : (
+              <p>{error.message}</p>
+            )}
+          </Alert>
+        </div>
+      )}
+      {created !== undefined && (
+        <div className={styles.section}>
+          <Alert
+            tone={created.created ? 'positive' : 'info'}
+            title={created.created ? 'Deployment created, stopped' : 'This deployment already exists'}
+            live
+          >
+            <p>
+              {created.deployment.deployment_id} trades account {created.deployment.account_id} only after you start it
+              under Paper deployments. The server verified model parameters{' '}
+              <Code>{created.deployment.model.parameters_sha256.slice(0, 12)}</Code>.
+            </p>
+          </Alert>
+        </div>
+      )}
+    </>
+  );
 }
 
 // Creates a deployment, stopped, from the selected model. The request is
@@ -108,7 +160,7 @@ export function DeploymentForm({
   const formId = useId();
   const [model, setModel] = useState<ModelName>('logistic');
   const [draft, setDraft] = useState<Draft>(() => initialDraft(defaults));
-  const [review, setReview] = useState<DeploymentRequest | null>(null);
+  const [review, setReview] = useState<ExperimentDeploymentRequest | null>(null);
   const create = useCreateDeployment();
   const client = useDeploymentClient();
 
@@ -129,7 +181,7 @@ export function DeploymentForm({
   const badIdentifier =
     !isValidIdentifier(draft.deployment_id) || draft.deployment_id.length > 32 || !isValidIdentifier(draft.account_id);
   const rejected = rejectedField(create.error);
-  const request: DeploymentRequest = {
+  const request: ExperimentDeploymentRequest = {
     ...draft,
     experiment_id: experiment.experiment_id,
     instrument: entry.instrument,
@@ -233,45 +285,7 @@ export function DeploymentForm({
             </div>
           </div>
         )}
-        {create.error !== null && (
-          <div className={styles.section}>
-            <Alert
-              tone={isUncertainDeploymentControl(create.error) ? 'caution' : 'negative'}
-              title={isUncertainDeploymentControl(create.error) ? 'Creation outcome unknown' : 'Creation request rejected'}
-              live
-            >
-              {isUncertainDeploymentControl(create.error) && (
-                <p>
-                  The server may have created the deployment. Check Paper deployments or retry this same reviewed
-                  request with the same IDs; nothing trades until Start is explicitly requested.
-                </p>
-              )}
-              {create.error instanceof ChronosApiError && create.error.failure.kind === 'api_error' ? (
-                <p>
-                  {create.error.failure.error.message}{' '}
-                  <Code>{create.error.failure.error.reason ?? create.error.failure.error.code}</Code>
-                </p>
-              ) : (
-                <p>{create.error.message}</p>
-              )}
-            </Alert>
-          </div>
-        )}
-        {create.data !== undefined && review === null && (
-          <div className={styles.section}>
-            <Alert
-              tone={create.data.created ? 'positive' : 'info'}
-              title={create.data.created ? 'Deployment created, stopped' : 'This deployment already exists'}
-              live
-            >
-              <p>
-                {create.data.deployment.deployment_id} trades account {create.data.deployment.account_id} only after
-                you start it under Paper deployments. The server verified model parameters{' '}
-                <Code>{create.data.deployment.model.parameters_sha256.slice(0, 12)}</Code>.
-              </p>
-            </Alert>
-          </div>
-        )}
+        <DeploymentCreationNotice error={create.error} created={review === null ? create.data : undefined} />
         <div className={styles.actions}>
           {review !== null ? (
             <>

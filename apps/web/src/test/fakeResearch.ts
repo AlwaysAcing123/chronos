@@ -12,18 +12,26 @@ export interface FakeResearchResponse {
   readonly omitServiceHeader?: boolean;
 }
 
-type Responder = (request: RecordedRequest) => FakeResearchResponse;
+// A request as sent, with its own body text or bytes and their media type.
+export interface RecordedResearchRequest extends RecordedRequest {
+  readonly contentType: string | null;
+  readonly text: string | undefined;
+  readonly bytes: Uint8Array | undefined;
+}
+
+type Responder = (request: RecordedResearchRequest) => FakeResearchResponse;
+type Method = 'GET' | 'POST' | 'PUT';
 
 export interface FakeResearch {
   readonly client: ResearchClient;
-  readonly requests: RecordedRequest[];
-  on(method: 'GET' | 'POST', path: string, respond: Responder | FakeResearchResponse): void;
-  requestsTo(method: 'GET' | 'POST', path: string): RecordedRequest[];
-  failNext(method: 'GET' | 'POST', path: string): void;
+  readonly requests: RecordedResearchRequest[];
+  on(method: Method, path: string, respond: Responder | FakeResearchResponse): void;
+  requestsTo(method: Method, path: string): RecordedResearchRequest[];
+  failNext(method: Method, path: string): void;
 }
 
 export function createFakeResearch(): FakeResearch {
-  const requests: RecordedRequest[] = [];
+  const requests: RecordedResearchRequest[] = [];
   const routes = new Map<string, Responder>();
   const failures = new Set<string>();
   const fetchImpl: typeof fetch = (input, init) => {
@@ -31,11 +39,15 @@ export function createFakeResearch(): FakeResearch {
     const url = new URL(target, 'http://chronos.test');
     const method = init?.method ?? 'GET';
     const bodyText = typeof init?.body === 'string' ? init.body : undefined;
-    const request: RecordedRequest = {
+    const contentType = new Headers(init?.headers).get('Content-Type');
+    const request: RecordedResearchRequest = {
       method,
       path: url.pathname,
       query: url.searchParams,
-      body: bodyText === undefined ? undefined : (JSON.parse(bodyText) as unknown),
+      body: bodyText === undefined || contentType !== 'application/json' ? undefined : (JSON.parse(bodyText) as unknown),
+      contentType,
+      text: bodyText,
+      bytes: init?.body instanceof Uint8Array ? init.body : undefined,
     };
     requests.push(request);
     const key = `${method} ${url.pathname}`;

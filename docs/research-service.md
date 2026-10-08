@@ -16,12 +16,19 @@ cannot touch a trading account, the replay, or a live source, and switching
 views keeps the open paper account. The decisions are in
 [ADR 0017](decisions/0017-local-research-service.md).
 
+The same service also keeps the **model library**: immutable model versions
+registered from verified experiments or imported as constrained ONNX
+classifiers, and **comparisons** of several versions under one frozen
+specification. Their decisions are in
+[ADR 0021](decisions/0021-model-registry-imports-and-comparisons.md).
+
 ## Running it
 
 ```sh
 cd python
 .venv/bin/python -m chronos_research serve --tools ../build --artifacts ../data --state ../data/research \
-  [--host 127.0.0.1] [--port 8090] [--max-running 1] [--max-queued 8] [--job-timeout-s 1800] [--retain-jobs 200]
+  [--host 127.0.0.1] [--port 8090] [--max-running 1] [--max-queued 8] [--job-timeout-s 1800] [--retain-jobs 200] \
+  [--docker docker] [--docker-host <DOCKER_HOST>]
 cd ../apps/web
 npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, default http://127.0.0.1:8090
 ```
@@ -32,6 +39,12 @@ npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, defaul
   no web framework, uploads, pickle, or joblib.
 - **Proxy.** The Vite proxy lists `/api/v1/research` before `/api`, so the
   trading API keeps every other path.
+- **The ONNX sandbox.** Imports run only in a Docker container built from
+  this source (`python -m chronos_research onnx-sandbox build`; see
+  [tools/onnx-sandbox/README.md](../tools/onnx-sandbox/README.md)).
+  `--docker` names the Docker CLI and `--docker-host` an optional
+  `DOCKER_HOST`. Without Docker or the image, everything else works and
+  imports are refused with the reason.
 
 ## Contract
 
@@ -48,6 +61,19 @@ npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, defaul
 | `GET /api/v1/research/results/{run_id}/decisions` | Its decisions, oldest first |
 | `GET /api/v1/research/results/{run_id}/trades?account=strategy\|buy_and_hold\|cash` | Its orders and their outcomes, oldest first |
 | `GET /api/v1/research/results/{run_id}/equity` | Every valuation point of every account |
+| `GET /api/v1/research/models?state=active\|archived\|all` | Model versions (default `active`); versions that do not verify are under `invalid_entries`, on the first page only |
+| `POST /api/v1/research/models` | Register a fitted experiment model as a version (a `registration` job) |
+| `GET /api/v1/research/models/{model_version_id}` | One version, with its compatibility, limitations, and a check of its source experiment |
+| `POST /api/v1/research/models/{model_version_id}/lifecycle` | Archive or restore it: `{"state", "reason"}` |
+| `POST /api/v1/research/imports` | Stage an ONNX import's `chronos.model_import/1` manifest |
+| `GET /api/v1/research/imports/{import_id}` | The staged import and its latest `import` job |
+| `PUT /api/v1/research/imports/{import_id}/model` | Its model bytes, `application/octet-stream`, at most 1 MiB |
+| `POST /api/v1/research/imports/{import_id}/validation` | Validate the reviewed bytes in the sandbox and import them (an `import` job) |
+| `GET /api/v1/research/comparisons` | Published comparisons; ones that do not verify are under `invalid_entries` |
+| `POST /api/v1/research/comparisons` | Start a comparison (a `comparison` job) |
+| `GET /api/v1/research/comparisons/{comparison_id}` | One comparison, with each member's schedule and run verified again |
+| `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison` | Every job, newest first, optionally of one kind |
+| `GET /api/v1/research/jobs/{job_id}` | One job of any kind |
 
 A run request names everything; nothing is defaulted silently:
 
@@ -66,17 +92,24 @@ The conventions are the paper-trading API's
 - **Bodies.** `POST` bodies must be `application/json` (else `415`) and at
   most 16 KiB (else `413`). Unknown, duplicate, missing, or null fields and
   JSON numbers are `400 malformed_request`, with a `reason` such as
-  `unexpected_field`, `invalid_type`, or `invalid_decimal`.
+  `unexpected_field`, `invalid_type`, or `invalid_decimal`. The one other
+  body is an import's model on `PUT /imports/{id}/model`:
+  `application/octet-stream` with no parameters, refused with `413` on its
+  announced `Content-Length` above 1 MiB before any byte is read, and
+  `400 incomplete_body` if fewer bytes arrive. A request that stops sending
+  is dropped after 30 seconds.
 - **Decimals and integers.** Both are strings. Decimals follow the trading
   API's grammar and scale; trailing zeros are accepted and canonicalized.
 - **Domain errors.** A well-formed value outside its domain is
   `422 invalid_configuration` with the field and reason `out_of_domain`.
 - **Queries.** Query strings are strict: only `limit` (1 to 200, default
-  50), `cursor`, and, for trades, `account`. Cursors are opaque and bound to
+  50), `cursor`, and, for trades, `account`, for models, `state`, and for
+  jobs, `kind`. Cursors are opaque and bound to
   their list and run. Invalid percent encoding or UTF-8 is a
   `400 malformed_request` with reason `invalid_query`, never a server error.
-- **Paging growing lists.** Jobs (newest first), experiments, and results
-  (both in ID order) can grow while a client pages them, so their cursors
+- **Paging growing lists.** Jobs (newest first), experiments, results,
+  model versions, and comparisons (in ID order) can grow while a client
+  pages them, so their cursors
   are keysets: a cursor names the last entry returned, and the next page
   continues strictly after it.
   - Following a chain never repeats an entry or skips one that existed
@@ -93,9 +126,14 @@ The conventions are the paper-trading API's
 - **Errors.** `{"error": {"code", "message", "field", "reason"}}`. The codes
   include:
   - `route_not_found` and `method_not_allowed` (with `Allow`);
-  - `experiment_not_found`, `run_not_found`, and `result_not_found`;
+  - `experiment_not_found`, `run_not_found`, `result_not_found`,
+    `job_not_found`, `model_not_found`, `import_not_found`,
+    `comparison_not_found`, and `split_not_found`;
   - `unknown_instrument` and `unevaluable_model` (with the model's reason);
   - `artifact_invalid` (an artifact whose bytes do not verify);
+  - for imports, `invalid_manifest` and `incompatible_contract` (422),
+    `model_already_uploaded`, `model_not_uploaded`, and `model_mismatch`
+    (409), and `sandbox_unavailable` (503, with the sandbox's `reason`);
   - `queue_full` (503);
   - `misdirected_request` (421, a non-loopback `Host`);
   - `internal_error`.
@@ -123,8 +161,36 @@ The conventions are the paper-trading API's
   `503 queue_full`). Combined stdout and stderr are capped at 1 MiB while
   the child is running; exceeding the cap kills its process group and fails
   the job. Only the last 4 KiB of a job's log is kept.
+- **Kinds.** `evaluation` (`evaluate-strategy`), `registration`
+  (`register-model`), `import` (`import-model --staged`), and `comparison`
+  (`compare-models --spec`), each one fixed child command. `GET /runs` lists
+  evaluations only, as before; `GET /jobs` lists every kind.
+- **Sandbox containers.** An import or comparison job's child may start
+  ONNX sandbox containers.
+  - Each such job gets a supervisor token, recorded in its job record
+    before the child starts and passed as `--sandbox-supervisor`.
+  - When the child ends, however it ends (including timeout, an output
+    flood, or shutdown), the service removes every container under the
+    token and checks that Docker lists none. Only then is the job's slot
+    free.
+  - If Docker cannot be reached at that moment, the record stays
+    unreleased. It is reclaimed at the next start and before every later
+    sandbox job. If Docker answers but such a container stays, a new
+    sandbox job fails with `sandbox_cleanup_pending`.
+  - Unreleased records are never pruned. See ADR 0021.
 - **States.** `queued`, `running`, `succeeded`, `failed` (with a code such
-  as `evaluation_failed` or `timed_out`), and `interrupted`.
+  as `evaluation_failed` or `timed_out`), and `interrupted`. A refused
+  registration, import, or comparison fails with the refusal's code and,
+  where the child reported one, its `reason`:
+  - `name_version_taken` and `registration_refused`;
+  - `import_refused` (the manifest, the profile, the smoke test, or the
+    staged bytes, with a reason such as `unsupported_operator`,
+    `external_data`, `graph_too_large`, `malformed_model`, or
+    `non_finite_output`), `sandbox_unavailable`, and `sandbox_failed` (a
+    timeout, an exit, or a reply outside the protocol);
+  - `comparison_refused`;
+  - otherwise `registration_failed`, `import_failed`, or
+    `comparison_failed`.
 - **Deduplication.** An identical request, after canonicalization, returns
   the equal job when it is queued, running, or succeeded (`200`,
   `"deduplicated": true`). After a failure or an interruption it starts new
@@ -155,12 +221,98 @@ The conventions are the paper-trading API's
   item in a listing.
 - **Full verification in the job.** Every evaluation verifies and
   reproduces the whole ancestry in its child process before publishing.
+- **Results.** `GET /results` lists version 1 strategy runs, the runs of
+  experiment models. A version 2 run, of a registered model version, is
+  listed by the comparison it belongs to; `GET /results/{run_id}` and its
+  decisions, trades, and equity read either version.
+
+## The model library
+
+- **Registration.** `POST /models` with `{"experiment_id", "instrument",
+  "model", "name", "version"}` checks that the experiment verifies and the
+  model is fitted, then queues a `registration` job. The child verifies the
+  sources again, with reproduction, and publishes the version and binds its
+  name. A name and version bound to another version fails the job with
+  `name_version_taken`, and nothing is published.
+- **Listing and detail.** A listing entry gives the family, instrument,
+  origin (`experiment` or `import`), names, lifecycle, payload, and the
+  information cutoff with its basis: `verified`, `declared`, or
+  `unavailable` with a reason. The detail adds:
+  - the inputs, outputs, target, runtime, and provenance;
+  - what Chronos verified and, for an import, what it did not;
+  - compatibility with evaluation and with paper deployment, each
+    `compatible` with its requirement or `unavailable` with a reason (an
+    import's evaluation needs the sandbox; a deployment needs an active
+    version with a known cutoff);
+  - the limitations;
+  - for an experiment model, whether its source experiment still holds
+    exactly this payload (`matches`, `missing`, `invalid`, or `differs`);
+    an import has none (`not_applicable`).
+- **Lifecycle.** `POST /models/{id}/lifecycle` with `{"state": "archived" |
+  "active", "reason"}`. Archiving changes only what new comparisons and
+  deployments may choose.
+- **Status.** `GET /status` also reports `imports`: the
+  `chronos.onnx_classifier/1` profile's limits, and the sandbox's
+  capability (`available` with its image, or `unavailable` with a reason
+  and detail).
+
+## Imports
+
+An import is staged in two requests and validated as a job, so the bytes
+reviewed are the bytes validated.
+
+1. `POST /imports` with the `chronos.model_import/1` manifest checks it at
+   once (`422 invalid_manifest` or `incompatible_contract`) and returns
+   `201` with the staged import.
+2. `PUT /imports/{id}/model` stores the bytes and their SHA-256 (`201`; the
+   same bytes again are `200`, other bytes `409 model_already_uploaded`).
+3. `POST /imports/{id}/validation` with `{"model_sha256"}` must name the
+   uploaded digest (`409 model_mismatch`, or `model_not_uploaded`). It is
+   refused with `503 sandbox_unavailable` unless the sandbox is available,
+   and otherwise queues an `import` job, deduplicated by manifest and
+   model digests.
+
+The job checks the profile and runs the smoke corpus in the sandbox, then
+publishes exactly those bytes. Staged imports live in `--state/imports/`
+and survive a restart; at most 64 are kept, the oldest pruned unless a job
+still needs them.
+
+## Comparisons
+
+`POST /comparisons` takes `{"model_version_ids", "split_artifact_id",
+"instrument", "window", "configuration"}`:
+- 2 to 6 distinct versions, else `422 invalid_configuration`;
+- versions that exist, else `422 model_not_found`;
+- a split that exists, else `422 split_not_found`;
+- a configuration checked as an evaluation's.
+
+The service adds the spec's schema, `chronos.model_comparison_spec/1`, and
+queues a `comparison` job deduplicated by the spec's digest. The job
+predicts, runs, and replays each member in its own accounts, keeps refused
+and failed members with their reasons, and publishes one immutable
+`chronos.model_comparison/1` artifact.
+
+Only after every member is predicted does the job read the window's
+realized labels. It scores each completed member's stored predictions with
+the experiment's metric definitions (`predictive`):
+- accuracy, balanced accuracy, log loss, Brier score, and per-class
+  precision, recall, and F1;
+- the rows scored, and the rows not scored by the split's reason.
+
+A member that cannot be scored keeps its trading results and says why. The
+detail route re-verifies each
+member's schedule and run (`verified`, or `invalid:` with why); the CLI's
+`inspect-comparison` also replays every run. See
+[strategy-evaluation.md](strategy-evaluation.md#registered-model-versions)
+and ADR 0021.
 
 ## The Research view
 
-- **Navigation.** The header has two views, Trading and Research. Research
-  lives under `#/research` and `#/research/results/<run-id>`, so a reload
-  or a link reopens the same view. The workspace's section links
+- **Navigation.** The header has four views: Trading, Models,
+  Comparisons, and Research. Research lives under `#/research` and
+  `#/research/results/<run-id>`, so a reload or a link reopens the same
+  view; Models and Comparisons are described in
+  [web-client.md](web-client.md#models-and-comparisons). The workspace's section links
   (`#portfolio`, …) keep working. The account selection is separate browser
   state, so "Back to trading" finds the same account open.
 - **Model.** The model panel shows:
@@ -218,6 +370,17 @@ The chart draws the three equity curves over market time.
   - unevaluable models;
   - symlinked and corrupt artifacts;
   - restart recovery, failed jobs, timed-out jobs, and a full queue.
+
+  `test_model_routes.py`, `test_import_routes.py`, and
+  `test_comparison_routes.py` cover the library, imports (with the real
+  sandbox when it is available), and comparisons the same way: the request
+  conventions, jobs and their refusals, persistence across a restart, and
+  corrupt artifacts. `test_registry.py`, `test_model_import.py`,
+  `test_onnx_profile.py`, `test_onnx_sandbox.py`, `test_comparison.py`, and
+  `test_registered_worker.py` cover the modules beneath them. The ONNX
+  tests build their models at test time with the optional `onnx` package
+  and are skipped without it or without the sandbox, unless
+  `CHRONOS_REQUIRE_ONNX_SANDBOX=1`.
 - **Web unit tests.** `apps/web` covers the client contract, routing,
   formatting, the components (including the chart's keyboard and readout),
   and keeping the account across views.
@@ -240,7 +403,10 @@ The chart draws the three equity curves over market time.
 <id> --instrument <symbol> --model logistic|majority` serves one verified
 model to a model deployment, which the paper-trading server runs
 ([model-deployments.md](model-deployments.md)). It is not part of this
-service.
+service. With `--model-version <id>` (and `--docker <path>` for an import)
+instead of `--experiment` and `--model`, it serves a registered model
+version over `chronos.inference_worker/2`; see
+[model-deployments.md](model-deployments.md#registered-model-versions).
 
 - **Protocol.** It speaks `chronos.inference_worker/1`, one JSON object
   per line. A ready line gives the model's identity: the experiment, the
@@ -263,9 +429,13 @@ service.
 - **Loopback only.** There is no authentication; the service is for the
   machine it runs on.
 - **No cancellation.** A job runs to completion or its time limit.
-- **No retraining.** The service evaluates prebuilt experiments. Building
-  datasets, features, labels, splits, and experiments is still the `demo`
-  and `evaluate` commands' work.
+- **No retraining.** The service evaluates prebuilt experiments and
+  registered or imported versions as they are. Building datasets, features,
+  labels, splits, and experiments is still the `demo` and `evaluate`
+  commands' work.
+- **Imports need Docker.** Without Docker and the sandbox image an import
+  cannot be validated, evaluated, or deployed, and an import's declared
+  cutoff cannot be verified at all.
 - **Simple listings.** Results are listed in ID order, not by recency; the
   runs list gives recency. The Research view loads one page of each list
   and an older page only when asked ("Load more"); a refresh re-reads the

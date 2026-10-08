@@ -1,10 +1,11 @@
 import type { ReactNode } from 'react';
 import { useId, useState } from 'react';
 
-import type { AccountName, AccountResult, ResearchResult, Valuation } from '../../api/researchSchemas';
+import type { AccountName, AccountResult, ResearchResult, RunSource, Valuation } from '../../api/researchSchemas';
 import { isComplete } from '../../api/researchSchemas';
 import type { UnsignedInteger } from '../../api/schemas';
 import { nanosecondsAsSeconds } from '../../presentation/format';
+import { CUTOFF_BASIS, familyLabel } from '../../presentation/models';
 import {
   ACCOUNT_LABEL,
   MODEL_LABEL,
@@ -14,6 +15,7 @@ import {
   tradeOutcome,
 } from '../../presentation/research';
 import { useDecisions, useEquity, useResult, useTrades } from '../../state/research';
+import { modelsHref } from '../../state/route';
 import historyStyles from '../history/history.module.css';
 import { Alert, Code } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
@@ -367,6 +369,11 @@ function Decisions({ result }: { readonly result: ResearchResult }) {
   );
 }
 
+// An experiment's model, or a registered version's family.
+function runModelLabel(source: RunSource): string {
+  return 'model_version_id' in source ? familyLabel(source.family) : MODEL_LABEL[source.model];
+}
+
 function Provenance({ result }: { readonly result: ResearchResult }) {
   const { configuration, source, window } = result;
   const id = (value: string) => <span className={styles.ids}>{value}</span>;
@@ -413,7 +420,19 @@ function Provenance({ result }: { readonly result: ResearchResult }) {
               label: 'Valued at',
               value: window.valued_at === null ? <Unavailable /> : <MarketTime value={window.valued_at} stacked />,
             },
-            { label: 'Training labels known by', value: <MarketTime value={source.training_labels_available_through} stacked /> },
+            'model_version_id' in source
+              ? {
+                  label: 'Information cutoff',
+                  value: (
+                    <>
+                      <MarketTime value={source.information_cutoff.at} stacked />
+                      <Badge tone={CUTOFF_BASIS[source.information_cutoff.basis].tone}>
+                        {CUTOFF_BASIS[source.information_cutoff.basis].label}
+                      </Badge>
+                    </>
+                  ),
+                }
+              : { label: 'Training labels known by', value: <MarketTime value={source.training_labels_available_through} stacked /> },
             { label: 'Warm-up events', value: result.events.warmup },
             { label: 'Events in the window', value: result.events.window },
             { label: 'Events after it, unused', value: result.events.after_window_unused },
@@ -426,9 +445,16 @@ function Provenance({ result }: { readonly result: ResearchResult }) {
           facts={[
             { label: 'Result', value: id(result.run_id) },
             { label: 'Schedule', value: id(source.schedule_id) },
-            { label: 'Model', value: `${MODEL_LABEL[source.model]}, ${source.instrument}` },
-            { label: 'Experiment', value: id(source.experiment_id) },
-            { label: 'Parameters SHA-256', value: id(source.parameters_sha256) },
+            { label: 'Model', value: `${runModelLabel(source)}, ${source.instrument}` },
+            ...('model_version_id' in source
+              ? [
+                  { label: 'Model version', value: <a href={modelsHref(source.model_version_id)}>{id(source.model_version_id)}</a> },
+                  { label: 'Payload SHA-256', value: id(source.payload_sha256) },
+                ]
+              : [
+                  { label: 'Experiment', value: id(source.experiment_id) },
+                  { label: 'Parameters SHA-256', value: id(source.parameters_sha256) },
+                ]),
             { label: 'Dataset', value: id(source.dataset_id) },
             { label: 'Features', value: id(source.feature_artifact_id) },
             { label: 'Labels', value: id(source.label_artifact_id) },
@@ -467,7 +493,7 @@ export function ResultView({ runId }: { readonly runId: string }) {
   const data = result.data;
   return (
     <>
-      <Alert tone="info" title={`${data.source.instrument} · ${WINDOW_LABEL[data.window.name]} window · ${MODEL_LABEL[data.source.model]}`}>
+      <Alert tone="info" title={`${data.source.instrument} · ${WINDOW_LABEL[data.window.name]} window · ${runModelLabel(data.source)}`}>
         <p>
           {data.scope.charAt(0).toUpperCase() + data.scope.slice(1)}. Prediction accuracy is reported with the model,
           not here: these are simulated trading results. <Code>{data.run_id}</Code>
