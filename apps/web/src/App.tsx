@@ -13,6 +13,11 @@ import { TRADING_HREF, useRoute } from './state/route';
 const Research = lazy(() =>
   import('./components/research/Research').then((module) => ({ default: module.Research })),
 );
+// The model library likewise, and it never changes the account selection.
+const Models = lazy(() => import('./components/models/Models').then((module) => ({ default: module.Models })));
+const Comparisons = lazy(() =>
+  import('./components/comparisons/Comparisons').then((module) => ({ default: module.Comparisons })),
+);
 
 export function App() {
   const selection = useAccountSelection();
@@ -26,7 +31,15 @@ export function App() {
           accountId === null ? null : <AccountContext accountId={accountId} onSwitch={selection.closeAccount} />
         }
       >
-        {route.view === 'research' ? (
+        {route.view === 'models' ? (
+          <Suspense fallback={<p role="status">Loading the model library…</p>}>
+            <Models modelId={route.modelId} />
+          </Suspense>
+        ) : route.view === 'comparisons' ? (
+          <Suspense fallback={<p role="status">Loading comparisons…</p>}>
+            <Comparisons comparisonId={route.comparisonId} />
+          </Suspense>
+        ) : route.view === 'research' ? (
           // Research changes the account selection only when asked to open
           // a deployment's account, so returning to trading otherwise finds
           // the same account open.

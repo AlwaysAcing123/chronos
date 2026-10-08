@@ -42,7 +42,9 @@
   font-size: 12px;
   font-weight: 500;
   line-height: 18px;
-  white-space: nowrap;
+  /* A long label wraps inside a narrow column rather than run past it. */
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 /* The glyph repeats the tone as a shape for readers who cannot use colour. */

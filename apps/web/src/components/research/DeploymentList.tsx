@@ -14,6 +14,7 @@ import {
   outcomeCode,
   policyReasonText,
 } from '../../presentation/deployments';
+import { CUTOFF_BASIS, familyLabel } from '../../presentation/models';
 import { MODEL_LABEL, shortId } from '../../presentation/research';
 import type { Tone } from '../../presentation/vocabulary';
 import {
@@ -24,6 +25,7 @@ import {
   useStartDeployment,
   useStopDeployment,
 } from '../../state/deployments';
+import { modelsHref } from '../../state/route';
 import historyStyles from '../history/history.module.css';
 import { Alert, Code } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
@@ -58,6 +60,18 @@ const REASON: Readonly<Record<string, string>> = {
   account_unhealthy: 'The deployment’s account is halted',
   runtime_error: 'An internal failure stopped it',
 };
+
+// The deployment's model: an experiment's, or a registered version, linked.
+function DeploymentModel({ model }: { readonly model: Deployment['model'] }) {
+  return model.reference === 'experiment' ? (
+    <>{`${model.instrument} · ${MODEL_LABEL[model.name]} · ${shortId(model.experiment_id)}`}</>
+  ) : (
+    <>
+      {`${model.instrument} · ${familyLabel(model.name)} · `}
+      <a href={modelsHref(model.model_version_id)}>{`version ${shortId(model.model_version_id)}`}</a>
+    </>
+  );
+}
 
 function failureText(error: unknown): string {
   if (error instanceof ChronosApiError) {
@@ -345,12 +359,20 @@ function DeploymentCard({
                 </Button>
               ),
           },
-          {
-            label: 'Model',
-            value: `${deployment.model.instrument} · ${MODEL_LABEL[deployment.model.name]} · ${shortId(deployment.model.experiment_id)}`,
-          },
+          { label: 'Model', value: <DeploymentModel model={deployment.model} /> },
           { label: 'Parameters', value: <Code>{shortId(deployment.model.parameters_sha256)}</Code> },
-          { label: 'Training cutoff (UTC)', value: <MarketTime value={deployment.model.training_cutoff} /> },
+          {
+            label: 'Training cutoff (UTC)',
+            value:
+              deployment.model.training_cutoff_basis === 'declared' ? (
+                <div>
+                  <MarketTime value={deployment.model.training_cutoff} stacked />
+                  <Badge tone={CUTOFF_BASIS.declared.tone}>{CUTOFF_BASIS.declared.label}</Badge>
+                </div>
+              ) : (
+                <MarketTime value={deployment.model.training_cutoff} />
+              ),
+          },
           {
             label: 'Policy',
             value: `Threshold ${deployment.policy.threshold} · target ${deployment.policy.target_quantity}`,

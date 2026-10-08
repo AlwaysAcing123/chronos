@@ -739,11 +739,17 @@ struct ScheduleSpec {
     Predictions predictions{kBaseSessionPredictions};
     // A row no event of the dataset has.
     bool extra_row{false};
+    // A version 2 schedule of a registered model version with this cutoff;
+    // a version 1 schedule of an experiment model without one.
+    std::optional<std::int64_t> registered_cutoff_at{};
+    // A version 2 schedule that names an experiment model, as no publisher may.
+    bool registered_with_experiment{false};
 };
 
-json::Value inference_definition() {
+json::Value inference_definition(bool registered = false) {
     return json::Value(json::Object{
-        {"class", "the model's predicted class: the largest logit, ties to the earliest class in class_order"},
+        {"class", registered ? "the model version's own class rule, stated in model.runtime.class"
+                             : "the model's predicted class: the largest logit, ties to the earliest class in class_order"},
         {"confidence_ppb", "floor(1e9 x the predicted class's probability), exact from its binary64 value"},
         {"rows", "every feature row of the instrument available in the window, labelled or not"},
         {"unavailable", "a row whose model inputs are unavailable has no prediction from any model"},
@@ -829,6 +835,7 @@ std::filesystem::path write_schedule(
         class_counts.emplace_back(name, std::to_string(n));
     }
     const std::string sha(64, 'b');
+    const bool registered = spec.registered_cutoff_at.has_value();
     const json::Value body(json::Object{
         {"class_order", json::Array{"down", "flat", "up"}},
         {"counts", json::Object{
@@ -843,16 +850,29 @@ std::filesystem::path write_schedule(
             {"sha256", chronos::Sha256::hex(bytes)},
             {"size_bytes", std::to_string(bytes.size())},
         }}}},
-        {"inference", inference_definition()},
-        {"model", json::Object{
-            {"experiment_id", std::string(64, 'e')},
-            {"instrument", "AAPL"},
-            {"model_feature_set", model_feature_set()},
-            {"name", "logistic"},
-            {"parameters_sha256", std::string(64, 'd')},
-        }},
+        {"inference", inference_definition(registered)},
+        {"model", registered && !spec.registered_with_experiment
+             ? json::Object{
+                   {"family", "onnx"},
+                   {"instrument", "AAPL"},
+                   {"model_feature_set", model_feature_set()},
+                   {"model_version_id", std::string(64, '7')},
+                   {"payload_sha256", std::string(64, '8')},
+                   {"runtime", json::Object{
+                       {"class", "the first largest probability"},
+                       {"name", "chronos.onnx_sandbox"},
+                       {"version", "1"},
+                   }},
+               }
+             : json::Object{
+                   {"experiment_id", std::string(64, 'e')},
+                   {"instrument", "AAPL"},
+                   {"model_feature_set", model_feature_set()},
+                   {"name", "logistic"},
+                   {"parameters_sha256", std::string(64, 'd')},
+               }},
         {"row", json::Object{{"name", "chronos.inference_row"}, {"version", "1"}}},
-        {"schema", json::Object{{"name", "chronos.inference_schedule"}, {"version", "1"}}},
+        {"schema", json::Object{{"name", "chronos.inference_schedule"}, {"version", registered ? "2" : "1"}}},
         {"scope", "model predictions only"},
         {"source", json::Object{
             {"dataset_id", spec.dataset_id},
@@ -870,10 +890,15 @@ std::filesystem::path write_schedule(
             {"test_start_at_ns", std::to_string(spec.test_start_at)},
             {"validation_start_at_ns", std::to_string(spec.validation_start_at)},
         }},
-        {"training", json::Object{
-            {"label_available_through_ns", std::to_string(spec.training_through)},
-            {"split", "train"},
-        }},
+        {"training", registered
+             ? json::Object{
+                   {"basis", "declared"},
+                   {"information_cutoff_ns", std::to_string(*spec.registered_cutoff_at)},
+               }
+             : json::Object{
+                   {"label_available_through_ns", std::to_string(spec.training_through)},
+                   {"split", "train"},
+               }},
         {"window", json::Object{
             {"end_at_ns", spec.end_at ? json::Value(std::to_string(*spec.end_at)) : json::Value(nullptr)},
             {"name", spec.window_name},
@@ -1011,6 +1036,59 @@ void tampered_runs_and_schedules_are_refused() {
     }
 }
 
+void a_registered_model_schedule_gives_a_run_that_names_the_version_and_no_experiment() {
+    Fixture fixture;
+    const auto schedule = write_schedule(
+        fixture.schedules,
+        base_session(),
+        ScheduleSpec{.dataset_id = fixture.dataset_id, .registered_cutoff_at = ms(1000)}
+    );
+    const auto result = st::run_strategy(fixture.catalog, schedule, fixture.output, {});
+    const auto& run = published(result);
+    const json::Value& document = run.manifest.document;
+    REQUIRE(text(document, {"schema", "version"}) == "2");
+    REQUIRE(text(document, {"source", "model_version_id"}) == std::string(64, '7'));
+    REQUIRE(text(document, {"source", "family"}) == "onnx");
+    REQUIRE(text(document, {"source", "payload_sha256"}) == std::string(64, '8'));
+    REQUIRE(text(document, {"source", "information_cutoff", "basis"}) == "declared");
+    REQUIRE(text(document, {"source", "information_cutoff", "at_ns"}) == std::to_string(ms(1000)));
+    for (const auto& member : *member(document, "source").if_object()) {
+        REQUIRE(member.first != "experiment_id");
+        REQUIRE(member.first != "parameters_sha256");
+    }
+    // The same predictions give the same account results as a version 1 run.
+    const auto v1 = write_schedule(fixture.schedules, base_session(), ScheduleSpec{.dataset_id = fixture.dataset_id});
+    const auto experiment_result = st::run_strategy(fixture.catalog, v1, fixture.output, {});
+    const auto& experiment_run = published(experiment_result);
+    REQUIRE(member(document, "results") == member(experiment_run.manifest.document, "results"));
+    REQUIRE(text(experiment_run.manifest.document, {"schema", "version"}) == "1");
+    const auto verified = st::verify_strategy_run(run.directory);
+    REQUIRE(std::holds_alternative<st::StrategyRunManifest>(verified));
+    REQUIRE(!st::reproduce_strategy_run(std::get<st::StrategyRunManifest>(verified), fixture.catalog, fixture.schedules));
+}
+
+void a_registered_model_must_not_see_the_window_or_claim_an_experiment() {
+    Fixture fixture;
+    const auto attempt = [&](ScheduleSpec spec, std::string_view name) {
+        const auto root = fixture.scratch.path() / ("schedules-" + std::string(name));
+        std::filesystem::create_directories(root);
+        return st::run_strategy(fixture.catalog, write_schedule(root, base_session(), spec), fixture.output, {});
+    };
+    // A cutoff after the window's start could have seen the window.
+    const auto late = attempt(
+        ScheduleSpec{.dataset_id = fixture.dataset_id, .registered_cutoff_at = ms(1000) + 1}, "late"
+    );
+    REQUIRE(std::get<ds::DatasetError>(late).code == ds::DatasetErrorCode::LabelLeakage);
+    const auto at_start = attempt(ScheduleSpec{.dataset_id = fixture.dataset_id, .registered_cutoff_at = ms(1000)}, "at-start");
+    REQUIRE(std::holds_alternative<st::PublishedStrategyRun>(at_start));
+    // A version 2 schedule names a model version, never an experiment.
+    const auto mixed = attempt(
+        ScheduleSpec{.dataset_id = fixture.dataset_id, .registered_cutoff_at = ms(900), .registered_with_experiment = true},
+        "mixed"
+    );
+    REQUIRE(std::holds_alternative<ds::DatasetError>(mixed));
+}
+
 }  // namespace
 
 int main() {
@@ -1044,5 +1122,9 @@ int main() {
         {"a run is published, verified, reproduced, and found again",
          a_run_is_published_verified_reproduced_and_found_again},
         {"tampered runs and schedules are refused", tampered_runs_and_schedules_are_refused},
+        {"a registered model's schedule gives a run that names the version and no experiment",
+         a_registered_model_schedule_gives_a_run_that_names_the_version_and_no_experiment},
+        {"a registered model must not see the window or claim an experiment",
+         a_registered_model_must_not_see_the_window_or_claim_an_experiment},
     });
 }

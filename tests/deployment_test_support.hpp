@@ -42,12 +42,13 @@ inline InferencePrediction predicted(PredictedClass value, std::uint64_t confide
 struct FakeModel {
     explicit FakeModel(Timestamp cutoff = Timestamp::from_nanoseconds(kMarketOpenNanoseconds + 10'000'000))
         : identity{
-              .experiment_id = std::string(64, 'e'),
+              .model = ExperimentModel{.experiment_id = std::string(64, 'e'), .name = "logistic"},
               .instrument = InstrumentId("AAPL"),
-              .model = "logistic",
+              .family = "logistic",
               .parameters_sha256 = std::string(64, 'f'),
               .model_feature_set = "top_of_book_baseline/1",
               .training_cutoff = cutoff,
+              .cutoff_basis = "verified",
           } {}
 
     ModelIdentity identity;

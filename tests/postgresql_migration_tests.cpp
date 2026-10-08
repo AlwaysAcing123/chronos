@@ -325,7 +325,7 @@ void test_a_fresh_database_gets_the_multi_instrument_schema() {
     REQUIRE(inspector.scalar(
         "SELECT string_agg(version::text, ',' ORDER BY version) "
         "FROM chronos_schema_migrations"
-    ) == "1,2,3,4,5,6,7");
+    ) == "1,2,3,4,5,6,7,8");
     REQUIRE(inspector.scalar(
         "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) "
         "FROM information_schema.columns "
@@ -582,6 +582,7 @@ void test_the_migration_applies_once() {
     apply(store, "005_model_deployments.sql");
     apply(store, "006_live_stream_sequences.sql");
     apply(store, "007_live_stream_writer_fence.sql");
+    apply(store, "008_registered_model_deployments.sql");
     const auto everything = [&] {
         return inspector.scalar(kJournalChecksum) + "/" + inspector.scalar(
             "SELECT md5(string_agg(row_text, ',' ORDER BY row_text)) FROM ("
@@ -613,6 +614,7 @@ void test_the_migration_applies_once() {
     apply(store, "005_model_deployments.sql");
     apply(store, "006_live_stream_sequences.sql");
     apply(store, "007_live_stream_writer_fence.sql");
+    apply(store, "008_registered_model_deployments.sql");
     // Reading the identity advanced it once.
     const std::string rerun = everything();
     REQUIRE(rerun.substr(0, rerun.rfind('/')) ==
@@ -1532,7 +1534,7 @@ void test_migration_006_changes_nothing_that_exists_and_reruns_as_a_no_op() {
 
     apply(store, "006_live_stream_sequences.sql");
     store.apply_migration(all_migrations_sql());
-    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7,8");
     REQUIRE(inspector.scalar(kVersion4Checksum) == before);
 }
 
@@ -1580,7 +1582,7 @@ void test_migration_007_starts_held_streams_at_their_next_sequence_and_reruns_as
 
     apply(store, "007_live_stream_writer_fence.sql");
     store.apply_migration(all_migrations_sql());
-    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7,8");
     REQUIRE(inspector.scalar(kVersion4Checksum) == before);
     REQUIRE(inspector.scalar(streams) == "held=18446744073709551616/w/18446744073709551616,released=16/-/-");
 }
@@ -1659,6 +1661,98 @@ void test_a_writer_change_must_begin_a_generation_where_reservations_ended() {
 // Sequences are exact unsigned 64-bit values: 2^64 marks an exhausted
 // stream and nothing beyond it, or below zero, is stored. A lease is whole
 // or absent, and an adoption records what it followed.
+// Migration 008 (ADR 0021) makes every existing deployment an experiment
+// deployment, exactly as it was, and changes nothing else.
+void test_migration_008_keeps_every_deployment_an_experiment_one_and_reruns_as_a_no_op() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    apply(store, "005_model_deployments.sql");
+    apply(store, "006_live_stream_sequences.sql");
+    apply(store, "007_live_stream_writer_fence.sql");
+    inspector.run_script(deployment_insert("dep-1", "legacy-open"));
+    const std::string deployment = "SELECT md5(string_agg(concat_ws('|', deployment_id, account_id, request_sha256, "
+        "experiment_id, parameters_sha256, model_name, instrument, training_cutoff_ns, state, version), ','))"
+        " FROM model_deployments";
+    const std::string before = inspector.scalar(kVersion4Checksum) + "/" + inspector.scalar(deployment);
+
+    apply(store, "008_registered_model_deployments.sql");
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7,8");
+    REQUIRE(inspector.scalar(kVersion4Checksum) + "/" + inspector.scalar(deployment) == before);
+    REQUIRE(inspector.scalar(
+        "SELECT model_reference || '/' || coalesce(model_version_id, '-') || '/' || training_cutoff_basis "
+        "FROM model_deployments"
+    ) == "experiment/-/verified");
+
+    apply(store, "008_registered_model_deployments.sql");
+    store.apply_migration(all_migrations_sql());
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6,7,8");
+    REQUIRE(inspector.scalar(kVersion4Checksum) + "/" + inspector.scalar(deployment) == before);
+}
+
+void test_migration_008_requires_migration_007() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    apply(store, "005_model_deployments.sql");
+    apply(store, "006_live_stream_sequences.sql");
+    REQUIRE(contains(
+        required_migration_error(store, "008_registered_model_deployments.sql"),
+        "migration 008 requires migration 007"
+    ));
+    REQUIRE(inspector.scalar(kMigrationVersions) == "1,2,3,4,5,6");
+    REQUIRE(inspector.scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() "
+        "AND table_name = 'model_deployments' AND column_name = 'model_reference'"
+    ) == "0");
+}
+
+// A deployment names exactly one model: an experiment's, with migration
+// 005's rules unchanged, or a registered version, with no experiment.
+void test_a_deployment_names_exactly_one_model() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    PostgresTestConnection inspector(schema.connection());
+    apply_working_order_rows(store, inspector);
+    store.apply_migration(all_migrations_sql());
+    const auto refused = [&](std::string_view sql) {
+        try {
+            inspector.run_script(sql);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto experiment = [](std::string_view deployment, std::string_view account) {
+        return deployment_insert(deployment, account);
+    };
+    const auto registered = [](std::string_view deployment, std::string_view account) {
+        std::string sql = replaced(
+            deployment_insert(deployment, account),
+            "experiment_id, ",
+            "model_reference, model_version_id, training_cutoff_basis, "
+        );
+        sql = replaced(std::move(sql), "repeat('b', 64), ", "'registered', repeat('7', 64), 'declared', ");
+        return replaced(std::move(sql), "'logistic'", "'onnx'");
+    };
+    REQUIRE(refused(registered("dep-1", "legacy-open")).empty());
+    REQUIRE(inspector.scalar("SELECT model_name || '/' || coalesce(experiment_id, '-') FROM model_deployments") ==
+        "onnx/-");
+    // An experiment deployment keeps every rule of migration 005.
+    REQUIRE(contains(refused(replaced(experiment("dep-2", "legacy-closed"), "'logistic'", "'onnx'")),
+        "model_deployments_one_model_reference"));
+    REQUIRE(contains(refused(replaced(experiment("dep-3", "legacy-closed"), "repeat('b', 64)", "NULL")),
+        "model_deployments_one_model_reference"));
+    // A registered deployment names a version and no experiment.
+    REQUIRE(contains(refused(replaced(registered("dep-4", "legacy-closed"), "repeat('7', 64)", "NULL")),
+        "model_deployments_one_model_reference"));
+    REQUIRE(contains(refused(replaced(registered("dep-5", "legacy-closed"), "'onnx'", "'gradient_boosting'")),
+        "model_deployments_model_name_check"));
+    REQUIRE(refused(experiment("dep-6", "legacy-closed")).empty());
+}
+
 void test_live_stream_sequence_constraints_hold() {
     const ScratchSchema schema;
     PostgresPaperOrderRepository store(schema.connection());
@@ -1802,6 +1896,12 @@ int main() {
             test_migration_007_starts_held_streams_at_their_next_sequence_and_reruns_as_a_no_op,
         },
         {"migration 007 requires migration 006", test_migration_007_requires_migration_006},
+        {
+            "migration 008 keeps every deployment an experiment one and reruns as a no-op",
+            test_migration_008_keeps_every_deployment_an_experiment_one_and_reruns_as_a_no_op,
+        },
+        {"migration 008 requires migration 007", test_migration_008_requires_migration_007},
+        {"a deployment names exactly one model", test_a_deployment_names_exactly_one_model},
         {
             "a writer change must begin a generation where reservations ended",
             test_a_writer_change_must_begin_a_generation_where_reservations_ended,

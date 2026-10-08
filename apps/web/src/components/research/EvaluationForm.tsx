@@ -34,7 +34,7 @@ interface FieldSpec {
 
 const INTEGER = /^(0|[1-9][0-9]*)$/;
 
-const FIELDS: readonly FieldSpec[] = [
+export const CONFIGURATION_FIELDS: readonly FieldSpec[] = [
   {
     key: 'threshold_ppb',
     label: 'Confidence threshold (parts per billion)',
@@ -61,7 +61,52 @@ const FIELDS: readonly FieldSpec[] = [
   { key: 'maximum_order_notional', label: 'Maximum order notional (USD)', hint: () => null },
 ];
 
-function fieldOf(error: unknown): string | null {
+// The policy, capital, cost, and risk inputs of an evaluation or a comparison.
+export function ConfigurationFields({
+  idPrefix,
+  configuration,
+  rejectedField,
+  onChange,
+}: {
+  readonly idPrefix: string;
+  readonly configuration: RunConfiguration;
+  readonly rejectedField: string | null;
+  readonly onChange: (configuration: RunConfiguration) => void;
+}) {
+  return (
+    <div className={styles.fields}>
+      {CONFIGURATION_FIELDS.map((field) => {
+        const id = `${idPrefix}-${field.key}`;
+        const hint = field.hint(configuration[field.key]);
+        const invalid = rejectedField === `configuration.${field.key}`;
+        return (
+          <div key={field.key} className={styles.field}>
+            <label htmlFor={id}>{field.label}</label>
+            <input
+              id={id}
+              inputMode="decimal"
+              autoComplete="off"
+              spellCheck={false}
+              value={configuration[field.key]}
+              aria-invalid={invalid}
+              aria-describedby={hint === null ? undefined : `${id}-hint`}
+              onChange={(event) => {
+                onChange({ ...configuration, [field.key]: event.target.value });
+              }}
+            />
+            {hint !== null && (
+              <span id={`${id}-hint`} className={styles.fieldHint}>
+                {hint}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function fieldOf(error: unknown): string | null {
   return error instanceof ChronosApiError && error.failure.kind === 'api_error' ? error.failure.error.field : null;
 }
 
@@ -117,7 +162,7 @@ export function EvaluationForm({
   const chosen = entry.models[model];
   const fittedModel = chosen.status === 'fitted';
   const rejectedField = fieldOf(start.error);
-  const blank = FIELDS.find((field) => configuration[field.key].trim() === '');
+  const blank = CONFIGURATION_FIELDS.find((field) => configuration[field.key].trim() === '');
 
   const request: RunRequest = {
     experiment_id: experiment.experiment_id,
@@ -200,35 +245,12 @@ export function EvaluationForm({
             )}
             <div className={styles.section}>
               <h3 className={styles.sectionTitle}>Policy, capital, costs, and risk</h3>
-              <div className={styles.fields}>
-                {FIELDS.map((field) => {
-                  const id = `${formId}-${field.key}`;
-                  const hint = field.hint(configuration[field.key]);
-                  const invalid = rejectedField === `configuration.${field.key}`;
-                  return (
-                    <div key={field.key} className={styles.field}>
-                      <label htmlFor={id}>{field.label}</label>
-                      <input
-                        id={id}
-                        inputMode="decimal"
-                        autoComplete="off"
-                        spellCheck={false}
-                        value={configuration[field.key]}
-                        aria-invalid={invalid}
-                        aria-describedby={hint === null ? undefined : `${id}-hint`}
-                        onChange={(event) => {
-                          setConfiguration({ ...configuration, [field.key]: event.target.value });
-                        }}
-                      />
-                      {hint !== null && (
-                        <span id={`${id}-hint`} className={styles.fieldHint}>
-                          {hint}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+              <ConfigurationFields
+                idPrefix={formId}
+                configuration={configuration}
+                rejectedField={rejectedField}
+                onChange={setConfiguration}
+              />
               <p className={styles.note}>
                 Defaults were fixed before any evaluation was run and were not tuned on test results.
               </p>
@@ -241,7 +263,7 @@ export function EvaluationForm({
                 { label: 'Instrument', value: review.instrument },
                 { label: 'Model', value: MODEL_LABEL[review.model] },
                 { label: 'Window', value: WINDOW_LABEL[review.window] },
-                ...FIELDS.map((field) => ({ label: field.label, value: review.configuration[field.key] })),
+                ...CONFIGURATION_FIELDS.map((field) => ({ label: field.label, value: review.configuration[field.key] })),
               ]}
             />
             <div>

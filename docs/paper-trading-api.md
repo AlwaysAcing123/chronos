@@ -1622,6 +1622,11 @@ Every field is required and is a string:
 }
 ```
 
+- **Model.** Either `experiment_id` and `model`, an experiment's model
+  (above), or `model_version_id` alone, a registered model version from the
+  research service's model library
+  ([model-deployments.md](model-deployments.md#registered-model-versions)).
+  A body with fields of both is `400 malformed_request`.
 - **Identifiers.** `deployment_id` is at most 32 identifier characters, so
   that `<deployment_id>-<12-digit decision sequence>` is a valid client order
   ID. `kill-switch` is reserved for the control route. `account_id` must not
@@ -1631,9 +1636,11 @@ Every field is required and is a string:
 - **Timing.** The three durations are whole milliseconds, at most a day, and
   `max_signal_age_ms` must exceed `latency_ms`.
 - **Verification.** Before anything is written, the server starts the
-  inference worker with `--describe`, which verifies the experiment and
-  reports the model's parameter checksum and training cutoff. The deployment
-  records both.
+  inference worker with `--describe`, which verifies the experiment or the
+  model version and reports the model's parameter or payload checksum and
+  training cutoff. The deployment records both, and the cutoff's basis. An
+  archived version, a version without a cutoff, and an imported version the
+  server cannot run in the ONNX sandbox are `model_unavailable`.
 - **Account limits.** The new account takes the server's risk limits, with
   its order and position quantity limits lowered to `target_quantity`.
 
@@ -1671,8 +1678,10 @@ A deployment after the demonstration replay ([model-deployments.md](model-deploy
     "stream_id": "databento-equs-mini-mbp1-20260925-1330-1340",
     "starting_cash": "10000",
     "model": {
+      "reference": "experiment",
       "experiment_id": "05be6dd441394993e67b5efadda6dc4f4ac395750fd9a4bc3ae449ac2c16ba62",
       "name": "logistic",
+      "training_cutoff_basis": "verified",
       "instrument": "AAPL",
       "parameters_sha256": "a0e07429e1654ee4cbe07ba6e2ded7b079e35a9e3671da50c7e281567c538939",
       "feature_set": "top_of_book_baseline/1",
@@ -1711,6 +1720,10 @@ A deployment after the demonstration replay ([model-deployments.md](model-deploy
   `started`, `stop_requested`, `kill_switch`, `server_restarted`,
   `server_stopped`, `model_identity_mismatch`, `rejection_limit_reached`,
   `order_limit_reached`, or `inference_timeout`.
+- **`model`.** `reference` is `experiment`, with `experiment_id`, or
+  `registered`, with `model_version_id` and no `experiment_id`. `name` is
+  the family (`logistic`, `majority`, or `onnx`). `training_cutoff_basis` is
+  `verified`, or `declared` for an import whose uploader declared it.
 - **`active`.** True while this server process runs the deployment's
   runner.
 - **`watermark`.** The latest decided observation. It is durable and never

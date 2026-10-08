@@ -28,7 +28,7 @@ export const AccountNameSchema = z.enum(['strategy', 'buy_and_hold', 'cash']);
 export type AccountName = z.infer<typeof AccountNameSchema>;
 
 // A metric with a value, or why it has none.
-const MetricSchema = z.union([z.object({ value: z.string() }), z.object({ undefined: z.string() })]);
+export const MetricSchema = z.union([z.object({ value: z.string() }), z.object({ undefined: z.string() })]);
 export type Metric = z.infer<typeof MetricSchema>;
 
 const PredictionMetricsSchema = z
@@ -121,6 +121,19 @@ export const StatusSchema = z.object({
     retain_jobs: UnsignedIntegerSchema,
   }),
   tools: z.record(z.string(), z.enum(['available', 'missing'])),
+  // Whether ONNX imports can be validated here, and the profile they meet.
+  imports: z.object({
+    profile: z.object({
+      max_model_bytes: UnsignedIntegerSchema,
+      operators: z.array(z.string()),
+      opsets: z.array(UnsignedIntegerSchema),
+      profile: z.object({ name: z.string(), version: z.string() }),
+    }),
+    sandbox: z.discriminatedUnion('status', [
+      z.object({ status: z.literal('available'), image: z.string(), content_sha256: z.string() }),
+      z.object({ status: z.literal('unavailable'), reason: z.string(), detail: z.string() }),
+    ]),
+  }),
 });
 export type ResearchStatus = z.infer<typeof StatusSchema>;
 
@@ -225,6 +238,35 @@ const AccountResultSchema = z.object({
 });
 export type AccountResult = z.infer<typeof AccountResultSchema>;
 
+const RUN_SOURCE = {
+  dataset_id: ArtifactIdSchema,
+  events_sha256: z.string(),
+  feature_artifact_id: ArtifactIdSchema,
+  instrument: z.string(),
+  label_artifact_id: ArtifactIdSchema,
+  schedule_id: ArtifactIdSchema,
+  schedule_sha256: z.string(),
+  split_artifact_id: ArtifactIdSchema,
+  stream: z.string(),
+};
+// A version 1 run, of an experiment's model.
+const ExperimentRunSourceSchema = z.object({
+  ...RUN_SOURCE,
+  experiment_id: ArtifactIdSchema,
+  model: ModelNameSchema,
+  parameters_sha256: z.string(),
+  training_labels_available_through: TimestampSchema,
+});
+// A version 2 run, of a registered model version; it names no experiment.
+const RegisteredRunSourceSchema = z.object({
+  ...RUN_SOURCE,
+  model_version_id: ArtifactIdSchema,
+  family: z.string(),
+  payload_sha256: z.string(),
+  information_cutoff: z.object({ at: TimestampSchema, basis: z.enum(['verified', 'declared']) }),
+});
+export type RunSource = z.infer<typeof ExperimentRunSourceSchema> | z.infer<typeof RegisteredRunSourceSchema>;
+
 export const ResultSchema = z.object({
   run_id: ArtifactIdSchema,
   scope: z.string(),
@@ -270,21 +312,7 @@ export const ResultSchema = z.object({
     after_window_unused: UnsignedIntegerSchema,
     schedule_rows: UnsignedIntegerSchema,
   }),
-  source: z.object({
-    dataset_id: ArtifactIdSchema,
-    events_sha256: z.string(),
-    experiment_id: ArtifactIdSchema,
-    feature_artifact_id: ArtifactIdSchema,
-    instrument: z.string(),
-    label_artifact_id: ArtifactIdSchema,
-    model: ModelNameSchema,
-    parameters_sha256: z.string(),
-    schedule_id: ArtifactIdSchema,
-    schedule_sha256: z.string(),
-    split_artifact_id: ArtifactIdSchema,
-    stream: z.string(),
-    training_labels_available_through: TimestampSchema,
-  }),
+  source: z.union([ExperimentRunSourceSchema, RegisteredRunSourceSchema]),
   window: z.object({
     name: WindowNameSchema,
     start_at: TimestampSchema,

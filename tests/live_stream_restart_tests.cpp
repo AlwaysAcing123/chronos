@@ -189,6 +189,7 @@ public:
         PostgresPaperOrderRepository store(connection());
         store.apply_migration(chronos::test::migration_sql("006_live_stream_sequences.sql"));
         store.apply_migration(chronos::test::migration_sql("007_live_stream_writer_fence.sql"));
+        store.apply_migration(chronos::test::migration_sql("008_registered_model_deployments.sql"));
     }
 };
 
@@ -528,8 +529,7 @@ DeploymentCreateRequest deployment_request(std::string id, std::string account) 
         .deployment_id = std::move(id),
         .account_id = std::move(account),
         .starting_cash = Money::parse("10000"),
-        .experiment_id = std::string(64, 'e'),
-        .model = "logistic",
+        .model = chronos::ExperimentModel{.experiment_id = std::string(64, 'e'), .name = "logistic"},
         .instrument = "AAPL",
         .threshold_ppb = 600'000'000,
         .target_quantity = Quantity::parse("1"),

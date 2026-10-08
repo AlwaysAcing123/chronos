@@ -29,11 +29,15 @@ struct ReplayArguments {
 
 // Model deployments (ADR 0018), enabled only by --model-deployments: the
 // Python interpreter that runs the inference worker, the repository's
-// python directory, and the research artifacts holding the experiments.
+// python directory, and the research artifacts holding the experiments and
+// registered models. --onnx-docker, the absolute path of a Docker CLI,
+// lets registered imported models run in the ONNX sandbox (ADR 0021);
+// without it they cannot be deployed.
 struct DeploymentArguments {
     std::filesystem::path python;
     std::filesystem::path python_root;
     std::filesystem::path artifacts;
+    std::optional<std::filesystem::path> onnx_docker{};
 };
 
 // A validated server command line. At most one market-data source is

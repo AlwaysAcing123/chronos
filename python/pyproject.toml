@@ -20,6 +20,12 @@ dev = [
     "pytest==9.1.1",
     "ruff==0.16.9",
 ]
+# Only for the ONNX sandbox image and its tests: the host never loads an
+# imported model. requirements-onnx.lock pins these with hashes.
+onnx = [
+    "onnx==1.23.2",
+    "onnxruntime==1.30.0",
+]
 
 [project.scripts]
 chronos-research = "chronos_research.cli:main"
@@ -42,6 +48,12 @@ files = ["chronos_research", "tests"]
 [[tool.mypy.overrides]]
 # SciPy, scikit-learn, and threadpoolctl publish no type information.
 module = ["scipy", "sklearn.*", "threadpoolctl"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The optional ONNX packages are absent from the default environment, and
+# onnxruntime publishes no type information.
+module = ["onnx", "onnx.*", "onnxruntime"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -913,12 +913,15 @@ void DeploymentManager::recover() {
 std::string DeploymentManager::canonical_request(const DeploymentCreateRequest& request) {
     // One field per line, in a fixed order, each value in its canonical
     // text; no field can contain a newline.
-    return std::string("chronos.model_deployment_request/1\n") +
+    const auto* experiment = std::get_if<ExperimentModel>(&request.model);
+    const std::string model = experiment != nullptr
+        ? "experiment_id=" + experiment->experiment_id + "\n" + "model=" + experiment->name + "\n"
+        : "model_version_id=" + std::get<RegisteredModel>(request.model).model_version_id + "\n";
+    return std::string(experiment != nullptr ? "chronos.model_deployment_request/1\n" : "chronos.model_deployment_request/2\n") +
         "deployment_id=" + request.deployment_id + "\n" +
         "account_id=" + request.account_id + "\n" +
         "starting_cash=" + request.starting_cash.to_string() + "\n" +
-        "experiment_id=" + request.experiment_id + "\n" +
-        "model=" + request.model + "\n" +
+        model +
         "instrument=" + request.instrument + "\n" +
         "policy=" + std::string(kDeploymentPolicy) + "\n" +
         "threshold_ppb=" + std::to_string(request.threshold_ppb) + "\n" +
@@ -949,11 +952,15 @@ std::optional<DeploymentError> DeploymentManager::validate(const DeploymentCreat
     if (request.starting_cash.raw() <= 0) {
         return invalid("starting_cash", "starting cash must be positive");
     }
-    if (!is_sha256_hex(request.experiment_id)) {
-        return invalid("experiment_id", "experiment_id must be 64 lowercase hexadecimal digits");
-    }
-    if (request.model != "logistic" && request.model != "majority") {
-        return invalid("model", "model must be logistic or majority");
+    if (const auto* experiment = std::get_if<ExperimentModel>(&request.model)) {
+        if (!is_sha256_hex(experiment->experiment_id)) {
+            return invalid("experiment_id", "experiment_id must be 64 lowercase hexadecimal digits");
+        }
+        if (experiment->name != "logistic" && experiment->name != "majority") {
+            return invalid("model", "model must be logistic or majority");
+        }
+    } else if (!is_sha256_hex(std::get<RegisteredModel>(request.model).model_version_id)) {
+        return invalid("model_version_id", "model_version_id must be 64 lowercase hexadecimal digits");
     }
     if (std::find(options_.tradeable_instruments.begin(), options_.tradeable_instruments.end(),
                   InstrumentId(request.instrument)) == options_.tradeable_instruments.end()) {
@@ -1003,18 +1010,14 @@ DeploymentCreateResult DeploymentManager::create(const DeploymentCreateRequest& 
         return std::move(*invalid);
     }
     const std::lock_guard control(control_mutex_);
-    const ModelSelection selection{
-        .experiment_id = request.experiment_id,
-        .instrument = InstrumentId(request.instrument),
-        .model = request.model,
-    };
+    const ModelSelection selection{.model = request.model, .instrument = InstrumentId(request.instrument)};
     auto described = provider_->describe(selection, options_.model_load_timeout);
     if (const auto* failed = std::get_if<InferenceFailure>(&described)) {
         return deployment_error(
             DeploymentErrorCode::ModelUnavailable,
             std::string(inference_failure_name(failed->code)),
             "the model could not be verified: " + failed->message,
-            "experiment_id"
+            std::holds_alternative<ExperimentModel>(request.model) ? "experiment_id" : "model_version_id"
         );
     }
     const ModelIdentity& identity = std::get<ModelIdentity>(described);
@@ -1034,11 +1037,12 @@ DeploymentCreateResult DeploymentManager::create(const DeploymentCreateRequest& 
     config.deployment_id = request.deployment_id;
     config.account_id = request.account_id;
     config.starting_cash = request.starting_cash;
-    config.experiment_id = identity.experiment_id;
+    config.model = identity.model;
+    config.family = identity.family;
     config.parameters_sha256 = identity.parameters_sha256;
-    config.model_name = identity.model;
     config.instrument = identity.instrument;
     config.training_cutoff = identity.training_cutoff;
+    config.training_cutoff_basis = identity.cutoff_basis;
     config.threshold_ppb = request.threshold_ppb;
     config.target_quantity = request.target_quantity;
     config.decision_interval_ns = request.decision_interval_ns;
@@ -1262,21 +1266,19 @@ DeploymentResult DeploymentManager::start(std::string_view deployment_id) {
             }));
             return deployment_error(DeploymentErrorCode::ModelUnavailable, std::move(reason), std::move(message));
         };
-        auto opened = provider_->open(
-            ModelSelection{.experiment_id = config.experiment_id, .instrument = config.instrument, .model = config.model_name},
-            options_.model_load_timeout
-        );
+        auto opened = provider_->open(ModelSelection{.model = config.model, .instrument = config.instrument}, options_.model_load_timeout);
         if (const auto* failed = std::get_if<InferenceFailure>(&opened)) {
             return fault_with(std::string(inference_failure_name(failed->code)), "the model could not be loaded: " + failed->message);
         }
         auto session = std::get<std::unique_ptr<InferenceSession>>(std::move(opened));
         const ModelIdentity expected{
-            .experiment_id = config.experiment_id,
+            .model = config.model,
             .instrument = config.instrument,
-            .model = config.model_name,
+            .family = config.family,
             .parameters_sha256 = config.parameters_sha256,
             .model_feature_set = std::string(kDeploymentModelFeatureSet),
             .training_cutoff = config.training_cutoff,
+            .cutoff_basis = config.training_cutoff_basis,
         };
         if (session->identity() != expected) {
             session.reset();

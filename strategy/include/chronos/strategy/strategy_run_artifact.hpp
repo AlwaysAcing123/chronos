@@ -21,7 +21,7 @@
 //                                               expiries, and valuations
 //
 // The run ID is the SHA-256 of the canonical manifest without the ID. The
-// manifest names the dataset, schedule, experiment, and model it came from,
+// manifest names the dataset, schedule, and model it came from,
 // the configuration, every assumption, the runner's version, the build
 // environment, and the results, so the same inputs and build give the same
 // ID and bytes. Nothing is published unless the whole dataset and the whole
@@ -29,7 +29,11 @@
 namespace chronos::strategy {
 
 inline constexpr std::string_view kStrategyRunSchemaName = "chronos.strategy_run";
-inline constexpr std::string_view kStrategyRunSchemaVersion = "1";
+// A version 1 run names the experiment model its version 1 schedule came
+// from; a version 2 run the registered model version of a version 2
+// schedule, and no experiment. Both stay readable.
+inline constexpr std::string_view kExperimentStrategyRunVersion = "1";
+inline constexpr std::string_view kRegisteredStrategyRunVersion = "2";
 inline constexpr std::string_view kJournalFileName = "journal.ndjson";
 inline constexpr datasets::DerivedArtifactLayout kStrategyRunLayout{
     .kind = "strategy run",

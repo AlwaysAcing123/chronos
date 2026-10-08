@@ -285,6 +285,22 @@ void require_name_version(
     nested.finish();
 }
 
+std::string require_name_and_one_of_versions(
+    ObjectFields& parent,
+    std::string_view key,
+    std::string_view name,
+    std::initializer_list<std::string_view> versions
+) {
+    NestedFields nested(parent, key, {"name", "version"});
+    nested.fields().constant("name", name);
+    std::string version = nested.fields().string("version");
+    if (nested.fields().ok() && std::find(versions.begin(), versions.end(), version) == versions.end()) {
+        nested.fields().fail(DatasetErrorCode::UnsupportedVersion, "version", "is not a version this reader supports: " + version);
+    }
+    nested.finish();
+    return parent.ok() ? version : std::string();
+}
+
 json::Value count_map_json(const std::map<std::string, std::uint64_t>& counts) {
     json::Object members;
     for (const auto& [name, count] : counts) {

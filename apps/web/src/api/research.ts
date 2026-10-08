@@ -7,6 +7,27 @@ import type { z } from 'zod';
 import { ChronosApiError } from './errors';
 import type { HttpResponse, ResponseIdentity, TransportOptions } from './http';
 import { decodeBody, failureOf, sendRequest } from './http';
+import type { ComparisonDetail, ComparisonPage, ComparisonRequest, StartedComparison } from './comparisonSchemas';
+import { ComparisonEnvelopeSchema, ComparisonPageSchema, StartedComparisonSchema } from './comparisonSchemas';
+import type {
+  ImportDocument,
+  LifecycleState,
+  ModelDetail,
+  ModelJob,
+  ModelPage,
+  RegistrationRequest,
+  StartedImport,
+  StartedRegistration,
+} from './modelSchemas';
+import {
+  ImportDocumentSchema,
+  LifecycleChangeSchema,
+  ModelEnvelopeSchema,
+  ModelJobEnvelopeSchema,
+  ModelPageSchema,
+  StartedImportSchema,
+  StartedRegistrationSchema,
+} from './modelSchemas';
 import type {
   AccountName,
   DecisionPage,
@@ -70,6 +91,23 @@ export interface ResearchClient {
   listDecisions(runId: string, cursor: string | null, signal?: AbortSignal): Promise<DecisionPage>;
   // Every point, in order.
   getEquity(runId: string, signal?: AbortSignal): Promise<readonly EquityPoint[]>;
+  // The model library.
+  listModels(state: LifecycleState | 'all', cursor: string | null, signal?: AbortSignal): Promise<ModelPage>;
+  getModel(modelVersionId: string, signal?: AbortSignal): Promise<ModelDetail>;
+  startRegistration(request: RegistrationRequest): Promise<StartedRegistration>;
+  // A registration or import job.
+  getModelJob(jobId: string, signal?: AbortSignal): Promise<ModelJob>;
+  setModelLifecycle(modelVersionId: string, state: LifecycleState, reason: string): Promise<void>;
+  // An ONNX import: the manifest file's own text, then the model file's own
+  // bytes, then validation of exactly the bytes whose checksum was reviewed.
+  stageImport(manifestText: string): Promise<ImportDocument>;
+  uploadImportModel(importId: string, model: Uint8Array<ArrayBuffer>): Promise<ImportDocument>;
+  startImportValidation(importId: string, modelSha256: string): Promise<StartedImport>;
+  getImport(importId: string, signal?: AbortSignal): Promise<ImportDocument>;
+  // Comparisons of registered model versions under one frozen spec.
+  listComparisons(cursor: string | null, signal?: AbortSignal): Promise<ComparisonPage>;
+  getComparison(comparisonId: string, signal?: AbortSignal): Promise<ComparisonDetail>;
+  startComparison(request: ComparisonRequest): Promise<StartedComparison>;
 }
 
 const DEFAULT_RESEARCH_TRANSPORT: TransportOptions = {
@@ -105,8 +143,64 @@ export function createResearchClient(transport: TransportOptions = DEFAULT_RESEA
     return decodeBody(schema, response);
   }
 
+  async function send<Schema extends z.ZodType>(
+    schema: Schema,
+    request: Parameters<typeof sendRequest>[1],
+    accepted: readonly number[],
+  ): Promise<z.infer<Schema>> {
+    const response: HttpResponse = await sendRequest(options, { ...request, path: RESEARCH_API + request.path });
+    if (!accepted.includes(response.status)) {
+      throw failureOf(response);
+    }
+    return decodeBody(schema, response);
+  }
+
+  const post = <Schema extends z.ZodType>(schema: Schema, path: string, body: unknown, accepted: readonly number[]) =>
+    send(schema, { method: 'POST', path, body }, accepted);
+
   return {
     getStatus: (signal) => get(StatusSchema, '/status', signal),
+    listModels: (state, cursor, signal) =>
+      get(ModelPageSchema, `/models${query({ limit: String(RESEARCH_PAGE_SIZE), cursor, state })}`, signal),
+    getModel: async (modelVersionId, signal) =>
+      (await get(ModelEnvelopeSchema, `/models/${encodeURIComponent(modelVersionId)}`, signal)).model,
+    startRegistration: (request) => post(StartedRegistrationSchema, '/models', request, [200, 202]),
+    getModelJob: async (jobId, signal) =>
+      (await get(ModelJobEnvelopeSchema, `/jobs/${encodeURIComponent(jobId)}`, signal)).job,
+    async setModelLifecycle(modelVersionId, state, reason) {
+      await post(
+        LifecycleChangeSchema,
+        `/models/${encodeURIComponent(modelVersionId)}/lifecycle`,
+        { state, reason },
+        [200],
+      );
+    },
+    stageImport: (manifestText) =>
+      send(
+        ImportDocumentSchema,
+        { method: 'POST', path: '/imports', raw: { contentType: 'application/json', data: manifestText } },
+        [201],
+      ),
+    uploadImportModel: (importId, model) =>
+      send(
+        ImportDocumentSchema,
+        {
+          method: 'PUT',
+          path: `/imports/${encodeURIComponent(importId)}/model`,
+          raw: { contentType: 'application/octet-stream', data: model },
+        },
+        [200, 201],
+      ),
+    startImportValidation: (importId, modelSha256) =>
+      post(StartedImportSchema, `/imports/${encodeURIComponent(importId)}/validation`, { model_sha256: modelSha256 }, [
+        200, 202,
+      ]),
+    getImport: (importId, signal) => get(ImportDocumentSchema, `/imports/${encodeURIComponent(importId)}`, signal),
+    listComparisons: (cursor, signal) =>
+      get(ComparisonPageSchema, `/comparisons${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
+    getComparison: (comparisonId, signal) =>
+      get(ComparisonEnvelopeSchema, `/comparisons/${encodeURIComponent(comparisonId)}`, signal),
+    startComparison: (request) => post(StartedComparisonSchema, '/comparisons', request, [200, 202]),
     listExperiments: (cursor, signal) =>
       get(ExperimentPageSchema, `/experiments${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
     getExperiment: async (experimentId, signal) =>

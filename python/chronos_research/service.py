@@ -15,11 +15,25 @@ accounts, the replay, or a live source. It uses only the standard library.
     GET  /api/v1/research/results/{run_id}/decisions  ?limit&cursor
     GET  /api/v1/research/results/{run_id}/trades     ?account&limit&cursor
     GET  /api/v1/research/results/{run_id}/equity     ?limit&cursor
+    GET  /api/v1/research/models                      ?limit&cursor&state
+    POST /api/v1/research/models                      register an experiment model
+    GET  /api/v1/research/models/{model_version_id}
+    POST /api/v1/research/models/{model_version_id}/lifecycle
+    POST /api/v1/research/imports                     stage an ONNX import's manifest
+    GET  /api/v1/research/imports/{import_id}
+    PUT  /api/v1/research/imports/{import_id}/model   its model bytes
+    POST /api/v1/research/imports/{import_id}/validation  validate and import
+    GET  /api/v1/research/comparisons                 ?limit&cursor
+    POST /api/v1/research/comparisons                 start a comparison
+    GET  /api/v1/research/comparisons/{comparison_id}
+    GET  /api/v1/research/jobs                        ?limit&cursor&kind
+    GET  /api/v1/research/jobs/{job_id}
 
 The conventions are the paper-trading API's (docs/paper-trading-api.md):
 strict JSON bodies of at most 16 KiB, decimals and integers as strings, RFC
 3339 nanosecond timestamps, a fixed error shape, strict query strings, and
-opaque cursors with limits from 1 to 200.
+opaque cursors with limits from 1 to 200. The one other body is an import's
+model, application/octet-stream of at most 1 MiB, on its own route.
 
 Work never runs on a request thread. A POST validates the request and queues
 a job; a bounded pool of workers runs each job as one fixed child command,
@@ -48,7 +62,6 @@ import re
 import secrets
 import selectors
 import signal
-import stat
 import subprocess
 import sys
 import threading
@@ -63,8 +76,38 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from chronos_research import comparison, model_library, onnx_profile
+from chronos_research.artifact_files import (
+    ArtifactUnavailableError,
+    artifact_directory,
+    canonical_bytes,
+    verified_file,
+    verified_manifest,
+)
 from chronos_research.artifacts import CLASS_ORDER, is_artifact_id
+from chronos_research.encoding import StrictJsonError, strict_json_object
+from chronos_research.import_staging import ImportStore, StagedImport, StagingError
+from chronos_research.model_import import ModelImportError, validated_import_manifest
+from chronos_research.onnx_sandbox import (
+    Sandbox,
+    SandboxCleanupError,
+    SandboxUnavailableError,
+    new_supervisor,
+)
 from chronos_research.pipeline import ArtifactRoots, Tools
+from chronos_research.registry import (
+    EXPERIMENT_FAMILIES,
+    LIFECYCLE_STATES,
+    MODEL_NAME,
+    MODEL_VERSION,
+    ModelVersion,
+    RegistryError,
+    RegistryRoots,
+    model_version_ids,
+    names_by_version,
+    set_lifecycle,
+    verified_model_version,
+)
 
 API = "/api/v1/research"
 VERSION = "1"
@@ -72,11 +115,21 @@ MAX_BODY_BYTES = 16 * 1024
 DEFAULT_LIMIT, MAX_LIMIT = 50, 200
 MAX_WORKER_OUTPUT_BYTES = 1024 * 1024
 LOG_BYTES = 4096
-MAX_JOURNAL_BYTES = 256 * 1024 * 1024
 MODELS = ("logistic", "majority")
 WINDOWS = ("validation", "test")
 ACCOUNTS = ("strategy", "buy_and_hold", "cash")
 TERMINAL = ("succeeded", "failed", "interrupted")
+# Jobs whose child may start ONNX sandbox containers, under a token of the job's own.
+SANDBOX_JOB_KINDS = ("comparison", "import")
+# How long a job's slot waits for Docker to remove its containers, and how
+# long after a killed child it looks again for a create still under way.
+RELEASE_TIMEOUT_S = 10.0
+RELEASE_SETTLE_S = 1.0
+EXPERIMENT_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "1"}
+# A registered model version's run (ADR 0021): readable here, and listed by
+# the comparison it belongs to rather than among evaluation results.
+REGISTERED_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "2"}
+JOB_KINDS = ("evaluation", "registration", "import", "comparison")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _DECIMAL = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
@@ -154,80 +207,8 @@ def with_timestamps(document: Any) -> Any:
     return converted
 
 
-def _canonical(document: Any) -> bytes:
-    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
 # --- Verified reads -----------------------------------------------------------------------------------
-
-
-class ArtifactUnavailableError(Exception):
-    """An artifact is missing, or its bytes are not what its manifest says."""
-
-
-def _regular_file(path: Path) -> bytes:
-    try:
-        # Pin the catalog and artifact directories before opening the leaf.
-        # O_NOFOLLOW on the leaf alone does not protect its parent directories.
-        with contextlib.ExitStack() as resources:
-            catalog = os.open(path.parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            resources.callback(os.close, catalog)
-            directory = os.open(
-                path.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=catalog
-            )
-            resources.callback(os.close, directory)
-            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-            file = resources.enter_context(os.fdopen(descriptor, "rb"))
-            if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-                raise ArtifactUnavailableError(f"{path.name} is not a regular file")
-            return file.read(MAX_JOURNAL_BYTES + 1)
-    except OSError as error:
-        raise ArtifactUnavailableError(f"{path.name} cannot be read as a regular artifact file") from error
-
-
-def artifact_directory(root: Path, artifact_id: str) -> Path:
-    """root/artifact_id: a real directory, never through a symlink."""
-    if not is_artifact_id(artifact_id):
-        raise ArtifactUnavailableError("not an artifact ID")
-    directory = root / artifact_id
-    try:
-        if not stat.S_ISDIR(os.lstat(root).st_mode):
-            raise ArtifactUnavailableError("the artifact catalog is not a real directory")
-        status = os.lstat(directory)
-    except OSError as error:
-        raise ArtifactUnavailableError(f"{artifact_id} does not exist") from error
-    if not stat.S_ISDIR(status.st_mode):
-        raise ArtifactUnavailableError(f"{artifact_id} is not an artifact directory")
-    return directory
-
-
-def verified_manifest(directory: Path, id_key: str, with_newline: bool) -> dict[str, Any]:
-    """A manifest whose canonical bytes hash, without its ID, to its ID,
-    which names its directory. The C++ artifacts hash the document without
-    its newline and the Python ones with it."""
-    data = _regular_file(directory / "manifest.json")
-    try:
-        manifest = json.loads(data)
-    except ValueError as error:
-        raise ArtifactUnavailableError("manifest.json is not JSON") from error
-    if not isinstance(manifest, dict) or _canonical(manifest) + b"\n" != data:
-        raise ArtifactUnavailableError("manifest.json is not canonical")
-    body = _canonical({key: value for key, value in manifest.items() if key != id_key})
-    if hashlib.sha256(body + (b"\n" if with_newline else b"")).hexdigest() != manifest.get(id_key) or (
-        manifest.get(id_key) != directory.name
-    ):
-        raise ArtifactUnavailableError("the manifest's identity does not match its content or directory")
-    return manifest
-
-
-def verified_file(directory: Path, digest: Mapping[str, str]) -> bytes:
-    name = digest["name"]
-    if not isinstance(name, str) or name in ("", ".", "..") or any(char in name for char in "/\\\x00"):
-        raise ArtifactUnavailableError("an artifact file name must be a single filename")
-    data = _regular_file(directory / name)
-    if len(data) != int(digest["size_bytes"]) or hashlib.sha256(data).hexdigest() != digest["sha256"]:
-        raise ArtifactUnavailableError(f"{name} differs from its manifest's checksum")
-    return data
+# The helpers live in artifact_files, shared with the model registry.
 
 
 class Artifacts:
@@ -328,7 +309,7 @@ class Artifacts:
     def result_manifest(self, run_id: str) -> dict[str, Any]:
         directory = artifact_directory(self.roots.strategies, run_id)
         manifest = verified_manifest(directory, "artifact_id", with_newline=False)
-        if manifest.get("schema") != {"name": "chronos.strategy_run", "version": "1"}:
+        if manifest.get("schema") not in (EXPERIMENT_RUN_SCHEMA, REGISTERED_RUN_SCHEMA):
             raise ArtifactUnavailableError("not a strategy run of a supported version")
         return manifest
 
@@ -419,36 +400,11 @@ def result_listing(manifest: Mapping[str, Any]) -> dict[str, Any]:
 # --- Requests ------------------------------------------------------------------------------------------
 
 
-def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    document: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in document:
-            raise malformed("duplicate_field", f"{key} appears more than once", key)
-        document[key] = value
-    return document
-
-
-def _refuse_number(text: str) -> Any:
-    raise malformed("invalid_type", "numbers are written as strings")
-
-
 def parse_body(data: bytes) -> dict[str, Any]:
     try:
-        text = data.decode("utf-8")
-        document = json.loads(
-            text,
-            object_pairs_hook=_no_duplicates,
-            parse_float=_refuse_number,
-            parse_int=_refuse_number,
-            parse_constant=_refuse_number,
-        )
-    except UnicodeDecodeError as error:
-        raise malformed("invalid_json", "the body is not UTF-8") from error
-    except ValueError as error:
-        raise malformed("invalid_json", f"the body is not JSON: {error}") from error
-    if not isinstance(document, dict):
-        raise malformed("invalid_type", "the body must be one JSON object")
-    return document
+        return strict_json_object(data)
+    except StrictJsonError as error:
+        raise malformed(error.reason, str(error), error.field) from error
 
 
 def _exact_keys(document: Mapping[str, Any], keys: tuple[str, ...], prefix: str = "") -> None:
@@ -527,13 +483,23 @@ def validate_run_request(document: Mapping[str, Any]) -> dict[str, Any]:
         raise malformed("unknown_enum_value", f"model is one of {', '.join(MODELS)}", "model")
     if window not in WINDOWS:
         raise malformed("unknown_enum_value", f"window is one of {', '.join(WINDOWS)}", "window")
-    configuration = document["configuration"]
+    return {
+        "configuration": validate_configuration(document["configuration"]),
+        "experiment_id": experiment_id,
+        "instrument": instrument,
+        "model": model,
+        "window": window,
+    }
+
+
+def validate_configuration(configuration: Any) -> dict[str, str]:
+    """A strategy configuration in canonical form, or why it is not one."""
     if not isinstance(configuration, dict):
         raise malformed("invalid_type", "configuration must be an object", "configuration")
     _exact_keys(configuration, CONFIGURATION_FIELDS, "configuration.")
     values = {key: _string(configuration, key, "configuration.") for key in CONFIGURATION_FIELDS}
     prefix = "configuration."
-    canonical = {
+    return {
         "decision_interval_ns": _integer(
             values["decision_interval_ns"], prefix + "decision_interval_ns", 1, _INT64_MAX
         ),
@@ -549,11 +515,74 @@ def validate_run_request(document: Mapping[str, Any]) -> dict[str, Any]:
         "target_quantity": _decimal(values["target_quantity"], prefix + "target_quantity", 8, True, False),
         "threshold_ppb": _integer(values["threshold_ppb"], prefix + "threshold_ppb", 0, 1_000_000_000),
     }
+
+
+def validate_registration_request(document: Mapping[str, Any]) -> dict[str, Any]:
+    """A registration request in canonical form, or why it is not one."""
+    _exact_keys(document, ("experiment_id", "instrument", "model", "name", "version"))
+    request = {
+        key: _string(document, key) for key in ("experiment_id", "instrument", "model", "name", "version")
+    }
+    if not is_artifact_id(request["experiment_id"]):
+        raise malformed("invalid_identifier", "experiment_id is a 64-digit lowercase ID", "experiment_id")
+    if not _IDENTIFIER.fullmatch(request["instrument"]):
+        raise malformed("invalid_identifier", "instrument is not a valid identifier", "instrument")
+    if request["model"] not in EXPERIMENT_FAMILIES:
+        raise malformed("unknown_enum_value", f"model is one of {', '.join(EXPERIMENT_FAMILIES)}", "model")
+    if not MODEL_NAME.fullmatch(request["name"]):
+        raise malformed(
+            "invalid_identifier",
+            "name is 1 to 64 characters from [a-z0-9._-], starting with one of [a-z0-9]",
+            "name",
+        )
+    if not MODEL_VERSION.fullmatch(request["version"]):
+        raise malformed(
+            "invalid_identifier", "version is one to three dot-separated whole numbers", "version"
+        )
+    return request
+
+
+def validate_comparison_request(document: Mapping[str, Any]) -> dict[str, Any]:
+    """A comparison request as its canonical chronos.model_comparison_spec/1."""
+    keys = ("configuration", "instrument", "model_version_ids", "split_artifact_id", "window")
+    for key in document:
+        if key not in keys:
+            raise malformed("unexpected_field", f"{key} is not a field of this request", key)
+    for key in keys:
+        if key not in document:
+            raise malformed("missing_field", f"{key} is required", key)
+    models = document["model_version_ids"]
+    if not isinstance(models, list) or not all(isinstance(item, str) for item in models):
+        raise malformed("invalid_type", "model_version_ids is a list of IDs", "model_version_ids")
+    if not all(is_artifact_id(item) for item in models):
+        raise malformed(
+            "invalid_identifier", "a model version ID is 64 lowercase hexadecimal digits", "model_version_ids"
+        )
+    if not comparison.MIN_MODELS <= len(models) <= comparison.MAX_MODELS or len(set(models)) != len(models):
+        raise ApiError(
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            "invalid_configuration",
+            f"a comparison names {comparison.MIN_MODELS} to {comparison.MAX_MODELS} distinct model versions",
+            "model_version_ids",
+            "out_of_domain",
+        )
+    split, instrument, window = (
+        _string(document, key) for key in ("split_artifact_id", "instrument", "window")
+    )
+    if not is_artifact_id(split):
+        raise malformed(
+            "invalid_identifier", "split_artifact_id is a 64-digit lowercase ID", "split_artifact_id"
+        )
+    if not _IDENTIFIER.fullmatch(instrument):
+        raise malformed("invalid_identifier", "instrument is not a valid identifier", "instrument")
+    if window not in WINDOWS:
+        raise malformed("unknown_enum_value", f"window is one of {', '.join(WINDOWS)}", "window")
     return {
-        "configuration": canonical,
-        "experiment_id": experiment_id,
+        "configuration": validate_configuration(document["configuration"]),
         "instrument": instrument,
-        "model": model,
+        "model_version_ids": list(models),
+        "schema": comparison.SPEC_SCHEMA,
+        "split_artifact_id": split,
         "window": window,
     }
 
@@ -636,14 +665,14 @@ def page_after_id(ids: list[str], limit: int, cursor: str | None, name: str) -> 
     return Page(page, _encode_keyset(name, page[-1]) if more and page else None)
 
 
-def page_before_sequence(jobs: list["Job"], limit: int, cursor: str | None) -> Page:
+def page_before_sequence(jobs: list["Job"], limit: int, cursor: str | None, name: str = "runs") -> Page:
     """Jobs newest first, continuing with those older than the cursor's."""
     # Decoded first, so a malformed cursor is refused even for an empty list.
-    before = None if cursor is None else int(_decode_keyset(cursor, "runs", _UNSIGNED))
+    before = None if cursor is None else int(_decode_keyset(cursor, name, _UNSIGNED))
     older = [job for job in jobs if before is None or job.sequence < before]
     page = older[:limit]
     more = len(older) > len(page)
-    return Page(page, _encode_keyset("runs", str(page[-1].sequence)) if more and page else None)
+    return Page(page, _encode_keyset(name, str(page[-1].sequence)) if more and page else None)
 
 
 def parse_query(query: str, allowed: tuple[str, ...]) -> dict[str, str]:
@@ -691,6 +720,11 @@ class Job:
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     log: str = ""
+    kind: str = "evaluation"
+    # The token the job's sandbox containers carry, and whether they are
+    # known to be gone; recorded before the child starts.
+    sandbox_supervisor: str | None = None
+    sandbox_released: bool = True
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -698,10 +732,13 @@ class Job:
             "error": self.error,
             "finished_at": self.finished_at,
             "job_id": self.job_id,
+            "kind": self.kind,
             "log": self.log,
             "request": self.request,
             "request_key": self.request_key,
             "result": self.result,
+            "sandbox_released": self.sandbox_released,
+            "sandbox_supervisor": self.sandbox_supervisor,
             "sequence": str(self.sequence),
             "started_at": self.started_at,
             "state": self.state,
@@ -709,7 +746,8 @@ class Job:
 
     def public(self) -> dict[str, Any]:
         document = self.as_json()
-        del document["request_key"], document["sequence"]
+        for internal in ("request_key", "sandbox_released", "sandbox_supervisor", "sequence"):
+            del document[internal]
         return document
 
     @classmethod
@@ -726,6 +764,10 @@ class Job:
             result=document["result"],
             error=document["error"],
             log=document["log"],
+            # A record from before job kinds is an evaluation's.
+            kind=document.get("kind", "evaluation"),
+            sandbox_supervisor=document.get("sandbox_supervisor"),
+            sandbox_released=document.get("sandbox_released", True),
         )
 
 
@@ -775,7 +817,7 @@ class JobStore:
             self._write(job)
             self.jobs[job.job_id] = job
 
-    def create(self, request: dict[str, Any], key: str) -> tuple[Job, bool]:
+    def create(self, request: dict[str, Any], key: str, kind: str = "evaluation") -> tuple[Job, bool]:
         """A new queued job, or the equal job already queued, running, or
         succeeded, and whether it is new."""
         with self.lock:
@@ -783,15 +825,18 @@ class JobStore:
                 if job.request_key == key and job.state in ("queued", "running", "succeeded"):
                     return job, False
             sequence = max((job.sequence for job in self.jobs.values()), default=0) + 1
-            job = Job(secrets.token_hex(16), sequence, request, key, "queued", now())
+            job = Job(secrets.token_hex(16), sequence, request, key, "queued", now(), kind=kind)
             self._write(job)
             self.jobs[job.job_id] = job
             self._prune()
             return job, True
 
     def _prune(self) -> None:
+        # A job whose containers are not known to be gone keeps its record,
+        # which is what reclaims them.
         finished = sorted(
-            (job for job in self.jobs.values() if job.state in TERMINAL), key=lambda job: job.sequence
+            (job for job in self.jobs.values() if job.state in TERMINAL and job.sandbox_released),
+            key=lambda job: job.sequence,
         )
         for job in finished[: max(0, len(self.jobs) - self.retain)]:
             (self.directory / f"{job.job_id}.json").unlink(missing_ok=True)
@@ -819,19 +864,79 @@ class ServiceConfiguration:
     retain_jobs: int = 200
     # The fixed child command; a test may point it at another interpreter.
     python: str = field(default=sys.executable)
+    # How import jobs reach Docker for the ONNX sandbox.
+    sandbox: Sandbox = field(default_factory=Sandbox)
 
 
-def job_arguments(configuration: ServiceConfiguration, request: Mapping[str, Any]) -> list[str]:
+def job_arguments(
+    configuration: ServiceConfiguration,
+    request: Mapping[str, Any],
+    kind: str = "evaluation",
+    supervisor: str | None = None,
+) -> list[str]:
     """The child command's argument vector: fixed, never a shell string."""
+    roots = ["--tools", str(configuration.tools.directory), "--artifacts", str(configuration.artifacts)]
+    sandbox = configuration.sandbox
+    docker = [
+        "--docker",
+        sandbox.docker,
+        *(["--docker-host", sandbox.docker_host] if sandbox.docker_host else []),
+        *(["--sandbox-supervisor", supervisor] if supervisor else []),
+    ]
+    if kind == "comparison":
+        spec = json.dumps(request, sort_keys=True, separators=(",", ":"))
+        return [
+            configuration.python,
+            "-m",
+            "chronos_research",
+            "compare-models",
+            *roots,
+            "--spec",
+            spec,
+            *docker,
+        ]
+    if kind == "import":
+        return [
+            configuration.python, "-m", "chronos_research", "import-model",
+            "--artifacts", str(configuration.artifacts),
+            "--staged", str(configuration.state / "imports" / request["import_id"]),
+            "--model-sha256", request["model_sha256"], *docker,
+        ]  # fmt: skip
+    if kind == "registration":
+        return [
+            configuration.python, "-m", "chronos_research", "register-model", *roots,
+            "--experiment", request["experiment_id"], "--instrument", request["instrument"],
+            "--model", request["model"], "--name", request["name"], "--version", request["version"],
+        ]  # fmt: skip
+    if kind != "evaluation":
+        raise ValueError(f"no child command for {kind} jobs")
     arguments = [
-        configuration.python, "-m", "chronos_research", "evaluate-strategy",
-        "--tools", str(configuration.tools.directory), "--artifacts", str(configuration.artifacts),
+        configuration.python, "-m", "chronos_research", "evaluate-strategy", *roots,
         "--experiment", request["experiment_id"], "--instrument", request["instrument"],
         "--model", request["model"], "--window", request["window"],
     ]  # fmt: skip
     for key, value in sorted(request["configuration"].items()):
         arguments += ["--" + key.replace("_", "-"), value]
     return arguments
+
+
+def job_result(kind: str, output: Mapping[str, Any]) -> dict[str, Any]:
+    """What a succeeded job records from its child's JSON."""
+    if kind in ("registration", "import"):
+        return {key: output[key] for key in ("binding_id", "binding_outcome", "model_version_id", "outcome")}
+    if kind == "comparison":
+        return {
+            "comparison_id": output["comparison"]["comparison_id"],
+            "outcome": output["outcome"],
+            "status": output["comparison"]["status"],
+        }
+    return {
+        "reproduced": output["reproduced"],
+        "run_id": output["run"]["artifact_id"],
+        "run_outcome": output["run"]["outcome"],
+        "schedule_id": output["schedule"]["artifact_id"],
+        "schedule_outcome": output["schedule"]["outcome"],
+    }
 
 
 class WorkerOutputLimitError(Exception):
@@ -881,8 +986,14 @@ class Workers:
         self.store = store
         self.queue: queue.Queue[str] = queue.Queue(maxsize=configuration.max_queued)
         self.stopping = threading.Event()
+        # Live children, to signal; and every job holding a slot, until its
+        # sandbox containers are known to be gone.
         self.children: dict[str, subprocess.Popen[bytes]] = {}
+        self.occupied: set[str] = set()
         self.lock = threading.Lock()
+        # Containers of jobs a crash interrupted, or whose cleanup Docker
+        # could not confirm, before anything new starts.
+        self._reclaim()
         self.threads = [
             threading.Thread(target=self._loop, name=f"research-worker-{index}", daemon=True)
             for index in range(configuration.max_running)
@@ -903,7 +1014,7 @@ class Workers:
 
     def running(self) -> int:
         with self.lock:
-            return len(self.children)
+            return len(self.occupied)
 
     def _loop(self) -> None:
         while not self.stopping.is_set():
@@ -914,11 +1025,37 @@ class Workers:
             job = self.store.get(job_id)
             if job is None or job.state != "queued":
                 continue
-            self._run(job)
+            with self.lock:
+                self.occupied.add(job.job_id)
+            try:
+                self._run(job)
+            finally:
+                with self.lock:
+                    self.occupied.discard(job.job_id)
 
     def _run(self, job: Job) -> None:
+        if job.kind in SANDBOX_JOB_KINDS:
+            job.sandbox_supervisor, job.sandbox_released = new_supervisor(), False
         job.state, job.started_at = "running", now()
         self.store.save(job)
+        if job.sandbox_supervisor is not None and not self._reclaim():
+            job.sandbox_released = True
+            self._finish(
+                job,
+                "failed",
+                error={
+                    "code": "sandbox_cleanup_pending",
+                    "message": "an earlier job's sandbox containers are still present; nothing was started",
+                },
+            )
+            return
+        state, recorded, abnormal = self._supervise(job)
+        self._release_sandbox(job, abnormal)
+        self._finish(job, state, **recorded)
+
+    def _supervise(self, job: Job) -> tuple[str, dict[str, Any], bool]:
+        """Runs the job's child to its end: the job's final state, what to
+        record, and whether the child was killed or failed."""
         try:
             with self.lock:
                 # Shutdown cannot miss a child between launch and registration.
@@ -926,7 +1063,7 @@ class Workers:
                     child = None
                 else:
                     child = subprocess.Popen(
-                        job_arguments(self.configuration, job.request),
+                        job_arguments(self.configuration, job.request, job.kind, job.sandbox_supervisor),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         stdin=subprocess.DEVNULL,
@@ -936,32 +1073,31 @@ class Workers:
                     )
                     self.children[job.job_id] = child
         except OSError as error:
-            self._finish(
-                job, "failed", error={"code": "worker_failed", "message": f"cannot start: {error.strerror}"}
+            return (
+                "failed",
+                {"error": {"code": "worker_failed", "message": f"cannot start: {error.strerror}"}},
+                False,
             )
-            return
         if child is None:
-            self._finish(job, "interrupted", error={"code": "interrupted", "message": "the service stopped"})
-            return
+            return "interrupted", {"error": {"code": "interrupted", "message": "the service stopped"}}, False
         try:
             stdout, stderr = _worker_output(child, self.configuration.job_timeout_s)
         except subprocess.TimeoutExpired as error:
             _signal_group(child, signal.SIGKILL)
             _, remaining_stderr = child.communicate()
-            self._finish(
-                job,
-                "failed",
-                error={"code": "timed_out", "message": f"stopped after {self.configuration.job_timeout_s} s"},
-                log=(error.stderr or b"") + remaining_stderr,
-            )
-            return
+            timed_out = {
+                "code": "timed_out",
+                "message": f"stopped after {self.configuration.job_timeout_s} s",
+            }
+            return "failed", {"error": timed_out, "log": (error.stderr or b"") + remaining_stderr}, True
         except WorkerOutputLimitError:
             _signal_group(child, signal.SIGKILL)
             child.communicate()
-            self._finish(
-                job, "failed", error={"code": "worker_failed", "message": "the job's output was too large"}
+            return (
+                "failed",
+                {"error": {"code": "worker_failed", "message": "the job's output was too large"}},
+                True,
             )
-            return
         finally:
             if child.stdout is not None:
                 child.stdout.close()
@@ -970,31 +1106,67 @@ class Workers:
             with self.lock:
                 self.children.pop(job.job_id, None)
         if self.stopping.is_set() and child.returncode != 0:
-            self._finish(
-                job,
-                "interrupted",
-                error={"code": "interrupted", "message": "the service stopped"},
-                log=stderr,
-            )
-            return
+            interrupted = {"code": "interrupted", "message": "the service stopped"}
+            return "interrupted", {"error": interrupted, "log": stderr}, True
         if child.returncode != 0:
-            self._finish(job, "failed", error=_child_error(stderr), log=stderr)
-            return
+            return "failed", {"error": _child_error(stderr, job.kind), "log": stderr}, True
         try:
-            output = json.loads(stdout)
-            result = {
-                "reproduced": output["reproduced"],
-                "run_id": output["run"]["artifact_id"],
-                "run_outcome": output["run"]["outcome"],
-                "schedule_id": output["schedule"]["artifact_id"],
-                "schedule_outcome": output["schedule"]["outcome"],
-            }
+            result = job_result(job.kind, json.loads(stdout))
         except (ValueError, KeyError, TypeError):
-            self._finish(
-                job, "failed", error={"code": "worker_failed", "message": "the job printed no result"}
+            return (
+                "failed",
+                {"error": {"code": "worker_failed", "message": "the job printed no result"}},
+                False,
             )
+        return "succeeded", {"result": result, "log": stderr}, False
+
+    def _release_sandbox(self, job: Job, abnormal: bool) -> None:
+        """Removes the job's sandbox containers and checks that none is left,
+        while the job still holds its slot. A container Docker does not
+        remove is retried for RELEASE_TIMEOUT_S. Docker not answering leaves
+        the job unreleased, for _reclaim; without the Docker CLI at all, the
+        child could not have started a container."""
+        if job.sandbox_supervisor is None or job.sandbox_released:
             return
-        self._finish(job, "succeeded", result=result, log=stderr)
+        deadline = time.monotonic() + RELEASE_TIMEOUT_S
+        while True:
+            try:
+                self.configuration.sandbox.remove_supervised(
+                    [job.sandbox_supervisor], settle_s=RELEASE_SETTLE_S if abnormal else 0.0
+                )
+            except SandboxCleanupError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.5)
+                continue
+            except SandboxUnavailableError as error:
+                job.sandbox_released = error.reason == "docker_not_found"
+                return
+            job.sandbox_released = True
+            return
+
+    def _reclaim(self) -> bool:
+        """Removes the containers of finished jobs not yet released. False
+        only when Docker answers and one of them stays."""
+        pending = [
+            job
+            for job in self.store.newest_first()
+            if job.state in TERMINAL and job.sandbox_supervisor is not None and not job.sandbox_released
+        ]
+        if not pending:
+            return True
+        try:
+            self.configuration.sandbox.remove_supervised([str(job.sandbox_supervisor) for job in pending])
+        except SandboxCleanupError:
+            return False
+        except SandboxUnavailableError as error:
+            if error.reason != "docker_not_found":
+                # Nothing can start a container while Docker does not answer.
+                return True
+        for job in pending:
+            job.sandbox_released = True
+            self.store.save(job)
+        return True
 
     def _finish(
         self,
@@ -1012,17 +1184,21 @@ class Workers:
     def stop(self) -> None:
         with self.lock:
             self.stopping.set()
-            children = list(self.children.items())
-        for _, child in children:
+            children = list(self.children.values())
+        for child in children:
             _signal_group(child, signal.SIGTERM)
         deadline = time.monotonic() + 1
         for thread in self.threads:
             thread.join(timeout=max(0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in self.threads):
-            # Include descendants even if their leader has already exited.
-            for _, child in children:
+            # Include descendants even if their leader has already exited,
+            # but only of children not yet reaped.
+            with self.lock:
+                children = list(self.children.values())
+            for child in children:
                 _signal_group(child, signal.SIGKILL)
-            deadline = time.monotonic() + 5
+            # Each slot then removes its job's containers.
+            deadline = time.monotonic() + 5 + RELEASE_SETTLE_S + RELEASE_TIMEOUT_S
             for thread in self.threads:
                 thread.join(timeout=max(0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in self.threads):
@@ -1046,12 +1222,38 @@ def _signal_group(child: "subprocess.Popen[bytes]", signum: int) -> None:
         os.killpg(child.pid, signum)
 
 
-def _child_error(stderr: bytes) -> dict[str, Any]:
+# A failed child's error code, by job kind and by the error kind it reported.
+_FAILURE_CODES = {
+    "evaluation": "evaluation_failed",
+    "registration": "registration_failed",
+    "import": "import_failed",
+    "comparison": "comparison_failed",
+}
+_REFUSAL_CODES = {
+    "NameVersionTakenError": "name_version_taken",
+    "RegistryError": "registration_refused",
+    "ModelImportError": "import_refused",
+    "SandboxRejectedError": "import_refused",
+    "StagingError": "import_refused",
+    "SandboxFailedError": "sandbox_failed",
+    "SandboxUnavailableError": "sandbox_unavailable",
+    "ComparisonError": "comparison_refused",
+}
+
+
+def _child_error(stderr: bytes, kind: str = "evaluation") -> dict[str, Any]:
+    code = _FAILURE_CODES[kind]
     try:
         error = json.loads(stderr)["error"]
-        return {"code": "evaluation_failed", "message": str(error["message"]), "kind": str(error.get("kind"))}
+        reported = str(error.get("kind"))
+        if kind != "evaluation":
+            code = _REFUSAL_CODES.get(reported, code)
+        document = {"code": code, "message": str(error["message"]), "kind": reported}
+        if isinstance(error.get("reason"), str):
+            document["reason"] = error["reason"]
+        return document
     except (ValueError, KeyError, TypeError):
-        return {"code": "evaluation_failed", "message": stderr[-LOG_BYTES:].decode("utf-8", errors="replace")}
+        return {"code": code, "message": stderr[-LOG_BYTES:].decode("utf-8", errors="replace")}
 
 
 # --- HTTP -----------------------------------------------------------------------------------------------
@@ -1061,36 +1263,60 @@ class Service:
     def __init__(self, configuration: ServiceConfiguration) -> None:
         self.configuration = configuration
         self.artifacts = Artifacts(ArtifactRoots.under(configuration.artifacts))
+        self.registry = RegistryRoots.under(configuration.artifacts)
         self.store = JobStore(configuration.state / "jobs", configuration.retain_jobs)
+        self.imports = ImportStore(configuration.state / "imports", now)
         self.workers = Workers(configuration, self.store)
 
     # Routes.
-    def route(self, method: str, path: str, query: str, body: Callable[[], bytes]) -> tuple[HTTPStatus, Any]:
-        if path == API + "/runs" and method == "POST":
-            parse_query(query, ())
-            return self.start_run(body())
-        routes: list[tuple[re.Pattern[str], Callable[..., tuple[HTTPStatus, Any]], tuple[str, ...]]] = [
-            (re.compile(r"/status"), self.status, ()),
-            (re.compile(r"/experiments"), self.experiments, ("limit", "cursor")),
-            (re.compile(r"/experiments/([^/]+)"), self.experiment, ()),
-            (re.compile(r"/runs"), self.runs, ("limit", "cursor")),
-            (re.compile(r"/runs/([^/]+)"), self.run, ()),
-            (re.compile(r"/results"), self.results, ("limit", "cursor")),
-            (re.compile(r"/results/([^/]+)"), self.result, ()),
-            (re.compile(r"/results/([^/]+)/decisions"), self.decisions, ("limit", "cursor")),
-            (re.compile(r"/results/([^/]+)/trades"), self.trades, ("account", "limit", "cursor")),
-            (re.compile(r"/results/([^/]+)/equity"), self.equity, ("limit", "cursor")),
+    def route(
+        self, method: str, path: str, query: str, body: Callable[[str, int], bytes]
+    ) -> tuple[HTTPStatus, Any]:
+        # Each path, its handler per method, and the query parameters it takes.
+        # A POST or PUT handler gets the body after the query is checked: JSON
+        # of at most 16 KiB, or for PUT a model of at most 1 MiB.
+        type Handler = Callable[..., tuple[HTTPStatus, Any]]
+        routes: list[tuple[str, dict[str, Handler], tuple[str, ...]]] = [
+            (r"/status", {"GET": self.status}, ()),
+            (r"/experiments", {"GET": self.experiments}, ("limit", "cursor")),
+            (r"/experiments/([^/]+)", {"GET": self.experiment}, ()),
+            (r"/runs", {"GET": self.runs, "POST": self.start_run}, ("limit", "cursor")),
+            (r"/runs/([^/]+)", {"GET": self.run}, ()),
+            (r"/results", {"GET": self.results}, ("limit", "cursor")),
+            (r"/results/([^/]+)", {"GET": self.result}, ()),
+            (r"/results/([^/]+)/decisions", {"GET": self.decisions}, ("limit", "cursor")),
+            (r"/results/([^/]+)/trades", {"GET": self.trades}, ("account", "limit", "cursor")),
+            (r"/results/([^/]+)/equity", {"GET": self.equity}, ("limit", "cursor")),
+            (r"/models", {"GET": self.models, "POST": self.start_registration}, ("limit", "cursor", "state")),
+            (r"/models/([^/]+)", {"GET": self.model}, ()),
+            (r"/models/([^/]+)/lifecycle", {"POST": self.set_model_lifecycle}, ()),
+            (r"/comparisons", {"GET": self.comparisons, "POST": self.start_comparison}, ("limit", "cursor")),
+            (r"/comparisons/([^/]+)", {"GET": self.comparison}, ()),
+            (r"/imports", {"POST": self.stage_import}, ()),
+            (r"/imports/([^/]+)", {"GET": self.staged_import}, ()),
+            (r"/imports/([^/]+)/model", {"PUT": self.upload_model}, ()),
+            (r"/imports/([^/]+)/validation", {"POST": self.start_import}, ()),
+            (r"/jobs", {"GET": self.jobs}, ("limit", "cursor", "kind")),
+            (r"/jobs/([^/]+)", {"GET": self.job}, ()),
         ]
         if not path.startswith(API + "/"):
             raise ApiError(HTTPStatus.NOT_FOUND, "route_not_found", "no such path")
         tail = path[len(API) :]
-        for pattern, handler, allowed in routes:
-            matched = pattern.fullmatch(tail)
+        for pattern, handlers, allowed in routes:
+            matched = re.fullmatch(pattern, tail)
             if matched is None:
                 continue
-            if method != "GET":
-                allow = "GET, POST" if tail == "/runs" else "GET"
-                raise MethodNotAllowedError(allow)
+            handler = handlers.get(method)
+            if handler is None:
+                raise MethodNotAllowedError(", ".join(sorted(handlers)))
+            if method == "POST":
+                parse_query(query, ())
+                return handler(*matched.groups(), body("application/json", MAX_BODY_BYTES))
+            if method == "PUT":
+                parse_query(query, ())
+                return handler(
+                    *matched.groups(), body("application/octet-stream", onnx_profile.MAX_MODEL_BYTES)
+                )
             return handler(*matched.groups(), parse_query(query, allowed))
         raise ApiError(HTTPStatus.NOT_FOUND, "route_not_found", "no such path")
 
@@ -1111,6 +1337,10 @@ class Service:
                 "max_queued": str(self.configuration.max_queued),
                 "max_running": str(self.configuration.max_running),
                 "retain_jobs": str(self.configuration.retain_jobs),
+            },
+            "imports": {
+                "profile": onnx_profile.limits(),
+                "sandbox": self.configuration.sandbox.capability(),
             },
             "service": "chronos-research",
             "tools": {name: "available" if present else "missing" for name, present in tools.items()},
@@ -1150,8 +1380,8 @@ class Service:
     def experiment(self, experiment_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
         return HTTPStatus.OK, {"experiment": self._experiment(experiment_id)}
 
-    def start_run(self, data: bytes) -> tuple[HTTPStatus, Any]:
-        request = validate_run_request(parse_body(data))
+    def _fitted_model(self, request: Mapping[str, Any]) -> None:
+        """The request's experiment verifies and its model is fitted."""
         experiment = self._experiment(request["experiment_id"])
         entry = next(
             (item for item in experiment["instruments"] if item["instrument"] == request["instrument"]), None
@@ -1172,24 +1402,300 @@ class Service:
                 "model",
                 model.get("reason"),
             )
-        key = hashlib.sha256(_canonical(request)).hexdigest()
+
+    def start_run(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        request = validate_run_request(parse_body(data))
+        self._fitted_model(request)
+        key = hashlib.sha256(canonical_bytes(request)).hexdigest()
         job, created = self.store.create(request, key)
         if created:
             self.workers.submit(job)
             return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
         return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
 
+    # Evaluations keep their own list, whose shape the workspace relies on.
     def runs(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
-        page = page_before_sequence(self.store.newest_first(), limit_of(query), query.get("cursor"))
+        evaluations = [job for job in self.store.newest_first() if job.kind == "evaluation"]
+        page = page_before_sequence(evaluations, limit_of(query), query.get("cursor"))
         return HTTPStatus.OK, {"next_cursor": page.next_cursor, "runs": [job.public() for job in page.items]}
 
     def run(self, job_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
-        if not _JOB_ID.fullmatch(job_id):
-            raise malformed("invalid_identifier", "a job ID is 32 lowercase hexadecimal digits", "job_id")
-        job = self.store.get(job_id)
-        if job is None:
+        job = self._job(job_id)
+        if job is None or job.kind != "evaluation":
             raise ApiError(HTTPStatus.NOT_FOUND, "run_not_found", "no such run")
         return HTTPStatus.OK, {"run": job.public()}
+
+    def _job(self, job_id: str) -> Job | None:
+        if not _JOB_ID.fullmatch(job_id):
+            raise malformed("invalid_identifier", "a job ID is 32 lowercase hexadecimal digits", "job_id")
+        return self.store.get(job_id)
+
+    # Every kind of job, with its kind.
+    def jobs(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        kind = query.get("kind")
+        if kind is not None and kind not in JOB_KINDS:
+            raise malformed("unknown_enum_value", f"kind is one of {', '.join(JOB_KINDS)}", "kind")
+        selected = [job for job in self.store.newest_first() if kind is None or job.kind == kind]
+        page = page_before_sequence(selected, limit_of(query), query.get("cursor"), f"jobs-{kind or 'all'}")
+        return HTTPStatus.OK, {"jobs": [job.public() for job in page.items], "next_cursor": page.next_cursor}
+
+    def job(self, job_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        job = self._job(job_id)
+        if job is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "job_not_found", "no such job")
+        return HTTPStatus.OK, {"job": job.public()}
+
+    # The model library.
+    def _model_version(self, model_version_id: str) -> ModelVersion:
+        if not is_artifact_id(model_version_id):
+            raise malformed(
+                "invalid_identifier",
+                "a model version ID is 64 lowercase hexadecimal digits",
+                "model_version_id",
+            )
+        if model_version_id not in model_version_ids(self.registry):
+            raise ApiError(HTTPStatus.NOT_FOUND, "model_not_found", "no such model version")
+        try:
+            return verified_model_version(self.registry, model_version_id)
+        except RegistryError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "artifact_invalid",
+                f"the model version cannot be read: {error}",
+            ) from error
+
+    def models(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        state = query.get("state", "active")
+        if state not in (*LIFECYCLE_STATES, "all"):
+            raise malformed("unknown_enum_value", "state is one of active, archived, all", "state")
+        names = names_by_version(self.registry)
+        entries: dict[str, dict[str, Any]] = {}
+        invalid = []
+        for version_id in model_version_ids(self.registry):
+            try:
+                version = verified_model_version(self.registry, version_id)
+                entry = model_library.summary(self.registry, version, names.get(version_id, []))
+            except RegistryError as error:
+                invalid.append({"model_version_id": version_id, "reason": str(error)})
+                continue
+            if state in ("all", entry["lifecycle"]["state"]):
+                entries[version_id] = entry
+        cursor = query.get("cursor")
+        page = page_after_id(sorted(entries), limit_of(query), cursor, f"models-{state}")
+        return HTTPStatus.OK, {
+            # Reported once, on the first page.
+            "invalid_entries": invalid if cursor is None else [],
+            "models": [with_timestamps(model_library.listing_entry(entries[key])) for key in page.items],
+            "next_cursor": page.next_cursor,
+        }
+
+    def model(self, model_version_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        version = self._model_version(model_version_id)
+        names = names_by_version(self.registry).get(model_version_id, [])
+        try:
+            document = model_library.detail(
+                self.registry,
+                self.artifacts.roots.experiments,
+                version,
+                names,
+                self.configuration.sandbox.capability(),
+            )
+        except RegistryError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "artifact_invalid",
+                f"the model version cannot be read: {error}",
+            ) from error
+        return HTTPStatus.OK, {"model": with_timestamps(document)}
+
+    def start_registration(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        request = validate_registration_request(parse_body(data))
+        self._fitted_model(request)
+        key = hashlib.sha256(canonical_bytes({"kind": "registration", "request": request})).hexdigest()
+        job, created = self.store.create(request, key, "registration")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    def set_model_lifecycle(self, model_version_id: str, data: bytes) -> tuple[HTTPStatus, Any]:
+        document = parse_body(data)
+        _exact_keys(document, ("reason", "state"))
+        state, reason = _string(document, "state"), _string(document, "reason")
+        if state not in LIFECYCLE_STATES:
+            raise malformed("unknown_enum_value", f"state is one of {', '.join(LIFECYCLE_STATES)}", "state")
+        self._model_version(model_version_id)
+        try:
+            record = set_lifecycle(self.registry, model_version_id, state, reason)
+        except RegistryError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_configuration",
+                str(error),
+                "reason",
+                "out_of_domain",
+            ) from error
+        return HTTPStatus.OK, {"lifecycle": record, "model_version_id": model_version_id}
+
+    # Imports: a manifest, then its model bytes, then a validation job.
+    def _staged(self, import_id: str) -> StagedImport:
+        if not _JOB_ID.fullmatch(import_id):
+            raise malformed(
+                "invalid_identifier", "an import ID is 32 lowercase hexadecimal digits", "import_id"
+            )
+        staged = self.imports.get(import_id)
+        if staged is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "import_not_found", "no such staged import")
+        return staged
+
+    def _import_jobs(self, import_id: str) -> list[Job]:
+        return [
+            job
+            for job in self.store.newest_first()
+            if job.kind == "import" and job.request["import_id"] == import_id
+        ]
+
+    def _busy_imports(self) -> set[str]:
+        return {
+            job.request["import_id"]
+            for job in self.store.newest_first()
+            if job.kind == "import" and job.state in ("queued", "running")
+        }
+
+    def _import_document(self, staged: StagedImport) -> dict[str, Any]:
+        jobs = self._import_jobs(staged.import_id)
+        return {"import": staged.public(), "job": jobs[0].public() if jobs else None}
+
+    def stage_import(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        try:
+            manifest = validated_import_manifest(parse_body(data))
+        except ModelImportError as error:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, error.reason, str(error)) from error
+        staged = self.imports.create(manifest, self._busy_imports)
+        return HTTPStatus.CREATED, self._import_document(staged)
+
+    def staged_import(self, import_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        return HTTPStatus.OK, self._import_document(self._staged(import_id))
+
+    def upload_model(self, import_id: str, data: bytes) -> tuple[HTTPStatus, Any]:
+        self._staged(import_id)
+        try:
+            staged, created = self.imports.attach_model(import_id, data)
+        except StagingError as error:
+            status = (
+                HTTPStatus.CONFLICT if error.reason == "model_already_uploaded" else HTTPStatus.BAD_REQUEST
+            )
+            raise ApiError(status, error.reason, str(error)) from error
+        return (HTTPStatus.CREATED if created else HTTPStatus.OK), self._import_document(staged)
+
+    def start_import(self, import_id: str, data: bytes) -> tuple[HTTPStatus, Any]:
+        document = parse_body(data)
+        _exact_keys(document, ("model_sha256",))
+        digest = _string(document, "model_sha256")
+        if not is_artifact_id(digest):
+            raise malformed(
+                "invalid_identifier", "model_sha256 is 64 lowercase hexadecimal digits", "model_sha256"
+            )
+        staged = self._staged(import_id)
+        if staged.model is None:
+            raise ApiError(HTTPStatus.CONFLICT, "model_not_uploaded", "upload the model bytes first")
+        if staged.model["sha256"] != digest:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "model_mismatch",
+                "the staged model is not the one reviewed",
+                "model_sha256",
+            )
+        capability = self.configuration.sandbox.capability()
+        if capability["status"] != "available":
+            # Fail closed: an import is never validated any other way.
+            raise ApiError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "sandbox_unavailable",
+                capability["detail"],
+                None,
+                capability["reason"],
+            )
+        request = {
+            "import_id": import_id,
+            "instrument": staged.manifest["instrument"],
+            "manifest_sha256": staged.manifest_sha256,
+            "model_sha256": digest,
+            "name": staged.manifest["name"],
+            "version": staged.manifest["version"],
+        }
+        key = hashlib.sha256(
+            canonical_bytes(
+                {"kind": "import", "manifest_sha256": staged.manifest_sha256, "model_sha256": digest}
+            )
+        ).hexdigest()
+        job, created = self.store.create(request, key, "import")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    # Comparisons: a frozen spec, run as a job, published as one artifact.
+    def start_comparison(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        spec = validate_comparison_request(parse_body(data))
+        known = set(model_version_ids(self.registry))
+        missing = [item for item in spec["model_version_ids"] if item not in known]
+        if missing:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "model_not_found",
+                f"no such model version: {', '.join(missing)}",
+                "model_version_ids",
+            )
+        if not (self.artifacts.roots.splits / spec["split_artifact_id"]).is_dir():
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "split_not_found",
+                "no such split artifact",
+                "split_artifact_id",
+            )
+        job, created = self.store.create(spec, comparison.spec_digest(spec), "comparison")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    def _comparison(self, comparison_id: str) -> dict[str, Any]:
+        if not is_artifact_id(comparison_id):
+            raise malformed(
+                "invalid_identifier", "a comparison ID is 64 lowercase hexadecimal digits", "comparison_id"
+            )
+        root = comparison.comparisons_root(self.configuration.artifacts)
+        if comparison_id not in comparison.comparison_ids(root):
+            raise ApiError(HTTPStatus.NOT_FOUND, "comparison_not_found", "no such comparison")
+        try:
+            return comparison.verified_comparison(root, comparison_id)
+        except comparison.ComparisonError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "artifact_invalid", f"the comparison cannot be read: {error}"
+            ) from error
+
+    def comparisons(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        root = comparison.comparisons_root(self.configuration.artifacts)
+        page = page_after_id(
+            comparison.comparison_ids(root), limit_of(query), query.get("cursor"), "comparisons"
+        )
+        items, invalid = [], []
+        for comparison_id in page.items:
+            try:
+                items.append(comparison.listing(comparison.verified_comparison(root, comparison_id)))
+            except comparison.ComparisonError as error:
+                invalid.append({"comparison_id": comparison_id, "reason": str(error)})
+        return HTTPStatus.OK, {
+            "comparisons": with_timestamps(items),
+            "invalid_entries": invalid,
+            "next_cursor": page.next_cursor,
+        }
+
+    def comparison(self, comparison_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        manifest = self._comparison(comparison_id)
+        checks = comparison.member_artifacts(ArtifactRoots.under(self.configuration.artifacts), manifest)
+        return HTTPStatus.OK, {"artifacts": checks, "comparison": with_timestamps(manifest)}
 
     def _manifest(self, run_id: str) -> dict[str, Any]:
         if not is_artifact_id(run_id):
@@ -1217,7 +1723,10 @@ class Service:
         items, invalid = [], []
         for run_id in page.items:
             try:
-                items.append(result_listing(self.artifacts.result_manifest(run_id)))
+                manifest = self.artifacts.result_manifest(run_id)
+                # A registered model's run is listed in its comparison.
+                if manifest["schema"] == EXPERIMENT_RUN_SCHEMA:
+                    items.append(result_listing(manifest))
             except (ArtifactUnavailableError, OSError, ValueError, KeyError, TypeError) as error:
                 invalid.append({"reason": str(error) or type(error).__name__, "run_id": run_id})
         return HTTPStatus.OK, {"invalid_entries": invalid, "next_cursor": page.next_cursor, "results": items}
@@ -1275,6 +1784,8 @@ def handler_for(service: Service) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "chronos-research/1"
         sys_version = ""
+        # A client that stops sending mid-request does not hold a thread.
+        timeout = 30
 
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -1293,24 +1804,27 @@ def handler_for(service: Service) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(data)
 
-        def _body(self) -> bytes:
+        def _body(self, media_type: str, limit: int) -> bytes:
             content_type = self.headers.get("Content-Type", "")
-            if content_type.split(";")[0].strip().lower() != "application/json" or (
-                ";" in content_type
-                and content_type.split(";", 1)[1].strip().lower() not in ("charset=utf-8",)
-            ):
+            parameter = content_type.split(";", 1)[1].strip().lower() if ";" in content_type else None
+            allowed = (None, "charset=utf-8") if media_type == "application/json" else (None,)
+            if content_type.split(";")[0].strip().lower() != media_type or parameter not in allowed:
                 raise ApiError(
-                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "send application/json"
+                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", f"send {media_type}"
                 )
             length_text = self.headers.get("Content-Length", "")
             if not _UNSIGNED.fullmatch(length_text):
                 raise malformed("invalid_json", "a body needs a Content-Length")
             length = int(length_text)
-            if length > MAX_BODY_BYTES:
+            if length > limit:
+                size = "16 KiB" if limit == MAX_BODY_BYTES else f"{limit // 1024 // 1024} MiB"
                 raise ApiError(
-                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "payload_too_large", "the body exceeds 16 KiB"
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "payload_too_large", f"the body exceeds {size}"
                 )
-            return self.rfile.read(length)
+            data = self.rfile.read(length)
+            if len(data) != length:
+                raise malformed("incomplete_body", "the body is shorter than its Content-Length")
+            return data
 
         def _handle(self, method: str) -> None:
             try:

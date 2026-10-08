@@ -44,6 +44,8 @@ export function deploymentJson(overrides: Json = {}): Json {
     stream_id: 'databento-equs-mini-mbp1-20260925-1330-1340',
     starting_cash: '10000',
     model: {
+      reference: 'experiment',
+      training_cutoff_basis: 'verified',
       experiment_id: EXPERIMENT_ID,
       name: 'logistic',
       instrument: 'SPY',

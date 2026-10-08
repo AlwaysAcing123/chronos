@@ -137,8 +137,8 @@ struct DeploymentCreateRequest {
     std::string deployment_id;
     std::string account_id;
     Money starting_cash;
-    std::string experiment_id;
-    std::string model;
+    // An experiment's model, or a registered model version.
+    ModelChoice model;
     std::string instrument;
     std::uint64_t threshold_ppb{0};
     Quantity target_quantity;
@@ -365,7 +365,9 @@ public:
 
     [[nodiscard]] bool enabled() const noexcept { return provider_ != nullptr; }
 
-    // The canonical request whose SHA-256 identifies a create.
+    // The canonical request whose SHA-256 identifies a create: version 1 for
+    // an experiment's model, unchanged since ADR 0018, and version 2 for a
+    // registered model version.
     [[nodiscard]] static std::string canonical_request(const DeploymentCreateRequest& request);
 
 private:

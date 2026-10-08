@@ -99,7 +99,43 @@ json::Value environment_json() {
     });
 }
 
+// What a run came from: the dataset and schedule, and the schedule's model,
+// as that schedule's version names it.
+json::Value source_json(const ScheduleManifest& source, const std::string& events_sha256) {
+    json::Object members{
+        {"dataset_id", source.dataset_id},
+        {"events_sha256", events_sha256},
+        {"feature_artifact_id", source.feature_artifact_id},
+        {"instrument", source.instrument.value()},
+        {"label_artifact_id", source.label_artifact_id},
+        {"schedule_id", source.artifact_id},
+        {"schedule_sha256", source.schedule.sha256},
+        {"split_artifact_id", source.split_artifact_id},
+        {"stream", source.stream.value()},
+    };
+    if (const auto* model = std::get_if<ExperimentScheduleModel>(&source.model)) {
+        members.emplace_back("experiment_id", model->experiment_id);
+        members.emplace_back("model", model->name);
+        members.emplace_back("parameters_sha256", model->parameters_sha256);
+        members.emplace_back(
+            "training_labels_available_through_ns",
+            std::to_string(model->training_labels_available_through.nanoseconds())
+        );
+    } else {
+        const auto& registered = std::get<RegisteredScheduleModel>(source.model);
+        members.emplace_back("family", registered.family);
+        members.emplace_back("information_cutoff", json::Object{
+            {"at_ns", std::to_string(registered.information_cutoff.nanoseconds())},
+            {"basis", registered.cutoff_basis},
+        });
+        members.emplace_back("model_version_id", registered.model_version_id);
+        members.emplace_back("payload_sha256", registered.payload_sha256);
+    }
+    return json::Value(std::move(members));
+}
+
 struct Simulated {
+    std::string_view schema_version;
     json::Value source;
     json::Value window;
     StrategyResults results;
@@ -133,23 +169,10 @@ std::variant<Simulated, DatasetError> simulate(
             "the dataset is not the schedule's source"
         );
     }
+    const bool registered = std::holds_alternative<RegisteredScheduleModel>(source.model);
     Simulated simulated{
-        .source = json::Value(json::Object{
-            {"dataset_id", source.dataset_id},
-            {"events_sha256", dataset.events.sha256},
-            {"experiment_id", source.experiment_id},
-            {"feature_artifact_id", source.feature_artifact_id},
-            {"instrument", source.instrument.value()},
-            {"label_artifact_id", source.label_artifact_id},
-            {"model", source.model_name},
-            {"parameters_sha256", source.parameters_sha256},
-            {"schedule_id", source.artifact_id},
-            {"schedule_sha256", source.schedule.sha256},
-            {"split_artifact_id", source.split_artifact_id},
-            {"stream", source.stream.value()},
-            {"training_labels_available_through_ns",
-             std::to_string(source.training_labels_available_through.nanoseconds())},
-        }),
+        .schema_version = registered ? kRegisteredStrategyRunVersion : kExperimentStrategyRunVersion,
+        .source = source_json(source, dataset.events.sha256),
         .window = json::Value(json::Object{
             {"end_at_ns", source.window.end_at ? json::Value(std::to_string(source.window.end_at->nanoseconds()))
                                                : json::Value(nullptr)},
@@ -233,7 +256,7 @@ json::Value manifest_body(
         {"record", datasets::name_version_json(kJournalRecordName, kJournalRecordVersion)},
         {"results", results_json(simulated.results, configuration)},
         {"runner", datasets::name_version_json(kRunnerName, kRunnerVersion)},
-        {"schema", datasets::name_version_json(kStrategyRunSchemaName, kStrategyRunSchemaVersion)},
+        {"schema", datasets::name_version_json(kStrategyRunSchemaName, simulated.schema_version)},
         {"scope", kScope},
         {"source", simulated.source},
         {"window", simulated.window},
@@ -353,11 +376,11 @@ std::variant<StrategyRunManifest, DatasetError> parse_strategy_run_manifest(std:
     }
     const json::Value& value = std::get<json::Value>(document);
     ObjectFields fields(value, "manifest");
-    if (fields.ok()) {
-        datasets::require_name_version(fields, "schema", kStrategyRunSchemaName, kStrategyRunSchemaVersion);
-        if (!fields.ok()) {
-            return *fields.error();
-        }
+    const std::string version = datasets::require_name_and_one_of_versions(
+        fields, "schema", kStrategyRunSchemaName, {kExperimentStrategyRunVersion, kRegisteredStrategyRunVersion}
+    );
+    if (!fields.ok()) {
+        return *fields.error();
     }
     fields.require_keys({
         "artifact_id", "assumptions", "configuration", "definitions", "environment", "events", "files", "journal",
@@ -386,11 +409,20 @@ std::variant<StrategyRunManifest, DatasetError> parse_strategy_run_manifest(std:
     }
     if (const json::Value* source = fields.value("source"); source != nullptr && fields.ok()) {
         ObjectFields entry(*source, "manifest.source");
-        entry.require_keys({
-            "dataset_id", "events_sha256", "experiment_id", "feature_artifact_id", "instrument", "label_artifact_id",
-            "model", "parameters_sha256", "schedule_id", "schedule_sha256", "split_artifact_id", "stream",
-            "training_labels_available_through_ns",
-        });
+        if (version == kRegisteredStrategyRunVersion) {
+            entry.require_keys({
+                "dataset_id", "events_sha256", "family", "feature_artifact_id", "information_cutoff", "instrument",
+                "label_artifact_id", "model_version_id", "payload_sha256", "schedule_id", "schedule_sha256",
+                "split_artifact_id", "stream",
+            });
+            (void)entry.sha256("model_version_id");
+        } else {
+            entry.require_keys({
+                "dataset_id", "events_sha256", "experiment_id", "feature_artifact_id", "instrument",
+                "label_artifact_id", "model", "parameters_sha256", "schedule_id", "schedule_sha256",
+                "split_artifact_id", "stream", "training_labels_available_through_ns",
+            });
+        }
         manifest.schedule_id = entry.sha256("schedule_id");
         manifest.dataset_id = entry.sha256("dataset_id");
         fields.adopt(entry.error());

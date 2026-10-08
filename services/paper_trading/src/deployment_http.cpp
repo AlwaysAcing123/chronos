@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -252,8 +253,15 @@ ResponseJson deployment_json(const DeploymentStatus& status) {
     const ModelDeploymentRecord& record = status.deployment;
     const ModelDeploymentConfig& config = record.config;
     ResponseJson model = ResponseJson::object();
-    model["experiment_id"] = config.experiment_id;
-    model["name"] = config.model_name;
+    if (const auto* experiment = std::get_if<ExperimentModel>(&config.model)) {
+        model["reference"] = "experiment";
+        model["experiment_id"] = experiment->experiment_id;
+    } else {
+        model["reference"] = "registered";
+        model["model_version_id"] = std::get<RegisteredModel>(config.model).model_version_id;
+    }
+    model["name"] = config.family;
+    model["training_cutoff_basis"] = config.training_cutoff_basis;
     model["instrument"] = config.instrument.value();
     model["parameters_sha256"] = config.parameters_sha256;
     model["feature_set"] = std::string(kDeploymentModelFeatureSet);
@@ -455,21 +463,23 @@ std::optional<Decimal> decimal_of(const std::string& text) {
     }
 }
 
+// Every create names its model one way: an experiment's, by experiment_id
+// and model, or a registered model version, by model_version_id.
 constexpr std::string_view kCreateFields[] = {
     "account_id",
     "decision_interval_ms",
     "deployment_id",
-    "experiment_id",
     "instrument",
     "latency_ms",
     "max_consecutive_rejections",
     "max_orders_per_run",
     "max_signal_age_ms",
-    "model",
     "starting_cash",
     "target_quantity",
     "threshold",
 };
+constexpr std::string_view kExperimentModelFields[] = {"experiment_id", "model"};
+constexpr std::string_view kRegisteredModelFields[] = {"model_version_id"};
 
 std::variant<HttpResponse, std::monostate> require_empty_object(const HttpRequest& request) {
     if (auto failure = parse_empty_object_request(request.body)) {
@@ -583,25 +593,36 @@ std::variant<DeploymentCreateRequest, MalformedDeploymentRequest> parse_deployme
     if (!duplicate.empty()) {
         return bad(duplicate, "a field may appear only once");
     }
+    using Fields = std::span<const std::string_view>;
+    const bool registered = object->contains("model_version_id");
+    const Fields model_fields = registered ? Fields(kRegisteredModelFields) : Fields(kExperimentModelFields);
+    const auto in = [](std::string_view key, Fields fields) {
+        return std::find(fields.begin(), fields.end(), key) != fields.end();
+    };
     for (const auto& [key, value] : object->items()) {
-        if (std::find(std::begin(kCreateFields), std::end(kCreateFields), key) == std::end(kCreateFields)) {
-            return bad(key, "unexpected field");
+        if (!in(key, kCreateFields) && !in(key, model_fields)) {
+            return bad(key, registered && in(key, kExperimentModelFields)
+                                ? "a registered model version is named by model_version_id alone"
+                                : "unexpected field");
         }
         if (!value.is_string()) {
             return bad(key, "every field is a string");
         }
     }
-    for (std::string_view field : kCreateFields) {
-        if (!object->contains(std::string(field))) {
-            return bad(std::string(field), "missing field");
+    for (const Fields fields : {Fields(kCreateFields), model_fields}) {
+        for (std::string_view field : fields) {
+            if (!object->contains(std::string(field))) {
+                return bad(std::string(field), "missing field");
+            }
         }
     }
     const auto text = [&](std::string_view field) { return object->at(std::string(field)).get<std::string>(); };
     DeploymentCreateRequest request;
     request.deployment_id = text("deployment_id");
     request.account_id = text("account_id");
-    request.experiment_id = text("experiment_id");
-    request.model = text("model");
+    request.model = registered
+        ? ModelChoice(RegisteredModel{.model_version_id = text("model_version_id")})
+        : ModelChoice(ExperimentModel{.experiment_id = text("experiment_id"), .name = text("model")});
     request.instrument = text("instrument");
     const auto cash = decimal_of<Money>(text("starting_cash"));
     if (!cash) {

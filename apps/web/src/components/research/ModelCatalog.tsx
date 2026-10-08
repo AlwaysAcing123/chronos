@@ -1,8 +1,8 @@
 import type { UseInfiniteQueryResult } from '@tanstack/react-query';
 import { useId } from 'react';
 
-import type { Experiment, ExperimentInstrument, ExperimentPage, Metric, PredictionMetrics } from '../../api/researchSchemas';
-import { MODEL_LABEL, WINDOW_LABEL, metricPercent, shortId } from '../../presentation/research';
+import type { Experiment, ExperimentInstrument, ExperimentPage, PredictionMetrics } from '../../api/researchSchemas';
+import { MODEL_LABEL, WINDOW_LABEL, shortId } from '../../presentation/research';
 import historyStyles from '../history/history.module.css';
 import { Alert, Code } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
@@ -11,6 +11,7 @@ import { Facts } from '../ui/Facts';
 import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
 import { ListFooter } from './ListFooter';
+import { MetricValue } from './MetricValue';
 import { ResearchFailure } from './Research';
 import styles from './research.module.css';
 
@@ -28,16 +29,6 @@ export function defaultSelection(page: ExperimentPage | undefined): Selection | 
   const instrument =
     experiment.instruments.find((entry) => entry.models.logistic.status === 'fitted') ?? experiment.instruments[0];
   return instrument === undefined ? null : { experimentId: experiment.experiment_id, instrument: instrument.instrument };
-}
-
-function MetricValue({ metric }: { readonly metric: Metric }) {
-  return 'value' in metric ? (
-    <span className="numeric" title={metric.value}>
-      {metricPercent(metric.value)}
-    </span>
-  ) : (
-    <Unavailable>{`Undefined: ${metric.undefined.replaceAll('_', ' ')}`}</Unavailable>
-  );
 }
 
 function MetricsCells({ metrics }: { readonly metrics: PredictionMetrics }) {

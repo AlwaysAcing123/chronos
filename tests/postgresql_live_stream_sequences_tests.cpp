@@ -277,9 +277,9 @@ void leave_legacy_history(const ScratchSchema& schema, const MarketDataStreamId&
     config.deployment_id = "legacy-model";
     config.account_id = "legacy-model-account";
     config.starting_cash = Money::parse("1000");
-    config.experiment_id = std::string(64, 'e');
+    config.model = chronos::ExperimentModel{.experiment_id = std::string(64, 'e'), .name = "logistic"};
+    config.family = "logistic";
     config.parameters_sha256 = std::string(64, 'f');
-    config.model_name = "logistic";
     config.instrument = InstrumentId("AAPL");
     config.training_cutoff = Timestamp::from_nanoseconds(100);
     config.threshold_ppb = 550'000'000;

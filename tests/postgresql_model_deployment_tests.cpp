@@ -32,6 +32,7 @@ using chronos::DeploymentConflictCode;
 using chronos::DeploymentDecisionRecord;
 using chronos::DeploymentOrderResolution;
 using chronos::DeploymentState;
+using chronos::ExperimentModel;
 using chronos::InstrumentId;
 using chronos::MarketDataStreamId;
 using chronos::ModelDeploymentConfig;
@@ -84,9 +85,9 @@ ModelDeploymentConfig config(std::string deployment_id, std::string account_id) 
     config.deployment_id = std::move(deployment_id);
     config.account_id = std::move(account_id);
     config.starting_cash = money("1000");
-    config.experiment_id = std::string(64, 'e');
+    config.model = ExperimentModel{.experiment_id = std::string(64, 'e'), .name = "logistic"};
+    config.family = "logistic";
     config.parameters_sha256 = std::string(64, 'f');
-    config.model_name = "logistic";
     config.instrument = kAapl;
     config.training_cutoff = Timestamp::from_nanoseconds(100);
     config.threshold_ppb = 550'000'000;
@@ -331,6 +332,29 @@ void test_a_deployment_is_created_stopped_with_its_own_account() {
     const auto exists = require_conflict(store.create_deployment(different), DeploymentConflictCode::DeploymentExists);
     REQUIRE(exists.deployment.has_value());
     REQUIRE(exists.deployment->config.request_sha256 == std::string(64, 'a'));
+}
+
+// A registered version's deployment (migration 008) reads back as exactly
+// the version it was created with, and no experiment.
+void test_a_registered_versions_deployment_reads_back_as_itself() {
+    const ScratchSchema schema;
+    PostgresPaperOrderRepository store(schema.connection());
+    ModelDeploymentConfig registered = config("dep-1", "model-1");
+    registered.model = chronos::RegisteredModel{.model_version_id = std::string(64, '7')};
+    registered.family = "onnx";
+    registered.training_cutoff_basis = "declared";
+    const ModelDeploymentRecord created = create(store, registered);
+    REQUIRE(std::get<chronos::RegisteredModel>(created.config.model).model_version_id == std::string(64, '7'));
+    REQUIRE(created.config.family == "onnx");
+    REQUIRE(created.config.training_cutoff_basis == "declared");
+    const auto found = store.find_deployment("dep-1");
+    REQUIRE(found.has_value());
+    REQUIRE(found->config.model == created.config.model);
+    // An experiment deployment beside it is unchanged.
+    const ModelDeploymentRecord experiment = create(store, config("dep-2", "model-2"));
+    REQUIRE(std::get<ExperimentModel>(experiment.config.model).experiment_id == std::string(64, 'e'));
+    REQUIRE(std::get<ExperimentModel>(experiment.config.model).name == "logistic");
+    REQUIRE(experiment.config.training_cutoff_basis == "verified");
 }
 
 void test_a_deployment_never_takes_an_existing_account() {
@@ -769,6 +793,7 @@ int main() {
     }
     connection_string = configured_connection;
     return chronos::test::run_tests({
+        {"a registered version's deployment reads back as itself", test_a_registered_versions_deployment_reads_back_as_itself},
         {"the generic commit cannot leave a pending decision with an order", test_the_generic_commit_cannot_leave_a_pending_decision_with_an_order},
         {"a deployment is created stopped with its own account", test_a_deployment_is_created_stopped_with_its_own_account},
         {"a deployment never takes an existing account", test_a_deployment_never_takes_an_existing_account},

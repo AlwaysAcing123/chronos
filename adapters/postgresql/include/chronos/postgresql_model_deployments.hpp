@@ -9,12 +9,13 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
-// The durable records of model deployments (migration 005, ADR 0018). The
-// repository that stores them is PostgresPaperOrderRepository: a
-// deployment's account is a paper account, and its orders commit in the
-// account's own transaction.
+// The durable records of model deployments (migrations 005 and 008, ADRs
+// 0018 and 0021). The repository that stores them is
+// PostgresPaperOrderRepository: a deployment's account is a paper account,
+// and its orders commit in the account's own transaction.
 namespace chronos {
 
 inline constexpr std::string_view kDeploymentModelFeatureSet = "top_of_book_baseline/1";
@@ -31,18 +32,42 @@ enum class DeploymentState {
 [[nodiscard]] std::string_view deployment_state_name(DeploymentState state) noexcept;
 [[nodiscard]] std::optional<DeploymentState> deployment_state_from_name(std::string_view name) noexcept;
 
+// An experiment's fitted model (ADR 0018).
+struct ExperimentModel {
+    std::string experiment_id;
+    // "logistic" or "majority".
+    std::string name;
+
+    friend bool operator==(const ExperimentModel&, const ExperimentModel&) = default;
+};
+
+// A registered model version (migration 008, ADR 0021), by its immutable ID;
+// never by a name, which could be bound to another version later.
+struct RegisteredModel {
+    std::string model_version_id;
+
+    friend bool operator==(const RegisteredModel&, const RegisteredModel&) = default;
+};
+
+// Which model a deployment serves: exactly one of the two.
+using ModelChoice = std::variant<ExperimentModel, RegisteredModel>;
+
 // Everything a deployment is created with. None of it changes afterwards.
 struct ModelDeploymentConfig {
     std::string deployment_id;
     std::string account_id;
     Money starting_cash;
-    // The model, as the inference worker verified and identified it.
-    std::string experiment_id;
+    // The model, as the inference worker verified and identified it: its
+    // choice, its family (logistic, majority, or a registered version's
+    // own, such as onnx), and the checksum of the parameters or payload.
+    ModelChoice model;
+    std::string family;
     std::string parameters_sha256;
-    std::string model_name;
     InstrumentId instrument{"unset"};
     // No decision on an observation received before this.
     Timestamp training_cutoff;
+    // verified, or declared by an import's uploader and not verified.
+    std::string training_cutoff_basis{"verified"};
     // The policy, long_flat_threshold version 1.
     std::uint64_t threshold_ppb{0};
     Quantity target_quantity;

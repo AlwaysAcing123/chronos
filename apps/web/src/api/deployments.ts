@@ -115,14 +115,31 @@ export const DeploymentSchema = z.object({
   run_generation: UnsignedIntegerSchema,
   stream_id: z.string().min(1),
   starting_cash: MoneySchema,
-  model: z.object({
-    experiment_id: Sha256Schema,
-    name: z.enum(['logistic', 'majority']),
-    instrument: IdentifierSchema,
-    parameters_sha256: Sha256Schema,
-    feature_set: z.string().min(1),
-    training_cutoff: TimestampSchema,
-  }),
+  // An experiment's model (ADR 0018) or a registered model version (ADR
+  // 0021), whose cutoff its uploader may have declared rather than Chronos
+  // verified.
+  model: z.discriminatedUnion('reference', [
+    z.object({
+      reference: z.literal('experiment'),
+      experiment_id: Sha256Schema,
+      name: z.enum(['logistic', 'majority']),
+      instrument: IdentifierSchema,
+      parameters_sha256: Sha256Schema,
+      feature_set: z.string().min(1),
+      training_cutoff: TimestampSchema,
+      training_cutoff_basis: z.literal('verified'),
+    }),
+    z.object({
+      reference: z.literal('registered'),
+      model_version_id: Sha256Schema,
+      name: z.string().min(1),
+      instrument: IdentifierSchema,
+      parameters_sha256: Sha256Schema,
+      feature_set: z.string().min(1),
+      training_cutoff: TimestampSchema,
+      training_cutoff_basis: z.enum(['verified', 'declared']),
+    }),
+  ]),
   policy: z.object({
     name: z.string().min(1),
     threshold: RatioSchema,
@@ -233,12 +250,18 @@ export type DecisionPage = z.infer<typeof DecisionPageSchema>;
 const KillSwitchSchema = z.object({ stopped: z.array(DeploymentSchema) });
 
 // Exactly what the server is asked to create; reviewed before it is sent.
-export interface DeploymentRequest {
+// The model is named one way: an experiment's, or a registered version's.
+export type ExperimentDeploymentRequest = DeploymentSettings & {
+  readonly experiment_id: string;
+  readonly model: 'logistic' | 'majority';
+};
+export type RegisteredDeploymentRequest = DeploymentSettings & { readonly model_version_id: string };
+export type DeploymentRequest = ExperimentDeploymentRequest | RegisteredDeploymentRequest;
+
+export interface DeploymentSettings {
   readonly deployment_id: string;
   readonly account_id: string;
   readonly starting_cash: string;
-  readonly experiment_id: string;
-  readonly model: 'logistic' | 'majority';
   readonly instrument: string;
   readonly threshold: string;
   readonly target_quantity: string;

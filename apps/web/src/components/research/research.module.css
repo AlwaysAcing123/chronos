@@ -71,6 +71,8 @@
   color: var(--color-text-muted);
   font-size: 12.5px;
   max-width: 80ch;
+  /* A statement may quote a 64-digit ID; it wraps rather than widen a phone's page. */
+  overflow-wrap: anywhere;
 }
 
 .choices {
@@ -201,6 +203,14 @@
 
 .ids {
   overflow-wrap: anywhere;
+}
+
+/* Several figures in one table cell, one per line, aligned as the cell is. */
+.stackedFigures {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  white-space: normal;
 }
 
 /* The chart draws approximate geometry only; every value a reader sees comes

@@ -68,6 +68,12 @@ export function metricPercent(value: string): string {
   return Number.isFinite(number) ? `${(number * 100).toFixed(2)}%` : value;
 }
 
+export function metricNumber(value: string): string {
+  // A loss or score that is not a share: four decimals, the exact value in the title.
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(4) : value;
+}
+
 /** The first and last characters of a long ID. */
 export function shortId(id: string): string {
   return `${id.slice(0, 12)}…`;

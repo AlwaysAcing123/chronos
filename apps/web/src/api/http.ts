@@ -27,10 +27,23 @@ export interface HttpResponse {
 }
 
 interface RequestSpec {
-  readonly method: 'GET' | 'POST';
+  readonly method: 'GET' | 'POST' | 'PUT';
   readonly path: string;
+  // Serialized as JSON.
   readonly body?: unknown;
+  // Sent exactly as given instead, such as a file's own bytes.
+  readonly raw?: { readonly contentType: 'application/json' | 'application/octet-stream'; readonly data: BodyInit };
   readonly signal?: AbortSignal | undefined;
+}
+
+function requestBody(body: unknown, raw: RequestSpec['raw']): { headers: Record<string, string>; body?: BodyInit } {
+  if (raw !== undefined) {
+    return { headers: { Accept: 'application/json', 'Content-Type': raw.contentType }, body: raw.data };
+  }
+  if (body !== undefined) {
+    return { headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  }
+  return { headers: { Accept: 'application/json' } };
 }
 
 // Every Chronos response carries this header; its absence means something
@@ -51,7 +64,7 @@ const GATEWAY_FAILURES: ReadonlySet<number> = new Set([502, 503, 504]);
  */
 export async function sendRequest(
   transport: TransportOptions,
-  { method, path, body, signal }: RequestSpec,
+  { method, path, body, raw, signal }: RequestSpec,
 ): Promise<HttpResponse> {
   const timeoutMs = method === 'GET' ? transport.readTimeoutMs : transport.writeTimeoutMs;
   const timeout = AbortSignal.timeout(timeoutMs);
@@ -75,11 +88,7 @@ export async function sendRequest(
   try {
     response = await transport.fetch(path, {
       method,
-      headers:
-        body === undefined
-          ? { Accept: 'application/json' }
-          : { Accept: 'application/json', 'Content-Type': 'application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...requestBody(body, raw),
       cache: 'no-store',
       signal: combined,
     });

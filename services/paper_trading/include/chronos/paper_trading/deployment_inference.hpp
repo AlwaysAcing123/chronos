@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chronos/market_data_types.hpp"
+#include "chronos/postgresql_model_deployments.hpp"
 #include "chronos/strategy/inference_schedule.hpp"
 
 #include <array>
@@ -8,34 +9,42 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
-// Model inference for deployments (ADR 0018): a verified research model,
-// served by a long-lived worker process speaking chronos.inference_worker/1
-// (python/chronos_research/inference_worker.py).
+// Model inference for deployments: a verified research model, served by a
+// long-lived worker process (python/chronos_research/inference_worker.py).
+// An experiment's model speaks chronos.inference_worker/1 (ADR 0018); a
+// registered model version chronos.inference_worker/2 (ADR 0021), whose
+// predictions come from the registered-model adapter, an import's only from
+// the ONNX sandbox.
 namespace chronos::paper_trading {
 
 inline constexpr std::string_view kInferenceProtocol = "chronos.inference_worker/1";
+inline constexpr std::string_view kRegisteredInferenceProtocol = "chronos.inference_worker/2";
 
 // Which model to serve.
 struct ModelSelection {
-    std::string experiment_id;
+    ModelChoice model;
     InstrumentId instrument{"unset"};
-    // "logistic" or "majority".
-    std::string model;
 };
 
 // The model as the worker verified it, before serving anything.
 struct ModelIdentity {
-    std::string experiment_id;
+    ModelChoice model;
     InstrumentId instrument{"unset"};
-    std::string model;
+    // logistic or majority for an experiment's model; a registered
+    // version's own family, such as onnx.
+    std::string family;
+    // The checksum of the exact parameters or payload served.
     std::string parameters_sha256;
     // "top_of_book_baseline/1".
     std::string model_feature_set;
     // No decision on an observation received before this.
     Timestamp training_cutoff;
+    // verified, or declared by an import's uploader and not verified.
+    std::string cutoff_basis{"verified"};
 
     friend bool operator==(const ModelIdentity&, const ModelIdentity&) = default;
 };
@@ -119,9 +128,13 @@ protected:
 
 // Runs `python -m chronos_research inference-worker` from `python_root`
 // (the repository's python directory) against `artifacts` (the directory
-// holding experiments/). The worker gets its own process group and a
-// minimal environment: PATH, PYTHONPATH, and nothing of the server's, so no
-// credential reaches it. Its stderr is the server's.
+// holding experiments/ and models/). The worker gets its own process group
+// and a minimal environment: PATH, PYTHONPATH, and nothing of the server's,
+// so no credential reaches it. Its stderr is the server's.
+//
+// A registered version's worker is also given `docker`, the absolute path of
+// the Docker CLI for the ONNX sandbox; without it an imported model cannot
+// be served at all, and nothing runs it any other way.
 //
 // Writing to a worker that has exited raises SIGPIPE; the server ignores
 // SIGPIPE whenever deployments are enabled.
@@ -129,6 +142,7 @@ struct PythonWorkerCommand {
     std::filesystem::path python;
     std::filesystem::path python_root;
     std::filesystem::path artifacts;
+    std::optional<std::filesystem::path> docker{};
 };
 
 class PythonInferenceProvider final : public InferenceProvider {
