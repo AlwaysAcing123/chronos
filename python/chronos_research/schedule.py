@@ -37,9 +37,11 @@ import numpy as np
 
 from chronos_research.artifacts import (
     CLASS_ORDER,
+    FEATURE_SET,
     ArtifactError,
     FeatureRow,
     Unavailable,
+    VerifiedArtifact,
     VerifiedSources,
     is_artifact_id,
     read_feature_rows,
@@ -55,6 +57,10 @@ SCHEMA = {"name": "chronos.inference_schedule", "version": "1"}
 # It names the version, never an experiment, and its model's information
 # cutoff, verified or declared, which must be at or before the window.
 REGISTERED_SCHEMA = {"name": "chronos.inference_schedule", "version": "2"}
+# A walk-forward fold model's schedule on one whole evaluation recording
+# (ADR 0022; walk_forward_schedule.py). It names the plan, fold, and fold
+# model, and no experiment, split, or labels; its window is explicit.
+FOLD_SCHEMA = {"name": "chronos.inference_schedule", "version": "3"}
 ROW_RECORD = {"name": "chronos.inference_row", "version": "1"}
 MANIFEST = "manifest.json"
 ROWS = "schedule.ndjson"
@@ -211,7 +217,7 @@ def logistic_predictions(
     return np.argmax(logits, axis=1).astype(np.int64), probabilities
 
 
-def _predict(
+def predict_rows(
     model: MajorityModel | LogisticModel, inputs: list[tuple[int, ...]]
 ) -> tuple[np.ndarray[Any, np.dtype[np.int64]], np.ndarray[Any, np.dtype[np.float64]]]:
     if isinstance(model, MajorityModel):
@@ -221,9 +227,15 @@ def _predict(
 
 def window_rows(sources: VerifiedSources, instrument: str, window: Window) -> list[FeatureRow]:
     """Every feature row of the instrument available in the window."""
+    return instrument_rows(sources.features, instrument, window)
+
+
+def instrument_rows(features: VerifiedArtifact, instrument: str, window: Window) -> list[FeatureRow]:
+    """Every feature row of the instrument in the window, from a verified
+    feature artifact read while hashing."""
     rows = [
         row
-        for row in read_feature_rows(sources.features)
+        for row in read_feature_rows(features)
         if row.identity.instrument == instrument and window.contains(row.available_at_ns)
     ]
     if not rows:
@@ -315,7 +327,7 @@ def build_schedule(
     rows = window_rows(sources, instrument, window)
     inputs = [exact_inputs(row) for row in rows]
     available = [value for value in inputs if not isinstance(value, Unavailable)]
-    classes, probabilities = _predict(model, available)
+    classes, probabilities = predict_rows(model, available)
     scheduled = scheduled_rows(
         rows, inputs, [(int(index), list(row)) for index, row in zip(classes, probabilities, strict=True)]
     )
@@ -411,6 +423,52 @@ def _check_registered_model(model: Any, training: Any, window: Window) -> None:
     require_cutoff_precedes(window, decode_integer(training["information_cutoff_ns"]))
 
 
+_FOLD_SOURCE_KEYS = {
+    "collection_id", "dataset_id", "feature_artifact_id", "feature_set", "features_sha256", "horizon_ns",
+    "stream",
+}  # fmt: skip
+_FOLD_MODEL_KEYS = {
+    "fold",
+    "fold_model_id",
+    "instrument",
+    "model_feature_set",
+    "name",
+    "parameters_sha256",
+    "plan_id",
+}
+_FOLD_TRAINING_KEYS = {"information_boundary_ns", "label_available_through_ns", "prediction_through_ns"}
+
+
+def _check_fold_provenance(manifest: Mapping[str, Any], window: Window) -> None:
+    """A version 3 schedule: a fold model on one whole recording, whose every
+    training prediction and label is strictly before an information boundary
+    at or before the window's start."""
+    source, model, training = manifest["source"], manifest["model"], manifest["training"]
+    _require_keys(source, _FOLD_SOURCE_KEYS, "the fold schedule's source")
+    _require_keys(model, _FOLD_MODEL_KEYS, "the fold model")
+    _require_keys(training, _FOLD_TRAINING_KEYS, "the fold model's training")
+    identifiers = (source["collection_id"], source["dataset_id"], source["feature_artifact_id"])
+    if not all(is_artifact_id(text) for text in (*identifiers, source["features_sha256"])):
+        raise ScheduleError("a fold schedule's source is named by its IDs and checksum")
+    if source["feature_set"] != FEATURE_SET or decode_integer(source["horizon_ns"]) <= 0:
+        raise ScheduleError("a fold schedule's features are top_of_book_v1, with a positive horizon")
+    if not all(is_artifact_id(model[key]) for key in ("fold_model_id", "parameters_sha256", "plan_id")):
+        raise ScheduleError("a fold model is named by its plan, fold model ID, and parameters checksum")
+    if model["name"] not in SCHEDULE_MODELS or decode_integer(model["fold"]) < 1:
+        raise ScheduleError("a fold model is a logistic or majority model of a fold numbered from 1")
+    if window.end_at_ns is None or window.end_at_ns <= window.start_at_ns or not window.name:
+        raise ScheduleError("a fold schedule's window is named and has an end after its start")
+    boundary = decode_integer(training["information_boundary_ns"])
+    if boundary > window.start_at_ns or not (
+        decode_integer(training["label_available_through_ns"]) < boundary
+        and decode_integer(training["prediction_through_ns"]) < boundary
+    ):
+        raise ScheduleError(
+            "the information boundary is after the window begins, or a training prediction or label is not "
+            "strictly before it"
+        )
+
+
 def verify_schedule(directory: Path) -> dict[str, Any]:
     """Checks a schedule's files, identity, checksum, and every row, and
     returns its manifest. It does not recompute the predictions; see
@@ -435,9 +493,10 @@ def _verify(directory: Path) -> dict[str, Any]:
             raise ScheduleError(f"{name} must be a regular file")
     manifest = _canonical((directory / MANIFEST).read_bytes(), MANIFEST)
     _require_keys(manifest, _MANIFEST_KEYS, MANIFEST)
-    if manifest["schema"] not in (SCHEMA, REGISTERED_SCHEMA) or manifest["row"] != ROW_RECORD:
+    if manifest["schema"] not in (SCHEMA, REGISTERED_SCHEMA, FOLD_SCHEMA) or manifest["row"] != ROW_RECORD:
         raise ScheduleError("unsupported schedule schema or row record")
     registered = manifest["schema"] == REGISTERED_SCHEMA
+    fold = manifest["schema"] == FOLD_SCHEMA
     if manifest["scope"] != SCOPE or manifest["class_order"] != list(CLASS_ORDER):
         raise ScheduleError("unsupported scope or class order")
     if manifest["inference"] != (REGISTERED_INFERENCE if registered else INFERENCE):
@@ -451,10 +510,12 @@ def _verify(directory: Path) -> dict[str, Any]:
         if manifest["window"]["end_at_ns"] is None
         else decode_integer(manifest["window"]["end_at_ns"]),
     )
-    if window.name not in WINDOWS or (window.end_at_ns is None) != (window.name == "test"):
-        raise ScheduleError(f"unsupported window {manifest['window']}")
     model = manifest["model"]
-    if registered:
+    if fold:
+        _check_fold_provenance(manifest, window)
+    elif window.name not in WINDOWS or (window.end_at_ns is None) != (window.name == "test"):
+        raise ScheduleError(f"unsupported window {manifest['window']}")
+    elif registered:
         _check_registered_model(model, manifest["training"], window)
     else:
         require_training_precedes(window, decode_integer(manifest["training"]["label_available_through_ns"]))

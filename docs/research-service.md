@@ -22,6 +22,12 @@ classifiers, and **comparisons** of several versions under one frozen
 specification. Their decisions are in
 [ADR 0021](decisions/0021-model-registry-imports-and-comparisons.md).
 
+It also runs **walk-forward evaluation**: collections of independent
+recordings, frozen plans, and studies that fit fresh models per fold and run
+them through the engine under fee and latency scenarios
+([walk-forward-evaluation.md](walk-forward-evaluation.md),
+[ADR 0022](decisions/0022-walk-forward-evaluation.md)).
+
 ## Running it
 
 ```sh
@@ -72,7 +78,15 @@ npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, defaul
 | `GET /api/v1/research/comparisons` | Published comparisons; ones that do not verify are under `invalid_entries` |
 | `POST /api/v1/research/comparisons` | Start a comparison (a `comparison` job) |
 | `GET /api/v1/research/comparisons/{comparison_id}` | One comparison, with each member's schedule and run verified again |
-| `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison` | Every job, newest first, optionally of one kind |
+| `GET /api/v1/research/collections` | Verified collections of recordings; ones that do not verify are under `invalid_entries` |
+| `GET /api/v1/research/collections/{collection_id}` | One collection: members, coverage, evidence, declared sessions, instrument counts |
+| `POST /api/v1/research/walk-forward/plans` | Preview: build and publish the plan of a request (a `walk_forward_plan` job) |
+| `GET /api/v1/research/walk-forward/plans` | Published plans |
+| `GET /api/v1/research/walk-forward/plans/{plan_id}` | One plan |
+| `POST /api/v1/research/walk-forward/studies` | Start a reviewed plan's study: `{"plan_id"}` (a `walk_forward` job) |
+| `GET /api/v1/research/walk-forward/studies` | Published studies |
+| `GET /api/v1/research/walk-forward/studies/{study_id}` | One study, with each fold model, schedule, and run verified again |
+| `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison\|walk_forward_plan\|walk_forward` | Every job, newest first, optionally of one kind |
 | `GET /api/v1/research/jobs/{job_id}` | One job of any kind |
 
 A run request names everything; nothing is defaulted silently:
@@ -162,9 +176,17 @@ The conventions are the paper-trading API's
   the child is running; exceeding the cap kills its process group and fails
   the job. Only the last 4 KiB of a job's log is kept.
 - **Kinds.** `evaluation` (`evaluate-strategy`), `registration`
-  (`register-model`), `import` (`import-model --staged`), and `comparison`
-  (`compare-models --spec`), each one fixed child command. `GET /runs` lists
-  evaluations only, as before; `GET /jobs` lists every kind.
+  (`register-model`), `import` (`import-model --staged`), `comparison`
+  (`compare-models --spec`), `walk_forward_plan` (`plan-walk-forward
+  --request`), and `walk_forward` (`run-walk-forward --plan --progress`),
+  each one fixed child command. `GET /runs` lists evaluations only, as
+  before; `GET /jobs` lists every kind.
+- **Progress.** A `walk_forward` job's child writes `{"progress": {...}}`
+  lines to stderr. The worker reads complete lines as they arrive: a line
+  that is a progress report (at most six known keys, each a short lowercase
+  token) replaces the job's `progress` and is saved; every other line stays
+  the bounded log, so an error still parses. Only walk-forward jobs show
+  `progress`, and an interrupted one keeps its last report.
 - **Sandbox containers.** An import or comparison job's child may start
   ONNX sandbox containers.
   - Each such job gets a supervisor token, recorded in its job record
@@ -189,8 +211,11 @@ The conventions are the paper-trading API's
     `non_finite_output`), `sandbox_unavailable`, and `sandbox_failed` (a
     timeout, an exit, or a reply outside the protocol);
   - `comparison_refused`;
-  - otherwise `registration_failed`, `import_failed`, or
-    `comparison_failed`.
+  - `plan_refused` (such as `insufficient_coverage`, `invalid_request`, or
+    `workload_exceeded`), `collection_refused`, and `study_refused` (such
+    as `source_invalid` when a source changed after review);
+  - otherwise `registration_failed`, `import_failed`,
+    `comparison_failed`, `plan_failed`, or `study_failed`.
 - **Deduplication.** An identical request, after canonicalization, returns
   the equal job when it is queued, running, or succeeded (`200`,
   `"deduplicated": true`). After a failure or an interruption it starts new
@@ -306,6 +331,35 @@ member's schedule and run (`verified`, or `invalid:` with why); the CLI's
 [strategy-evaluation.md](strategy-evaluation.md#registered-model-versions)
 and ADR 0021.
 
+## Walk-forward evaluation
+
+`POST /walk-forward/plans` takes `{"collection_id", "instrument",
+"minimum_training_sources", "configuration", "scenarios": [{"name",
+"fee_per_fill", "latency_ns"}]}`:
+- every field checked as an evaluation's: decimals and integers as
+  strings, canonicalized before deduplication;
+- a collection that exists, else `422 collection_not_found`;
+- the plan's rules (a base scenario with the configuration's own fee and
+  latency, a named stress scenario no cheaper and no faster, at most four
+  cells, values the engine holds exactly), else `422 invalid_configuration`
+  with the rule's reason.
+
+The service adds the request's schema, `chronos.walk_forward_request/1`, and
+queues a `walk_forward_plan` job: verifying the members runs the C++ tools,
+so even Preview never runs on a request thread. The job publishes the plan
+of exactly this request, content-addressed, or fails with why (too few
+recordings is `plan_refused` / `insufficient_coverage`, with the counts).
+
+`POST /walk-forward/studies` takes only `{"plan_id"}`, so a study is always
+the reviewed plan; an unknown plan is `422 plan_not_found`. Its
+`walk_forward` job verifies every source again and rebuilds the plan before
+anything runs, then runs every fold, model, and scenario, and publishes one
+`chronos.walk_forward_study/1`, complete or partial. A study's fold runs
+(`chronos.strategy_run/3`) open through `/results/{run_id}` and its
+decisions, trades, and equity like any run, and are listed by their study
+rather than under `/results`. See
+[walk-forward-evaluation.md](walk-forward-evaluation.md#http-contract).
+
 ## The Research view
 
 - **Navigation.** The header has four views: Trading, Models,
@@ -375,7 +429,9 @@ The chart draws the three equity curves over market time.
   `test_comparison_routes.py` cover the library, imports (with the real
   sandbox when it is available), and comparisons the same way: the request
   conventions, jobs and their refusals, persistence across a restart, and
-  corrupt artifacts. `test_registry.py`, `test_model_import.py`,
+  corrupt artifacts. `test_walk_forward_routes.py` covers collections,
+  Preview and Start jobs, deduplication, progress apart from the log, a
+  source changed after review, fold runs as results, and keyset paging. `test_registry.py`, `test_model_import.py`,
   `test_onnx_profile.py`, `test_onnx_sandbox.py`, `test_comparison.py`, and
   `test_registered_worker.py` cover the modules beneath them. The ONNX
   tests build their models at test time with the optional `onnx` package

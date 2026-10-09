@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { comparisonsHref, modelsHref, parseRoute, researchHref } from './route';
+import { comparisonsHref, modelsHref, parseRoute, researchHref, walkForwardHref } from './route';
 
 describe('parseRoute', () => {
   it('selects research only for its own hash and keeps section links in trading', () => {
@@ -26,5 +26,19 @@ describe('parseRoute', () => {
     expect(parseRoute('#/comparisons')).toEqual({ view: 'comparisons', comparisonId: null });
     expect(parseRoute(comparisonsHref('c'.repeat(64)))).toEqual({ view: 'comparisons', comparisonId: 'c'.repeat(64) });
     expect(parseRoute('#/comparisons/..%2Fmodels')).toEqual({ view: 'comparisons', comparisonId: null });
+  });
+
+  it('opens walk-forward evaluation, a reviewed plan, or a study inside Research', () => {
+    const home = { view: 'walk-forward', planId: null, studyId: null };
+    expect(parseRoute(walkForwardHref())).toEqual(home);
+    expect(parseRoute(walkForwardHref({ planId: 'd'.repeat(64) }))).toEqual({ ...home, planId: 'd'.repeat(64) });
+    expect(parseRoute(walkForwardHref({ studyId: 'e'.repeat(64) }))).toEqual({ ...home, studyId: 'e'.repeat(64) });
+    expect(walkForwardHref({ studyId: 'e'.repeat(64) })).toBe(`#/research/walk-forward/studies/${'e'.repeat(64)}`);
+    // Anything that is not an ID opens its home, never a path.
+    expect(parseRoute('#/research/walk-forward/plans/..%2F..%2Fetc')).toEqual(home);
+    expect(parseRoute(`#/research/walk-forward/studies/${'E'.repeat(64)}`)).toEqual(home);
+    expect(parseRoute('#/research/walk-forwardx')).toEqual({ view: 'research', resultId: null });
+    // The rest of Research is unchanged.
+    expect(parseRoute('#/research/results/x')).toEqual({ view: 'research', resultId: null });
   });
 });

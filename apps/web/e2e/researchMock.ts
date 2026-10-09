@@ -11,6 +11,21 @@ import {
   comparisonPageJson,
 } from '../src/test/comparisonFixtures';
 import { errorJson } from '../src/test/fixtures';
+import {
+  ONE_RECORDING_COLLECTION_ID,
+  PARTIAL_STUDY_ID,
+  PLAN_ID,
+  PLAN_JOB_ID,
+  STUDY_JOB_ID,
+  WEEK_COLLECTION_ID,
+  collectionJson,
+  collectionPageJson,
+  partialStudyDetailJson,
+  planJobJson,
+  planJson,
+  studyJobJson,
+  studyPageJson,
+} from '../src/test/walkForwardFixtures';
 import type { Json } from '../src/test/fixtures';
 import {
   IMPORTED_VERSION_ID,
@@ -51,6 +66,10 @@ export interface ResearchMockOptions {
   readonly corruptResult?: boolean;
   // The library already holds a registered and an imported AAPL version.
   readonly seededLibrary?: boolean;
+  // The only collection holds one recording, too few for a walk-forward study.
+  readonly oneRecording?: boolean;
+  // The study's fold 2 logistic base run journal no longer matches its manifest.
+  readonly corruptStudyRun?: boolean;
 }
 
 function reply(route: Route, status: number, body: unknown) {
@@ -79,6 +98,11 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
   // A comparison: queued, running, then published.
   let comparisonJob: Json | null = null;
   let comparisonPolls = 0;
+  // Walk-forward: a Preview job, then a study job reporting its folds.
+  let planJob: Json | null = null;
+  let planPolls = 0;
+  let studyJob: Json | null = null;
+  let studyPolls = 0;
 
   await page.route('**/api/v1/research/**', async (route) => {
     if (options.unreachable === true) {
@@ -225,6 +249,66 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
       const body = request.postDataJSON() as Json;
       lifecycle = { state: body.state, reason: body.reason, changed_at: '2026-10-07T20:01:00.000000000Z' };
       return reply(route, 200, { model_version_id: MODEL_VERSION_ID, lifecycle });
+    }
+    if (path === '/collections') {
+      return reply(
+        route,
+        200,
+        collectionPageJson(
+          options.oneRecording === true
+            ? [collectionJson(ONE_RECORDING_COLLECTION_ID)]
+            : [collectionJson(WEEK_COLLECTION_ID), collectionJson(ONE_RECORDING_COLLECTION_ID)],
+        ),
+      );
+    }
+    if (path === '/walk-forward/plans' && request.method() === 'POST') {
+      planJob = planJobJson({ request: request.postDataJSON() as Json, state: 'queued', result: null, finished_at: null });
+      planPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: planJob });
+    }
+    if (path === `/jobs/${PLAN_JOB_ID}` && planJob !== null) {
+      planPolls += 1;
+      planJob = planPolls === 1 ? { ...planJob, state: 'running' } : planJobJson({ request: planJob.request });
+      return reply(route, 200, { job: planJob });
+    }
+    if (path === `/walk-forward/plans/${PLAN_ID}`) {
+      return reply(route, 200, planJson());
+    }
+    if (path === '/walk-forward/studies' && request.method() === 'POST') {
+      studyJob = studyJobJson({ state: 'queued', progress: null, result: null, finished_at: null });
+      studyPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: studyJob });
+    }
+    if (path === `/jobs/${STUDY_JOB_ID}` && studyJob !== null) {
+      studyPolls += 1;
+      const progress = [
+        { stage: 'verify_sources' },
+        { fold: '1', folds: '2', stage: 'fold', step: 'fit' },
+        { fold: '2', folds: '2', model: 'logistic', scenario: 'stress', stage: 'fold', step: 'run' },
+      ][studyPolls - 1];
+      studyJob =
+        progress === undefined
+          ? studyJobJson({
+              result: { missing: '1', outcome: 'published', status: 'partial', study_id: PARTIAL_STUDY_ID },
+            })
+          : { ...studyJob, state: 'running', progress };
+      return reply(route, 200, { job: studyJob });
+    }
+    if (path === '/jobs' && url.searchParams.get('kind') === 'walk_forward') {
+      return reply(route, 200, { jobs: studyJob === null ? [] : [studyJob], next_cursor: null });
+    }
+    if (path === '/walk-forward/studies') {
+      const page = studyPageJson();
+      return reply(route, 200, studyJob?.state === 'succeeded' ? page : { ...page, studies: [] });
+    }
+    if (path === `/walk-forward/studies/${PARTIAL_STUDY_ID}`) {
+      const detail = partialStudyDetailJson();
+      if (options.corruptStudyRun === true) {
+        const [, second] = detail.artifacts as Json[];
+        const runs = ((second?.models as Record<string, Json>).logistic as { runs: Record<string, string> }).runs;
+        runs.base = 'invalid: journal.ndjson differs from its manifest’s checksum';
+      }
+      return reply(route, 200, detail);
     }
     if (path === '/results') {
       return reply(route, 200, { results: published() ? [resultListingJson()] : [], invalid_entries: [], next_cursor: null });

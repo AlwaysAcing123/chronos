@@ -132,68 +132,19 @@ InstrumentId model_instrument(ObjectFields& entry) {
     return InstrumentId(instrument.empty() ? std::string("unset") : instrument);
 }
 
-struct ParsedManifest {
-    ScheduleManifest manifest;
-    std::map<std::string, std::uint64_t> classes;
-    std::map<std::string, std::uint64_t> unavailable;
-};
+// The stream a source block names.
+void parse_stream(ObjectFields& entry, ScheduleManifest& manifest) {
+    const std::string stream = entry.string("stream");
+    if (entry.ok() && !stream.empty()) {
+        manifest.stream = MarketDataStreamId(stream);
+    } else if (entry.ok()) {
+        entry.fail(DatasetErrorCode::InvalidValue, "stream", "must not be empty");
+    }
+}
 
-std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes) {
-    auto document = datasets::parse_canonical_document(bytes, datasets::kArtifactManifestFileName);
-    if (auto* error = std::get_if<DatasetError>(&document)) {
-        return std::move(*error);
-    }
-    const json::Value& value = std::get<json::Value>(document);
-    ObjectFields fields(value, "manifest");
-    const std::string version = datasets::require_name_and_one_of_versions(
-        fields, "schema", kScheduleSchemaName, {kExperimentScheduleVersion, kRegisteredScheduleVersion}
-    );
-    if (!fields.ok()) {
-        return *fields.error();
-    }
-    const bool registered = version == kRegisteredScheduleVersion;
-    fields.require_keys({
-        "artifact_id", "class_order", "counts", "environment", "files", "inference", "model", "row", "schema",
-        "scope", "source", "training", "window",
-    });
-    datasets::require_name_version(fields, "row", kScheduleRowRecordName, kScheduleRowRecordVersion);
-    require_value(fields, "inference", inference_definition(registered), "is not the inference definition this runner reads");
-    if (fields.ok() && fields.string_array("class_order") != std::vector<std::string>(kClassOrder.begin(), kClassOrder.end())) {
-        fields.fail(DatasetErrorCode::UnsupportedVersion, "class_order", "must be down, flat, up");
-    }
-    if (fields.ok() && fields.string("scope").empty()) {
-        fields.fail(DatasetErrorCode::InvalidValue, "scope", "must not be empty");
-    }
-    if (const json::Object* environment = fields.object("environment"); environment != nullptr) {
-        for (const auto& [name, entry] : *environment) {
-            if (entry.if_string() == nullptr) {
-                fields.fail(DatasetErrorCode::InvalidValue, "environment", "every entry must be a string");
-                break;
-            }
-        }
-    }
-    ParsedManifest parsed{
-        .manifest = ScheduleManifest{
-            .artifact_id = fields.sha256("artifact_id"),
-            .dataset_id = {},
-            .stream = MarketDataStreamId("unset"),
-            .feature_artifact_id = {},
-            .features_sha256 = {},
-            .label_artifact_id = {},
-            .split_artifact_id = {},
-            .horizon_ns = 0,
-            .instrument = InstrumentId("unset"),
-            .model = {},
-            .window = {},
-            .rows = 0,
-            .predicted = 0,
-            .schedule = {},
-        },
-        .classes = {},
-        .unavailable = {},
-    };
-    ScheduleManifest& manifest = parsed.manifest;
-
+// Versions 1 and 2: the verified split's sources, model, window (the split's
+// validation or test window), and the model's training bound.
+void parse_split_provenance(ObjectFields& fields, ScheduleManifest& manifest, bool registered) {
     Timestamp validation_start;
     Timestamp test_start;
     {
@@ -216,12 +167,7 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
         manifest.horizon_ns = entry.signed_integer("horizon_ns");
         validation_start = entry.timestamp("validation_start_at_ns");
         test_start = entry.timestamp("test_start_at_ns");
-        const std::string stream = entry.string("stream");
-        if (entry.ok() && !stream.empty()) {
-            manifest.stream = MarketDataStreamId(stream);
-        } else if (entry.ok()) {
-            entry.fail(DatasetErrorCode::InvalidValue, "stream", "must not be empty");
-        }
+        parse_stream(entry, manifest);
         source.finish();
     }
     if (registered) {
@@ -292,6 +238,154 @@ std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes
                 "the model's information cutoff is after the window begins"
             );
         }
+    }
+}
+
+// Version 3: a walk-forward fold model on one whole evaluation recording.
+// The source is the collection and the recording's dataset and features; it
+// has no labels and no split. The window is explicit and has an end. The
+// boundary may not be after the window's start, and every training
+// prediction and label time is strictly before the boundary.
+void parse_fold_provenance(ObjectFields& fields, ScheduleManifest& manifest) {
+    FoldScheduleModel model;
+    {
+        datasets::NestedFields source(fields, "source", {
+            "collection_id", "dataset_id", "feature_artifact_id", "feature_set", "features_sha256", "horizon_ns",
+            "stream",
+        });
+        ObjectFields& entry = source.fields();
+        model.collection_id = entry.sha256("collection_id");
+        manifest.dataset_id = entry.sha256("dataset_id");
+        manifest.feature_artifact_id = entry.sha256("feature_artifact_id");
+        manifest.features_sha256 = entry.sha256("features_sha256");
+        entry.constant("feature_set", "top_of_book_v1");
+        manifest.horizon_ns = entry.signed_integer("horizon_ns");
+        if (entry.ok() && manifest.horizon_ns <= 0) {
+            entry.fail(DatasetErrorCode::InvalidValue, "horizon_ns", "must be positive");
+        }
+        parse_stream(entry, manifest);
+        source.finish();
+    }
+    {
+        datasets::NestedFields block(fields, "model", {
+            "fold", "fold_model_id", "instrument", "model_feature_set", "name", "parameters_sha256", "plan_id",
+        });
+        ObjectFields& entry = block.fields();
+        model.plan_id = entry.sha256("plan_id");
+        model.fold_model_id = entry.sha256("fold_model_id");
+        model.parameters_sha256 = entry.sha256("parameters_sha256");
+        model.fold = entry.unsigned_integer("fold");
+        model.name = entry.string("name");
+        if (entry.ok() && (model.fold == 0 || (model.name != "logistic" && model.name != "majority"))) {
+            entry.fail(DatasetErrorCode::InvalidValue, "name", "a fold is numbered from 1 and its model is logistic or majority");
+        }
+        manifest.instrument = model_instrument(entry);
+        block.finish();
+    }
+    {
+        datasets::NestedFields window(fields, "window", {"end_at_ns", "name", "start_at_ns"});
+        ObjectFields& entry = window.fields();
+        manifest.window = ScheduleWindow{
+            .name = entry.string("name"),
+            .start_at = entry.timestamp("start_at_ns"),
+            .end_at = entry.timestamp("end_at_ns"),
+        };
+        if (entry.ok() && (manifest.window.name.empty() || *manifest.window.end_at <= manifest.window.start_at)) {
+            entry.fail(DatasetErrorCode::InvalidValue, "window", "must be named and end after it starts");
+        }
+        window.finish();
+    }
+    {
+        datasets::NestedFields training(fields, "training", {
+            "information_boundary_ns", "label_available_through_ns", "prediction_through_ns",
+        });
+        ObjectFields& entry = training.fields();
+        model.information_boundary = entry.timestamp("information_boundary_ns");
+        model.training_labels_available_through = entry.timestamp("label_available_through_ns");
+        model.training_predictions_through = entry.timestamp("prediction_through_ns");
+        training.finish();
+    }
+    if (fields.ok() && (model.information_boundary > manifest.window.start_at ||
+                        model.training_labels_available_through >= model.information_boundary ||
+                        model.training_predictions_through >= model.information_boundary)) {
+        fields.fail(
+            DatasetErrorCode::LabelLeakage,
+            "training",
+            "the information boundary is after the window begins, or a training prediction or label is not "
+            "strictly before it"
+        );
+    }
+    manifest.model = std::move(model);
+}
+
+struct ParsedManifest {
+    ScheduleManifest manifest;
+    std::map<std::string, std::uint64_t> classes;
+    std::map<std::string, std::uint64_t> unavailable;
+};
+
+std::variant<ParsedManifest, DatasetError> parse_manifest(std::string_view bytes) {
+    auto document = datasets::parse_canonical_document(bytes, datasets::kArtifactManifestFileName);
+    if (auto* error = std::get_if<DatasetError>(&document)) {
+        return std::move(*error);
+    }
+    const json::Value& value = std::get<json::Value>(document);
+    ObjectFields fields(value, "manifest");
+    const std::string version = datasets::require_name_and_one_of_versions(
+        fields, "schema", kScheduleSchemaName,
+        {kExperimentScheduleVersion, kRegisteredScheduleVersion, kFoldScheduleVersion}
+    );
+    if (!fields.ok()) {
+        return *fields.error();
+    }
+    const bool registered = version == kRegisteredScheduleVersion;
+    const bool fold = version == kFoldScheduleVersion;
+    fields.require_keys({
+        "artifact_id", "class_order", "counts", "environment", "files", "inference", "model", "row", "schema",
+        "scope", "source", "training", "window",
+    });
+    datasets::require_name_version(fields, "row", kScheduleRowRecordName, kScheduleRowRecordVersion);
+    require_value(fields, "inference", inference_definition(registered), "is not the inference definition this runner reads");
+    if (fields.ok() && fields.string_array("class_order") != std::vector<std::string>(kClassOrder.begin(), kClassOrder.end())) {
+        fields.fail(DatasetErrorCode::UnsupportedVersion, "class_order", "must be down, flat, up");
+    }
+    if (fields.ok() && fields.string("scope").empty()) {
+        fields.fail(DatasetErrorCode::InvalidValue, "scope", "must not be empty");
+    }
+    if (const json::Object* environment = fields.object("environment"); environment != nullptr) {
+        for (const auto& [name, entry] : *environment) {
+            if (entry.if_string() == nullptr) {
+                fields.fail(DatasetErrorCode::InvalidValue, "environment", "every entry must be a string");
+                break;
+            }
+        }
+    }
+    ParsedManifest parsed{
+        .manifest = ScheduleManifest{
+            .artifact_id = fields.sha256("artifact_id"),
+            .dataset_id = {},
+            .stream = MarketDataStreamId("unset"),
+            .feature_artifact_id = {},
+            .features_sha256 = {},
+            .label_artifact_id = {},
+            .split_artifact_id = {},
+            .horizon_ns = 0,
+            .instrument = InstrumentId("unset"),
+            .model = {},
+            .window = {},
+            .rows = 0,
+            .predicted = 0,
+            .schedule = {},
+        },
+        .classes = {},
+        .unavailable = {},
+    };
+    ScheduleManifest& manifest = parsed.manifest;
+
+    if (fold) {
+        parse_fold_provenance(fields, manifest);
+    } else {
+        parse_split_provenance(fields, manifest, registered);
     }
     {
         datasets::NestedFields counts(fields, "counts", {"classes", "predicted", "rows", "unavailable"});

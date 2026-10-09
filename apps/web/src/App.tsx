@@ -18,6 +18,10 @@ const Models = lazy(() => import('./components/models/Models').then((module) => 
 const Comparisons = lazy(() =>
   import('./components/comparisons/Comparisons').then((module) => ({ default: module.Comparisons })),
 );
+// Walk-forward evaluation is part of Research, loaded when opened.
+const WalkForward = lazy(() =>
+  import('./components/walkForward/WalkForward').then((module) => ({ default: module.WalkForward })),
+);
 
 export function App() {
   const selection = useAccountSelection();
@@ -26,7 +30,7 @@ export function App() {
   return (
     <MarketDataStreamProvider>
       <AppShell
-        view={route.view}
+        view={route.view === 'walk-forward' ? 'research' : route.view}
         accountContext={
           accountId === null ? null : <AccountContext accountId={accountId} onSwitch={selection.closeAccount} />
         }
@@ -38,6 +42,10 @@ export function App() {
         ) : route.view === 'comparisons' ? (
           <Suspense fallback={<p role="status">Loading comparisons…</p>}>
             <Comparisons comparisonId={route.comparisonId} />
+          </Suspense>
+        ) : route.view === 'walk-forward' ? (
+          <Suspense fallback={<p role="status">Loading walk-forward evaluation…</p>}>
+            <WalkForward planId={route.planId} studyId={route.studyId} />
           </Suspense>
         ) : route.view === 'research' ? (
           // Research changes the account selection only when asked to open

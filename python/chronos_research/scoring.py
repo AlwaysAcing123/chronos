@@ -17,7 +17,7 @@ quality, kept apart from the strategy's trading results.
 
 import json
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,9 +65,21 @@ def window_labels(sources: VerifiedSources, instrument: str, window_name: str) -
     return WindowLabels(truth, dict(data.excluded[window_name].get(instrument, Counter())))
 
 
-def score_schedule(rows: bytes, labels: WindowLabels) -> dict[str, Any]:
-    """The classification metrics of a schedule's scorable rows, and the
-    count of every row by whether and why it was scored."""
+@dataclass(frozen=True)
+class ScoredRows:
+    """A schedule's scored rows, in schedule order, and how many of its
+    rows were scheduled and left out, by reason."""
+
+    truth: list[int]
+    predicted: list[int]
+    probabilities: list[list[float]]
+    scheduled: int
+    not_scored: Mapping[str, int]
+
+
+def scored_rows(rows: bytes, labels: WindowLabels) -> ScoredRows:
+    """Joins a schedule's rows to the window's labels by identity, after
+    checking they are exactly the window's rows."""
     scheduled: set[RowIdentity] = set()
     truth: list[int] = []
     predicted: list[int] = []
@@ -94,17 +106,44 @@ def score_schedule(rows: bytes, labels: WindowLabels) -> dict[str, Any]:
         raise ScoringError(f"{len(missing)} labelled rows of the window are not in the schedule")
     if len(scheduled) != len(truth) + sum(labels.not_scored.values()):
         raise ScoringError("the schedule's rows are not the window's rows")
+    return ScoredRows(truth, predicted, probabilities, len(scheduled), dict(labels.not_scored))
+
+
+def scores(scored: ScoredRows) -> dict[str, Any]:
+    """The classification metrics of scored rows, and every row's count."""
+    rows = len(scored.truth)
     return {
         "metrics": classification_metrics(
-            np.array(truth, dtype=np.int64),
-            np.array(predicted, dtype=np.int64),
-            np.array(probabilities, dtype=np.float64).reshape(len(truth), len(CLASS_ORDER)),
+            np.array(scored.truth, dtype=np.int64),
+            np.array(scored.predicted, dtype=np.int64),
+            np.array(scored.probabilities, dtype=np.float64).reshape(rows, len(CLASS_ORDER)),
         ),
         "rows": {
             "not_scored": {
-                reason: encode_integer(count) for reason, count in sorted(labels.not_scored.items())
+                reason: encode_integer(count) for reason, count in sorted(scored.not_scored.items())
             },
-            "scheduled": encode_integer(len(scheduled)),
-            "scored": encode_integer(len(truth)),
+            "scheduled": encode_integer(scored.scheduled),
+            "scored": encode_integer(rows),
         },
     }
+
+
+def pooled(parts: Sequence[ScoredRows]) -> ScoredRows:
+    """Several schedules' scored rows as one sample, in order: metrics of
+    it weight every scored row equally, never every schedule."""
+    not_scored: Counter[str] = Counter()
+    for part in parts:
+        not_scored.update(part.not_scored)
+    return ScoredRows(
+        truth=[value for part in parts for value in part.truth],
+        predicted=[value for part in parts for value in part.predicted],
+        probabilities=[value for part in parts for value in part.probabilities],
+        scheduled=sum(part.scheduled for part in parts),
+        not_scored=dict(not_scored),
+    )
+
+
+def score_schedule(rows: bytes, labels: WindowLabels) -> dict[str, Any]:
+    """The classification metrics of a schedule's scorable rows, and the
+    count of every row by whether and why it was scored."""
+    return scores(scored_rows(rows, labels))

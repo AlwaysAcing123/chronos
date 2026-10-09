@@ -347,6 +347,45 @@ cash, buy and hold, and the first completed member. `inspect-comparison`
 verifies it and replays every member's run. The research service runs the
 same as a `comparison` job ([research-service.md](research-service.md#comparisons)).
 
+## Walk-forward fold models
+
+A walk-forward study ([walk-forward-evaluation.md](walk-forward-evaluation.md),
+[ADR 0022](decisions/0022-walk-forward-evaluation.md)) predicts with fold
+models fitted on earlier recordings, under a third version of each artifact.
+Versions 1 and 2 keep their exact bytes, readers, and meaning.
+
+### Schedule version 3
+
+`walk_forward_schedule.py` publishes `chronos.inference_schedule/3`. Its rows,
+row record, and row-pure inference are version 1's; only its provenance
+differs:
+- **`source`**: the collection, and the evaluation recording's dataset,
+  features, feature checksum, horizon, and stream. There are no labels and
+  no split.
+- **`model`**: the plan, fold, fold model, model name (`majority` or
+  `logistic`), instrument, model feature set, and parameters checksum.
+- **`training`**: the information boundary and the latest training
+  prediction and label-availability times, each strictly before it.
+- **`window`**: the fold's explicit half-open window, `fold_<k>`.
+
+Every feature row of the instrument in the window is predicted, labelled or
+not; the builder has no label argument. The Python and C++ readers accept
+version 3 on a separate branch with exact keys: a boundary after the
+window's start, a training time at or after the boundary, a split or label
+reference, or an unknown model is refused, the training times as
+`LabelLeakage` by the runner.
+
+### Strategy run version 3
+
+A version 3 schedule gives `chronos.strategy_run/3`, whose `source` names the
+collection, dataset, events and feature checksums, plan, fold, fold model,
+model, parameters checksum, schedule and its checksum, stream, the
+information boundary, and the training prediction and label bounds. The
+runner reads it exactly as the others: it recomputes every row's identity,
+time, inputs, coverage, and order from the dataset. A study runs each
+schedule once per scenario with only `--fee-per-fill` and `--latency-ns`
+changed, and replays each run with `inspect --catalog --schedules`.
+
 ## Hand-checked example
 
 The AAPL validation run (`9ca24b58…cba1`) was recomputed by a standalone
@@ -412,5 +451,6 @@ that trades exactly as the logistic model it came from.
   market impact, borrow, or exchange fees.
 - **Assumed costs.** A flat fee per fill, and a fixed latency with no
   jitter.
-- **Thin evidence.** One short session per result: no walk-forward, no
-  confidence intervals.
+- **Thin evidence.** One short session per result. Walk-forward studies
+  span several recordings, but only synthetic ones exist so far; there are
+  no confidence intervals.

@@ -325,6 +325,51 @@ their verified results, kept separate from the trading API:
 See [research-service.md](research-service.md) for the service, the flow, and
 the charting boundary.
 
+### Walk-forward evaluation
+
+Walk-forward evaluation is part of Research, not another dashboard:
+`#/research/walk-forward`, `#/research/walk-forward/plans/<plan-id>` for a
+reviewed plan, and `#/research/walk-forward/studies/<study-id>` for a study,
+each reopened by a reload or a link, with the Research tab selected. It is
+loaded when opened, never changes the account selection, and uses the
+`ResearchClient` with the decoders in `src/api/walkForwardSchemas.ts` and the
+hooks in `src/state/walkForward.ts`.
+
+- **Collections.** Each verified collection, labelled synthetic or observed,
+  with every member's stream, declared session label, receive time, partial
+  coverage, and rows per instrument.
+- **Plan.** Choose a collection, instrument, how many recordings the
+  earliest fold trains on, the configuration, a labelled stress scenario,
+  and, only if selected, a zero-fee reference. With too few recordings the
+  form says how many exist and how many are needed, and Preview is
+  disabled. Preview sends exactly the request shown and is followed until
+  its plan is published.
+- **Review and Start.** The plan page shows every fold's training
+  recordings, eligible and excluded rows, class support, latest training
+  label, exclusive information boundary, and evaluation recording, then the
+  frozen scenarios, configuration, rules, and limits. Start sends only the
+  plan's ID and follows the job's stage and fold.
+- **Study.** Synthetic and partial alerts first, then trading results per
+  fold, model, and scenario (exact strings, each run's own benchmark
+  differences, and a link to its journal in the result view), totals over
+  reset accounts (complete, or unavailable with what is missing, and a
+  partial total that names its folds), prediction quality per fold and
+  pooled in its own panel, the fold models and artifact checks, and how to
+  reproduce it. The browser does no arithmetic on figures.
+- **Verification.** Each run, schedule, and fold model shows the service's
+  check, read again on every load (Verifies, Does not verify with why, or Not
+  checked). If anything does not, the page says so before anything else, a
+  completed run resting on it is "Completed, unverified", and every total or
+  pooled score that includes it is labelled unverified; the recorded figures
+  stay visible, never rewritten.
+- **Phones.** Every table row names its fold, model, and scenario, and every
+  cell is labelled, so each figure on a card is identified. Tables wider
+  than their panel scroll in a named, keyboard-focusable region on desktop.
+
+The result view reads fold runs too (window `Fold <k>`, the information
+boundary and training bounds, and the plan, fold, and fold model, with no
+labels or split).
+
 ### Model deployments
 
 Research also deploys a model to a paper account
@@ -496,6 +541,15 @@ Before the first browser run: `npx playwright install chromium`.
   an empty catalog, axe, and a stricter overflow check against the client
   width. `e2e/research-live.spec.ts` is the opt-in run against a real
   research service (`CHRONOS_WEB_LIVE_RESEARCH=1`).
+- **Walk-forward browser tests** (`e2e/walkForward.spec.ts`) plan, review,
+  reload, start, follow, and read a study inside Research and return to the
+  same account, keyboard-only where it matters; show why one recording
+  cannot start a study; and handle an unreachable service, with axe and the
+  overflow check on desktop and mobile. `e2e/walkForward-live.spec.ts` is the
+  opt-in run against a real, isolated service
+  ([walk-forward-evaluation.md](walk-forward-evaluation.md#tests-and-evidence)).
+  The mocked responses (`src/test/walkForwardFixtures.ts`) were captured from
+  the real service over synthetic recordings.
 - **Models and comparisons browser tests** (`e2e/models.spec.ts`,
   `e2e/comparisons.spec.ts`) register, open, and archive a version; import
   an ONNX model through review; and compare two versions through review to

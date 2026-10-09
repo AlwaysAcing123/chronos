@@ -265,7 +265,33 @@ const RegisteredRunSourceSchema = z.object({
   payload_sha256: z.string(),
   information_cutoff: z.object({ at: TimestampSchema, basis: z.enum(['verified', 'declared']) }),
 });
-export type RunSource = z.infer<typeof ExperimentRunSourceSchema> | z.infer<typeof RegisteredRunSourceSchema>;
+// A version 3 run, of a walk-forward fold model (ADR 0022): it names its
+// plan, fold, and collection, and no labels or split.
+const FoldRunSourceSchema = z.object({
+  collection_id: ArtifactIdSchema,
+  dataset_id: ArtifactIdSchema,
+  events_sha256: z.string(),
+  feature_artifact_id: ArtifactIdSchema,
+  fold: UnsignedIntegerSchema,
+  fold_model_id: ArtifactIdSchema,
+  information_boundary: TimestampSchema,
+  instrument: z.string(),
+  model: ModelNameSchema,
+  parameters_sha256: z.string(),
+  plan_id: ArtifactIdSchema,
+  schedule_id: ArtifactIdSchema,
+  schedule_sha256: z.string(),
+  stream: z.string(),
+  training_labels_available_through: TimestampSchema,
+  training_predictions_through: TimestampSchema,
+});
+export type FoldRunSource = z.infer<typeof FoldRunSourceSchema>;
+export type RunSource =
+  | z.infer<typeof ExperimentRunSourceSchema>
+  | z.infer<typeof RegisteredRunSourceSchema>
+  | FoldRunSource;
+// A split's window, or a walk-forward fold's whole evaluation recording.
+export const ResultWindowNameSchema = z.union([WindowNameSchema, z.string().regex(/^fold_[1-9][0-9]*$/)]);
 
 export const ResultSchema = z.object({
   run_id: ArtifactIdSchema,
@@ -312,9 +338,9 @@ export const ResultSchema = z.object({
     after_window_unused: UnsignedIntegerSchema,
     schedule_rows: UnsignedIntegerSchema,
   }),
-  source: z.union([ExperimentRunSourceSchema, RegisteredRunSourceSchema]),
+  source: z.union([ExperimentRunSourceSchema, RegisteredRunSourceSchema, FoldRunSourceSchema]),
   window: z.object({
-    name: WindowNameSchema,
+    name: ResultWindowNameSchema,
     start_at: TimestampSchema,
     end_at: TimestampSchema.nullable(),
     first_event_at: TimestampSchema.nullable(),

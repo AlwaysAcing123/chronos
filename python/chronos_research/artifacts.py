@@ -104,7 +104,7 @@ def is_artifact_id(text: str) -> bool:
     return len(text) == _ARTIFACT_ID_LENGTH and all(c in "0123456789abcdef" for c in text)
 
 
-def _inspect(tool: Path, arguments: Sequence[str]) -> Mapping[str, Any]:
+def _inspect(tool: Path, arguments: Sequence[str], key: str = "artifact") -> Mapping[str, Any]:
     try:
         completed = subprocess.run(
             [str(tool), *arguments], capture_output=True, text=True, check=False, timeout=3600
@@ -122,7 +122,7 @@ def _inspect(tool: Path, arguments: Sequence[str]) -> Mapping[str, Any]:
         document = json.loads(completed.stdout)
     except ValueError as error:
         raise ArtifactError("the verifier's output is not JSON") from error
-    if not isinstance(document, dict) or not isinstance(document.get("artifact"), dict):
+    if not isinstance(document, dict) or not isinstance(document.get(key), dict):
         raise ArtifactError("the verifier's output has an unexpected shape")
     return document
 
@@ -190,6 +190,48 @@ def _verify_sources(
     if split["split_set"] != {"name": "chronological_purged", "version": "1"}:
         raise ArtifactError(f"unsupported split set {split['split_set']}")
     source = split["source"]
+    label_document, feature_document = _verify_labels_and_features(
+        tool, features_root, labels_root, source["label_artifact_id"], catalog
+    )
+    labels = label_document["artifact"]
+    features = feature_document["artifact"]
+    ancestry = {
+        "split -> label artifact": (source["label_artifact_id"], labels["artifact_id"]),
+        "split -> labels checksum": (source["labels_sha256"], labels["labels_sha256"]),
+        "split -> feature artifact": (source["feature_artifact_id"], features["artifact_id"]),
+        "split -> dataset": (source["dataset_id"], features["source"]["dataset_id"]),
+        "split -> horizon": (source["horizon_ns"], labels["horizon_ns"]),
+        "stream": (source["stream"], features["source"]["stream"]),
+        "rows": (split["counts"]["rows"], labels["rows"]),
+    }
+    _require_ancestry(ancestry)
+    if not str(split_document["reproduced"]).startswith("recomputed"):
+        raise ArtifactError("the split artifact was not reproduced from its source")
+
+    return VerifiedSources(
+        dataset_id=features["source"]["dataset_id"],
+        stream=features["source"]["stream"],
+        horizon_ns=int(labels["horizon_ns"]),
+        features=_verified(feature_document, features_root, "features.ndjson", features["features_sha256"]),
+        labels=_verified(label_document, labels_root, "labels.ndjson", labels["labels_sha256"]),
+        splits=_verified(split_document, splits_root, "splits.ndjson", split["files"]["splits"]["sha256"]),
+        validation_start_at_ns=int(split["boundaries"]["validation_start"]["prediction_at_ns"]),
+        test_start_at_ns=int(split["boundaries"]["test_start"]["prediction_at_ns"]),
+    )
+
+
+def _require_ancestry(ancestry: Mapping[str, tuple[Any, Any]]) -> None:
+    for relation, (claimed, actual) in ancestry.items():
+        if claimed != actual:
+            raise ArtifactError(f"artifact ancestry does not match ({relation}): {claimed} != {actual}")
+
+
+def _verify_labels_and_features(
+    tool: Path, features_root: Path, labels_root: Path, label_artifact_id: str, catalog: Path | None
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """A label artifact reproduced from its feature artifact, and that
+    feature artifact, reproduced from its dataset when `catalog` is given,
+    with their ancestry cross-checked: the verifier documents of both."""
     label_document = _inspect(
         tool,
         [
@@ -198,7 +240,7 @@ def _verify_sources(
             "--output",
             str(labels_root),
             "--artifact",
-            source["label_artifact_id"],
+            label_artifact_id,
             "--features",
             str(features_root),
         ],
@@ -216,41 +258,86 @@ def _verify_sources(
         feature_arguments += ["--catalog", str(catalog)]
     feature_document = _inspect(tool, feature_arguments)
     features = feature_document["artifact"]
-
     if labels["label_set"] != LABEL_SET or features["feature_set"] != FEATURE_SET:
         raise ArtifactError(
             f"unsupported label set {labels['label_set']} or feature set {features['feature_set']}"
         )
-    ancestry = {
-        "split -> label artifact": (source["label_artifact_id"], labels["artifact_id"]),
-        "split -> labels checksum": (source["labels_sha256"], labels["labels_sha256"]),
-        "split -> feature artifact": (source["feature_artifact_id"], features["artifact_id"]),
-        "label -> features checksum": (labels["source"]["features_sha256"], features["features_sha256"]),
-        "split -> dataset": (source["dataset_id"], features["source"]["dataset_id"]),
-        "label -> dataset": (labels["source"]["dataset_id"], features["source"]["dataset_id"]),
-        "split -> horizon": (source["horizon_ns"], labels["horizon_ns"]),
-        "stream": (source["stream"], features["source"]["stream"]),
-        "label stream": (labels["source"]["stream"], features["source"]["stream"]),
-        "rows": (split["counts"]["rows"], labels["rows"]),
-        "label rows": (labels["rows"], features["rows"]),
-    }
-    for relation, (claimed, actual) in ancestry.items():
-        if claimed != actual:
-            raise ArtifactError(f"artifact ancestry does not match ({relation}): {claimed} != {actual}")
-    for name, document in (("split", split_document), ("label", label_document)):
-        if not str(document["reproduced"]).startswith("recomputed"):
-            raise ArtifactError(f"the {name} artifact was not reproduced from its source")
-
-    return VerifiedSources(
-        dataset_id=features["source"]["dataset_id"],
-        stream=features["source"]["stream"],
-        horizon_ns=int(labels["horizon_ns"]),
-        features=_verified(feature_document, features_root, "features.ndjson", features["features_sha256"]),
-        labels=_verified(label_document, labels_root, "labels.ndjson", labels["labels_sha256"]),
-        splits=_verified(split_document, splits_root, "splits.ndjson", split["files"]["splits"]["sha256"]),
-        validation_start_at_ns=int(split["boundaries"]["validation_start"]["prediction_at_ns"]),
-        test_start_at_ns=int(split["boundaries"]["test_start"]["prediction_at_ns"]),
+    _require_ancestry(
+        {
+            "label -> features checksum": (labels["source"]["features_sha256"], features["features_sha256"]),
+            "label -> dataset": (labels["source"]["dataset_id"], features["source"]["dataset_id"]),
+            "label stream": (labels["source"]["stream"], features["source"]["stream"]),
+            "label rows": (labels["rows"], features["rows"]),
+        }
     )
+    if not str(label_document["reproduced"]).startswith("recomputed"):
+        raise ArtifactError("the label artifact was not reproduced from its source")
+    return label_document, feature_document
+
+
+@dataclass(frozen=True)
+class VerifiedRecording:
+    """One recording's dataset, feature artifact, and label artifact, each
+    verified completely by the C++ tool and reproduced from its source."""
+
+    dataset_id: str
+    stream: str
+    horizon_ns: int
+    features: VerifiedArtifact
+    labels: VerifiedArtifact
+    # The verifier's dataset summary and the dataset's manifest.
+    dataset: Mapping[str, Any]
+    dataset_manifest: Mapping[str, Any]
+
+
+def verify_recording(
+    tool: Path, *, catalog: Path, features_root: Path, labels_root: Path, label_artifact_id: str
+) -> VerifiedRecording:
+    """Verifies a label artifact, its feature artifact, and its dataset, each
+    from its source, and cross-checks the whole ancestry."""
+    if not is_artifact_id(label_artifact_id):
+        raise ArtifactError("a label artifact ID is 64 lowercase hexadecimal digits")
+    try:
+        label_document, feature_document = _verify_labels_and_features(
+            tool, features_root, labels_root, label_artifact_id, catalog
+        )
+        labels = label_document["artifact"]
+        features = feature_document["artifact"]
+        if not str(feature_document["reproduced"]).startswith("recomputed"):
+            raise ArtifactError("the feature artifact was not reproduced from its dataset")
+        dataset_document = _inspect(
+            tool,
+            ["inspect", "--catalog", str(catalog), "--dataset", features["source"]["dataset_id"]],
+            key="dataset",
+        )
+        dataset = dataset_document["dataset"]
+        manifest = dataset_document["manifest"]
+        _require_ancestry(
+            {
+                "features -> dataset": (features["source"]["dataset_id"], dataset["dataset_id"]),
+                "features -> events checksum": (
+                    features["source"]["events_sha256"],
+                    manifest["files"]["events"]["sha256"],
+                ),
+                "features -> stream": (features["source"]["stream"], dataset["stream"]),
+                "dataset manifest": (manifest["dataset_id"], dataset["dataset_id"]),
+            }
+        )
+        return VerifiedRecording(
+            dataset_id=dataset["dataset_id"],
+            stream=dataset["stream"],
+            horizon_ns=int(labels["horizon_ns"]),
+            features=_verified(
+                feature_document, features_root, "features.ndjson", features["features_sha256"]
+            ),
+            labels=_verified(label_document, labels_root, "labels.ndjson", labels["labels_sha256"]),
+            dataset=dataset,
+            dataset_manifest=manifest,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactError(
+            f"the verifier's output has an unexpected shape ({type(error).__name__}: {error})"
+        ) from error
 
 
 def _records(artifact: VerifiedArtifact) -> Iterator[dict[str, Any]]:

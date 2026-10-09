@@ -10,6 +10,27 @@ import { decodeBody, failureOf, sendRequest } from './http';
 import type { ComparisonDetail, ComparisonPage, ComparisonRequest, StartedComparison } from './comparisonSchemas';
 import { ComparisonEnvelopeSchema, ComparisonPageSchema, StartedComparisonSchema } from './comparisonSchemas';
 import type {
+  CollectionPage,
+  Plan,
+  StartedPlan,
+  StartedStudy,
+  StudyDetail,
+  StudyJobPage,
+  StudyPage,
+  WalkForwardJob,
+  WalkForwardRequest,
+} from './walkForwardSchemas';
+import {
+  CollectionPageSchema,
+  PlanEnvelopeSchema,
+  StartedPlanSchema,
+  StartedStudySchema,
+  StudyEnvelopeSchema,
+  StudyJobPageSchema,
+  StudyPageSchema,
+  WalkForwardJobEnvelopeSchema,
+} from './walkForwardSchemas';
+import type {
   ImportDocument,
   LifecycleState,
   ModelDetail,
@@ -108,6 +129,17 @@ export interface ResearchClient {
   listComparisons(cursor: string | null, signal?: AbortSignal): Promise<ComparisonPage>;
   getComparison(comparisonId: string, signal?: AbortSignal): Promise<ComparisonDetail>;
   startComparison(request: ComparisonRequest): Promise<StartedComparison>;
+  // Walk-forward evaluation: verified collections, a Preview job that
+  // publishes the frozen plan of exactly the request, and a study job that
+  // names only that plan's ID.
+  listCollections(cursor: string | null, signal?: AbortSignal): Promise<CollectionPage>;
+  previewWalkForward(request: WalkForwardRequest): Promise<StartedPlan>;
+  getWalkForwardPlan(planId: string, signal?: AbortSignal): Promise<Plan>;
+  startWalkForwardStudy(planId: string): Promise<StartedStudy>;
+  listWalkForwardStudies(cursor: string | null, signal?: AbortSignal): Promise<StudyPage>;
+  getWalkForwardStudy(studyId: string, signal?: AbortSignal): Promise<StudyDetail>;
+  getWalkForwardJob(jobId: string, signal?: AbortSignal): Promise<WalkForwardJob>;
+  listStudyJobs(cursor: string | null, signal?: AbortSignal): Promise<StudyJobPage>;
 }
 
 const DEFAULT_RESEARCH_TRANSPORT: TransportOptions = {
@@ -201,6 +233,25 @@ export function createResearchClient(transport: TransportOptions = DEFAULT_RESEA
     getComparison: (comparisonId, signal) =>
       get(ComparisonEnvelopeSchema, `/comparisons/${encodeURIComponent(comparisonId)}`, signal),
     startComparison: (request) => post(StartedComparisonSchema, '/comparisons', request, [200, 202]),
+    listCollections: (cursor, signal) =>
+      get(CollectionPageSchema, `/collections${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
+    previewWalkForward: (request) => post(StartedPlanSchema, '/walk-forward/plans', request, [200, 202]),
+    getWalkForwardPlan: async (planId, signal) =>
+      (await get(PlanEnvelopeSchema, `/walk-forward/plans/${encodeURIComponent(planId)}`, signal)).plan,
+    startWalkForwardStudy: (planId) =>
+      post(StartedStudySchema, '/walk-forward/studies', { plan_id: planId }, [200, 202]),
+    listWalkForwardStudies: (cursor, signal) =>
+      get(StudyPageSchema, `/walk-forward/studies${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
+    getWalkForwardStudy: (studyId, signal) =>
+      get(StudyEnvelopeSchema, `/walk-forward/studies/${encodeURIComponent(studyId)}`, signal),
+    getWalkForwardJob: async (jobId, signal) =>
+      (await get(WalkForwardJobEnvelopeSchema, `/jobs/${encodeURIComponent(jobId)}`, signal)).job,
+    listStudyJobs: (cursor, signal) =>
+      get(
+        StudyJobPageSchema,
+        `/jobs${query({ kind: 'walk_forward', limit: String(RESEARCH_PAGE_SIZE), cursor })}`,
+        signal,
+      ),
     listExperiments: (cursor, signal) =>
       get(ExperimentPageSchema, `/experiments${query({ limit: String(RESEARCH_PAGE_SIZE), cursor })}`, signal),
     getExperiment: async (experimentId, signal) =>

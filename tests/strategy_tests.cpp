@@ -744,6 +744,13 @@ struct ScheduleSpec {
     std::optional<std::int64_t> registered_cutoff_at{};
     // A version 2 schedule that names an experiment model, as no publisher may.
     bool registered_with_experiment{false};
+    // A version 3 schedule of a walk-forward fold model with this
+    // information boundary and these latest training times.
+    std::optional<std::int64_t> fold_boundary_at{};
+    std::int64_t fold_labels_through{ms(900)};
+    std::int64_t fold_predictions_through{ms(800)};
+    // A version 3 schedule that claims a split, as no publisher may.
+    bool fold_with_split{false};
 };
 
 json::Value inference_definition(bool registered = false) {
@@ -836,6 +843,36 @@ std::filesystem::path write_schedule(
     }
     const std::string sha(64, 'b');
     const bool registered = spec.registered_cutoff_at.has_value();
+    const bool fold = spec.fold_boundary_at.has_value();
+    json::Object fold_source{
+        {"collection_id", std::string(64, '3')},
+        {"dataset_id", spec.dataset_id},
+        {"feature_artifact_id", std::string(64, 'f')},
+        {"feature_set", "top_of_book_v1"},
+        {"features_sha256", sha},
+        {"horizon_ns", "1000000000"},
+        {"stream", kDatasetStream},
+    };
+    if (spec.fold_with_split) {
+        fold_source.emplace_back("split_artifact_id", std::string(64, 'a'));
+    }
+    const json::Value fold_body(json::Object{
+        {"model", json::Object{
+            {"fold", "2"},
+            {"fold_model_id", std::string(64, '9')},
+            {"instrument", "AAPL"},
+            {"model_feature_set", model_feature_set()},
+            {"name", "logistic"},
+            {"parameters_sha256", std::string(64, 'd')},
+            {"plan_id", std::string(64, '4')},
+        }},
+        {"source", std::move(fold_source)},
+        {"training", json::Object{
+            {"information_boundary_ns", std::to_string(spec.fold_boundary_at.value_or(0))},
+            {"label_available_through_ns", std::to_string(spec.fold_labels_through)},
+            {"prediction_through_ns", std::to_string(spec.fold_predictions_through)},
+        }},
+    });
     const json::Value body(json::Object{
         {"class_order", json::Array{"down", "flat", "up"}},
         {"counts", json::Object{
@@ -872,7 +909,9 @@ std::filesystem::path write_schedule(
                    {"parameters_sha256", std::string(64, 'd')},
                }},
         {"row", json::Object{{"name", "chronos.inference_row"}, {"version", "1"}}},
-        {"schema", json::Object{{"name", "chronos.inference_schedule"}, {"version", registered ? "2" : "1"}}},
+        {"schema", json::Object{
+            {"name", "chronos.inference_schedule"}, {"version", fold ? "3" : registered ? "2" : "1"},
+        }},
         {"scope", "model predictions only"},
         {"source", json::Object{
             {"dataset_id", spec.dataset_id},
@@ -905,8 +944,20 @@ std::filesystem::path write_schedule(
             {"start_at_ns", std::to_string(spec.start_at)},
         }},
     });
-    const std::string id = chronos::Sha256::hex(ds::canonical_document(body));
-    json::Object manifest = *body.if_object();
+    json::Object members = *body.if_object();
+    if (fold) {
+        // A version 3 schedule's own source, model, and training blocks.
+        for (auto& [key, value] : members) {
+            for (const auto& [fold_key, fold_value] : *fold_body.if_object()) {
+                if (key == fold_key) {
+                    value = fold_value;
+                }
+            }
+        }
+    }
+    const json::Value document(std::move(members));
+    const std::string id = chronos::Sha256::hex(ds::canonical_document(document));
+    json::Object manifest = *document.if_object();
     manifest.emplace_back("artifact_id", id);
     const std::filesystem::path directory = root / id;
     std::filesystem::create_directories(directory);
@@ -1089,6 +1140,66 @@ void a_registered_model_must_not_see_the_window_or_claim_an_experiment() {
     REQUIRE(std::holds_alternative<ds::DatasetError>(mixed));
 }
 
+// A walk-forward fold model's schedule (ADR 0022): a version 3 run that names
+// the plan, fold, and fold model, and no experiment, split, or labels.
+void a_fold_model_schedule_gives_a_run_that_names_the_fold_and_no_split() {
+    Fixture fixture;
+    const ScheduleSpec spec{.dataset_id = fixture.dataset_id, .end_at = ms(1'000'000), .fold_boundary_at = ms(1000)};
+    const auto schedule = write_schedule(fixture.schedules, base_session(), spec);
+    const auto result = st::run_strategy(fixture.catalog, schedule, fixture.output, {});
+    const auto& run = published(result);
+    const json::Value& document = run.manifest.document;
+    REQUIRE(text(document, {"schema", "version"}) == "3");
+    REQUIRE(text(document, {"source", "plan_id"}) == std::string(64, '4'));
+    REQUIRE(text(document, {"source", "collection_id"}) == std::string(64, '3'));
+    REQUIRE(text(document, {"source", "fold"}) == "2");
+    REQUIRE(text(document, {"source", "fold_model_id"}) == std::string(64, '9'));
+    REQUIRE(text(document, {"source", "model"}) == "logistic");
+    REQUIRE(text(document, {"source", "information_boundary_ns"}) == std::to_string(ms(1000)));
+    REQUIRE(text(document, {"source", "training_labels_available_through_ns"}) == std::to_string(ms(900)));
+    REQUIRE(text(document, {"window", "end_at_ns"}) == std::to_string(ms(1'000'000)));
+    for (const auto& member : *member(document, "source").if_object()) {
+        REQUIRE(member.first != "experiment_id");
+        REQUIRE(member.first != "split_artifact_id");
+        REQUIRE(member.first != "label_artifact_id");
+    }
+    // The same predictions over the same events give the same results as a
+    // version 1 run of the whole test window.
+    const auto v1 = write_schedule(fixture.schedules, base_session(), ScheduleSpec{.dataset_id = fixture.dataset_id});
+    const auto experiment_result = st::run_strategy(fixture.catalog, v1, fixture.output, {});
+    REQUIRE(member(document, "results") == member(published(experiment_result).manifest.document, "results"));
+    const auto verified = st::verify_strategy_run(run.directory);
+    REQUIRE(std::holds_alternative<st::StrategyRunManifest>(verified));
+    REQUIRE(!st::reproduce_strategy_run(std::get<st::StrategyRunManifest>(verified), fixture.catalog, fixture.schedules));
+}
+
+void a_fold_model_must_have_learned_strictly_before_its_window() {
+    Fixture fixture;
+    std::size_t attempts = 0;
+    const auto attempt = [&](ScheduleSpec spec) {
+        const auto root = fixture.scratch.path() / ("fold-schedules-" + std::to_string(++attempts));
+        std::filesystem::create_directories(root);
+        spec.dataset_id = fixture.dataset_id;
+        spec.end_at = ms(1'000'000);
+        return st::run_strategy(fixture.catalog, write_schedule(root, base_session(), spec), fixture.output, {});
+    };
+    const auto leakage = [](const auto& result) {
+        return std::holds_alternative<ds::DatasetError>(result) &&
+            std::get<ds::DatasetError>(result).code == ds::DatasetErrorCode::LabelLeakage;
+    };
+    // A label known exactly at the boundary, or a prediction made there.
+    REQUIRE(leakage(attempt(ScheduleSpec{.fold_boundary_at = ms(1000), .fold_labels_through = ms(1000)})));
+    REQUIRE(leakage(attempt(ScheduleSpec{.fold_boundary_at = ms(1000), .fold_predictions_through = ms(1000)})));
+    // A boundary after the window's start.
+    REQUIRE(leakage(attempt(ScheduleSpec{.fold_boundary_at = ms(1000) + 1})));
+    // One nanosecond before is enough, and a boundary at the start is valid.
+    REQUIRE(std::holds_alternative<st::PublishedStrategyRun>(attempt(ScheduleSpec{
+        .fold_boundary_at = ms(1000), .fold_labels_through = ms(1000) - 1, .fold_predictions_through = ms(1000) - 1,
+    })));
+    // A version 3 schedule has no split to name.
+    REQUIRE(std::holds_alternative<ds::DatasetError>(attempt(ScheduleSpec{.fold_boundary_at = ms(1000), .fold_with_split = true})));
+}
+
 }  // namespace
 
 int main() {
@@ -1124,6 +1235,10 @@ int main() {
         {"tampered runs and schedules are refused", tampered_runs_and_schedules_are_refused},
         {"a registered model's schedule gives a run that names the version and no experiment",
          a_registered_model_schedule_gives_a_run_that_names_the_version_and_no_experiment},
+        {"a fold model's schedule gives a run that names the fold and no split",
+         a_fold_model_schedule_gives_a_run_that_names_the_fold_and_no_split},
+        {"a fold model must have learned strictly before its window",
+         a_fold_model_must_have_learned_strictly_before_its_window},
         {"a registered model must not see the window or claim an experiment",
          a_registered_model_must_not_see_the_window_or_claim_an_experiment},
     });

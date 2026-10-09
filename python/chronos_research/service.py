@@ -26,6 +26,14 @@ accounts, the replay, or a live source. It uses only the standard library.
     GET  /api/v1/research/comparisons                 ?limit&cursor
     POST /api/v1/research/comparisons                 start a comparison
     GET  /api/v1/research/comparisons/{comparison_id}
+    GET  /api/v1/research/collections                 ?limit&cursor
+    GET  /api/v1/research/collections/{collection_id}
+    GET  /api/v1/research/walk-forward/plans          ?limit&cursor
+    POST /api/v1/research/walk-forward/plans          preview: build and publish a plan
+    GET  /api/v1/research/walk-forward/plans/{plan_id}
+    GET  /api/v1/research/walk-forward/studies        ?limit&cursor
+    POST /api/v1/research/walk-forward/studies        start a reviewed plan's study
+    GET  /api/v1/research/walk-forward/studies/{study_id}
     GET  /api/v1/research/jobs                        ?limit&cursor&kind
     GET  /api/v1/research/jobs/{job_id}
 
@@ -42,7 +50,9 @@ vector, under a time limit. Every job record is written atomically to the
 state directory, so finished jobs survive a restart, and a job that was
 queued or running when the service stopped is marked interrupted on the next
 start, never resumed silently. An identical request while an equal job is
-queued, running, or succeeded returns that job instead of new work.
+queued, running, or succeeded returns that job instead of new work. A
+walk-forward study's child reports its stage and fold on stderr; the latest
+report is the job's bounded `progress`, and the rest of stderr its log.
 
 Artifacts are named only by validated IDs, never by client paths. Every
 artifact this service serves is read as bytes and verified before use:
@@ -76,7 +86,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from chronos_research import comparison, model_library, onnx_profile
+from chronos_research import collection as collections
+from chronos_research import comparison, model_library, onnx_profile, walk_forward, walk_forward_study
 from chronos_research.artifact_files import (
     ArtifactUnavailableError,
     artifact_directory,
@@ -108,6 +119,12 @@ from chronos_research.registry import (
     set_lifecycle,
     verified_model_version,
 )
+from chronos_research.strategy_configuration import (
+    ConfigurationError,
+    canonical_configuration,
+    canonical_decimal,
+    canonical_integer,
+)
 
 API = "/api/v1/research"
 VERSION = "1"
@@ -129,14 +146,19 @@ EXPERIMENT_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "1"}
 # A registered model version's run (ADR 0021): readable here, and listed by
 # the comparison it belongs to rather than among evaluation results.
 REGISTERED_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "2"}
-JOB_KINDS = ("evaluation", "registration", "import", "comparison")
+# A walk-forward fold model's run (ADR 0022): readable here, and listed by
+# the study it belongs to.
+FOLD_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "3"}
+JOB_KINDS = ("evaluation", "registration", "import", "comparison", "walk_forward_plan", "walk_forward")
+# Jobs whose child reports progress, as {"progress": {...}} lines on stderr.
+PROGRESS_JOB_KINDS = ("walk_forward",)
+_PROGRESS_KEYS = ("fold", "folds", "model", "scenario", "stage", "step")
+_PROGRESS_VALUE = re.compile(r"[a-z0-9_]{1,32}")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_DECIMAL = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
 _UNSIGNED = re.compile(r"0|[1-9][0-9]*")
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
-_INT64_MAX = 2**63 - 1
-_DURATIONS = ("latency_ns", "interval_ns", "age_ns", "horizon_ns")
+_DURATIONS = ("latency_ns", "interval_ns", "age_ns", "horizon_ns", "duration_ns")
 
 # What the UI shows next to every model and result.
 LIMITATIONS = (
@@ -309,7 +331,7 @@ class Artifacts:
     def result_manifest(self, run_id: str) -> dict[str, Any]:
         directory = artifact_directory(self.roots.strategies, run_id)
         manifest = verified_manifest(directory, "artifact_id", with_newline=False)
-        if manifest.get("schema") not in (EXPERIMENT_RUN_SCHEMA, REGISTERED_RUN_SCHEMA):
+        if manifest.get("schema") not in (EXPERIMENT_RUN_SCHEMA, REGISTERED_RUN_SCHEMA, FOLD_RUN_SCHEMA):
             raise ArtifactUnavailableError("not a strategy run of a supported version")
         return manifest
 
@@ -427,46 +449,26 @@ def _string(document: Mapping[str, Any], key: str, prefix: str = "") -> str:
     return value
 
 
+def _configuration_error(error: ConfigurationError) -> ApiError:
+    if error.domain:
+        return ApiError(
+            HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_configuration", error.message, error.field, error.reason
+        )
+    return malformed(error.reason, error.message, error.field)
+
+
 def _decimal(text: str, field_name: str, scale: int, positive: bool, nonnegative: bool) -> str:
-    if not _DECIMAL.fullmatch(text):
-        raise malformed("invalid_decimal", f"{field_name} is not a decimal", field_name)
-    whole, _, fraction = text.lstrip("-").partition(".")
-    fraction = fraction.rstrip("0")
-    if len(fraction) > scale:
-        raise malformed(
-            "too_many_fractional_digits", f"{field_name} has more than {scale} decimals", field_name
-        )
-    raw = int(whole) * 10**scale + int(fraction.ljust(scale, "0") or "0")
-    if text.startswith("-") and raw:
-        raw = -raw
-    if raw > _INT64_MAX or raw < -_INT64_MAX - 1:
-        raise malformed("decimal_out_of_range", f"{field_name} is out of range", field_name)
-    if (positive and raw <= 0) or (nonnegative and raw < 0):
-        raise ApiError(
-            HTTPStatus.UNPROCESSABLE_ENTITY,
-            "invalid_configuration",
-            f"{field_name} must be {'positive' if positive else 'nonnegative'}",
-            field_name,
-            "out_of_domain",
-        )
-    canonical = whole.lstrip("0") or "0"
-    return f"{'-' if raw < 0 else ''}{canonical}{'.' + fraction if fraction else ''}"
+    try:
+        return canonical_decimal(text, field_name, scale, positive, nonnegative)
+    except ConfigurationError as error:
+        raise _configuration_error(error) from error
 
 
 def _integer(text: str, field_name: str, minimum: int, maximum: int) -> str:
-    if not _UNSIGNED.fullmatch(text):
-        raise malformed(
-            "invalid_type", f"{field_name} must be a whole number written as a string", field_name
-        )
-    if not minimum <= int(text) <= maximum:
-        raise ApiError(
-            HTTPStatus.UNPROCESSABLE_ENTITY,
-            "invalid_configuration",
-            f"{field_name} must be from {minimum} to {maximum}",
-            field_name,
-            "out_of_domain",
-        )
-    return text
+    try:
+        return canonical_integer(text, field_name, minimum, maximum)
+    except ConfigurationError as error:
+        raise _configuration_error(error) from error
 
 
 def validate_run_request(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -498,23 +500,10 @@ def validate_configuration(configuration: Any) -> dict[str, str]:
         raise malformed("invalid_type", "configuration must be an object", "configuration")
     _exact_keys(configuration, CONFIGURATION_FIELDS, "configuration.")
     values = {key: _string(configuration, key, "configuration.") for key in CONFIGURATION_FIELDS}
-    prefix = "configuration."
-    return {
-        "decision_interval_ns": _integer(
-            values["decision_interval_ns"], prefix + "decision_interval_ns", 1, _INT64_MAX
-        ),
-        "fee_per_fill": _decimal(values["fee_per_fill"], prefix + "fee_per_fill", 8, False, True),
-        "latency_ns": _integer(values["latency_ns"], prefix + "latency_ns", 1, _INT64_MAX),
-        "maximum_order_notional": _decimal(
-            values["maximum_order_notional"], prefix + "maximum_order_notional", 8, True, False
-        ),
-        "maximum_quote_age_ns": _integer(
-            values["maximum_quote_age_ns"], prefix + "maximum_quote_age_ns", 1, _INT64_MAX
-        ),
-        "starting_cash": _decimal(values["starting_cash"], prefix + "starting_cash", 8, True, False),
-        "target_quantity": _decimal(values["target_quantity"], prefix + "target_quantity", 8, True, False),
-        "threshold_ppb": _integer(values["threshold_ppb"], prefix + "threshold_ppb", 0, 1_000_000_000),
-    }
+    try:
+        return canonical_configuration(values, "configuration.")
+    except ConfigurationError as error:
+        raise _configuration_error(error) from error
 
 
 def validate_registration_request(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -540,6 +529,115 @@ def validate_registration_request(document: Mapping[str, Any]) -> dict[str, Any]
             "invalid_identifier", "version is one to three dot-separated whole numbers", "version"
         )
     return request
+
+
+def validate_walk_forward_request(document: Mapping[str, Any]) -> dict[str, Any]:
+    """A walk-forward preview request as its canonical
+    chronos.walk_forward_request/1: fields and values checked here, then
+    the plan's own rules (base and stress scenarios, engine bounds)."""
+    keys = ("collection_id", "configuration", "instrument", "minimum_training_sources", "scenarios")
+    for key in document:
+        if key not in keys:
+            raise malformed("unexpected_field", f"{key} is not a field of this request", key)
+    for key in keys:
+        if key not in document:
+            raise malformed("missing_field", f"{key} is required", key)
+    collection_id, instrument, minimum = (
+        _string(document, key) for key in ("collection_id", "instrument", "minimum_training_sources")
+    )
+    if not is_artifact_id(collection_id):
+        raise malformed("invalid_identifier", "collection_id is a 64-digit lowercase ID", "collection_id")
+    if not _IDENTIFIER.fullmatch(instrument):
+        raise malformed("invalid_identifier", "instrument is not a valid identifier", "instrument")
+    minimum = _integer(minimum, "minimum_training_sources", 1, collections.MAX_SOURCES - 1)
+    scenarios = document["scenarios"]
+    if not isinstance(scenarios, list) or not all(isinstance(cell, dict) for cell in scenarios):
+        raise malformed("invalid_type", "scenarios is a list of objects", "scenarios")
+    if not 1 <= len(scenarios) <= walk_forward.MAX_SCENARIOS:
+        raise ApiError(
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            "invalid_configuration",
+            f"a study has 1 to {walk_forward.MAX_SCENARIOS} scenarios",
+            "scenarios",
+            "out_of_domain",
+        )
+    cells = []
+    for position, cell in enumerate(scenarios):
+        prefix = f"scenarios[{position}]."
+        _exact_keys(cell, ("fee_per_fill", "latency_ns", "name"), prefix)
+        cells.append(
+            {
+                "fee_per_fill": _decimal(
+                    _string(cell, "fee_per_fill", prefix), prefix + "fee_per_fill", 8, False, True
+                ),
+                "latency_ns": _integer(
+                    _string(cell, "latency_ns", prefix), prefix + "latency_ns", 1, 10**18 - 1
+                ),
+                "name": _string(cell, "name", prefix),
+            }
+        )
+    request = {
+        "collection_id": collection_id,
+        "configuration": validate_configuration(document["configuration"]),
+        "instrument": instrument,
+        "minimum_training_sources": minimum,
+        "scenarios": cells,
+        "schema": walk_forward.REQUEST_SCHEMA,
+    }
+    try:
+        return walk_forward.validated_request(request)
+    except walk_forward.PlanError as error:
+        raise ApiError(
+            HTTPStatus.UNPROCESSABLE_ENTITY, "invalid_configuration", str(error), None, error.reason
+        ) from error
+
+
+def collection_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """What the workflow shows of a verified collection: each member's
+    recording, coverage, and declared session, and how many members hold
+    each instrument."""
+
+    def member(entry: Mapping[str, Any]) -> dict[str, Any]:
+        receive = entry["dataset"]["receive_time_ns"]
+        provenance = entry["provenance"]
+        return {
+            "coverage": entry["coverage"],
+            "dataset_id": entry["dataset"]["dataset_id"],
+            "events": entry["dataset"]["events"],
+            "feature_artifact_id": entry["features"]["artifact_id"],
+            "instruments": with_timestamps(entry["instruments"]),
+            "label_artifact_id": entry["labels"]["artifact_id"],
+            "provenance": {
+                key: provenance[key] for key in ("description", "evidence", "provider", "provider_dataset")
+            },
+            "receive_time": {
+                "earliest": rfc3339(int(receive["earliest"])),
+                "latest": rfc3339(int(receive["latest"])),
+            },
+            "session": entry["session"],
+            "stream": entry["dataset"]["stream"],
+        }
+
+    return {
+        "collection_id": manifest["collection_id"],
+        "contract": {key: manifest["contract"][key] for key in ("feature_set", "horizon_ns", "label_set")},
+        "definitions": manifest["definitions"],
+        "evidence": manifest["evidence"],
+        "instruments": manifest["counts"]["instruments"],
+        "members": [member(entry) for entry in manifest["members"]],
+        "verification": manifest["verification"],
+    }
+
+
+def plan_listing(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "collection_id": manifest["collection"]["collection_id"],
+        "evidence": manifest["collection"]["evidence"],
+        "folds": str(len(manifest["folds"])),
+        "instrument": manifest["instrument"],
+        "plan_id": manifest["plan_id"],
+        "scenarios": manifest["scenarios"],
+    }
 
 
 def validate_comparison_request(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -725,6 +823,8 @@ class Job:
     # known to be gone; recorded before the child starts.
     sandbox_supervisor: str | None = None
     sandbox_released: bool = True
+    # The latest progress a walk-forward study's child reported.
+    progress: dict[str, str] | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -734,6 +834,7 @@ class Job:
             "job_id": self.job_id,
             "kind": self.kind,
             "log": self.log,
+            "progress": self.progress,
             "request": self.request,
             "request_key": self.request_key,
             "result": self.result,
@@ -748,6 +849,8 @@ class Job:
         document = self.as_json()
         for internal in ("request_key", "sandbox_released", "sandbox_supervisor", "sequence"):
             del document[internal]
+        if self.kind not in PROGRESS_JOB_KINDS:
+            del document["progress"]
         return document
 
     @classmethod
@@ -768,6 +871,7 @@ class Job:
             kind=document.get("kind", "evaluation"),
             sandbox_supervisor=document.get("sandbox_supervisor"),
             sandbox_released=document.get("sandbox_released", True),
+            progress=document.get("progress"),
         )
 
 
@@ -895,6 +999,16 @@ def job_arguments(
             spec,
             *docker,
         ]
+    if kind == "walk_forward_plan":
+        return [
+            configuration.python, "-m", "chronos_research", "plan-walk-forward", *roots,
+            "--request", json.dumps(request, sort_keys=True, separators=(",", ":")),
+        ]  # fmt: skip
+    if kind == "walk_forward":
+        return [
+            configuration.python, "-m", "chronos_research", "run-walk-forward", *roots,
+            "--plan", request["plan_id"], "--progress",
+        ]  # fmt: skip
     if kind == "import":
         return [
             configuration.python, "-m", "chronos_research", "import-model",
@@ -930,6 +1044,20 @@ def job_result(kind: str, output: Mapping[str, Any]) -> dict[str, Any]:
             "outcome": output["outcome"],
             "status": output["comparison"]["status"],
         }
+    if kind == "walk_forward_plan":
+        return {
+            "folds": str(len(output["plan"]["folds"])),
+            "outcome": output["outcome"],
+            "plan_id": output["plan"]["plan_id"],
+        }
+    if kind == "walk_forward":
+        study = output["study"]
+        return {
+            "missing": str(len(study["missing"])),
+            "outcome": output["outcome"],
+            "status": study["status"],
+            "study_id": study["study_id"],
+        }
     return {
         "reproduced": output["reproduced"],
         "run_id": output["run"]["artifact_id"],
@@ -943,15 +1071,50 @@ class WorkerOutputLimitError(Exception):
     """A child exceeded the output limit before it finished."""
 
 
-def _worker_output(child: subprocess.Popen[bytes], timeout_s: int) -> tuple[bytes, bytes]:
+def progress_report(line: bytes) -> dict[str, str] | None:
+    """A child's progress line as a bounded report, or None if the line is
+    not one: {"progress": {...}} of at most six known keys, each a short
+    lowercase token."""
+    try:
+        document = json.loads(line)
+    except ValueError:
+        return None
+    report = document.get("progress") if isinstance(document, dict) and len(document) == 1 else None
+    if (
+        not isinstance(report, dict)
+        or not report
+        or not set(report) <= set(_PROGRESS_KEYS)
+        or not all(isinstance(value, str) and _PROGRESS_VALUE.fullmatch(value) for value in report.values())
+    ):
+        return None
+    return {key: report[key] for key in sorted(report)}
+
+
+def _worker_output(
+    child: subprocess.Popen[bytes],
+    timeout_s: int,
+    on_progress: Callable[[dict[str, str]], None] | None = None,
+) -> tuple[bytes, bytes]:
     """Drain both pipes without unbounded communicate() buffers.
 
     The result has a hard byte limit; diagnostics keep only a bounded tail.
-    An overall output limit also stops a worker flooding either pipe.
+    An overall output limit also stops a worker flooding either pipe. With
+    on_progress, each complete stderr line that is a progress report goes to
+    it instead of the log; a line longer than the log tail is only log.
     """
     assert child.stdout is not None
     assert child.stderr is not None
     stdout, stderr = bytearray(), bytearray()
+    pending = bytearray()
+
+    def logged(line: bytes) -> None:
+        report = progress_report(line) if on_progress is not None else None
+        if report is None:
+            stderr.extend(line + b"\n")
+        else:
+            assert on_progress is not None
+            on_progress(report)
+
     output_bytes = 0
     deadline = time.monotonic() + timeout_s
     with selectors.DefaultSelector() as pipes:
@@ -973,11 +1136,22 @@ def _worker_output(child: subprocess.Popen[bytes], timeout_s: int) -> tuple[byte
                     raise WorkerOutputLimitError
                 if key.data == "stdout":
                     stdout.extend(chunk)
-                else:
+                elif on_progress is None:
                     stderr.extend(chunk)
                     del stderr[:-LOG_BYTES]
+                else:
+                    pending.extend(chunk)
+                    *lines, rest = pending.split(b"\n")
+                    pending = bytearray(rest)
+                    for line in lines:
+                        logged(bytes(line))
+                    if len(pending) > LOG_BYTES:
+                        stderr.extend(pending)
+                        pending.clear()
+                    del stderr[:-LOG_BYTES]
         child.wait(timeout=max(0, deadline - time.monotonic()))
-    return bytes(stdout), bytes(stderr)
+    stderr.extend(pending)
+    return bytes(stdout), bytes(stderr[-LOG_BYTES:])
 
 
 class Workers:
@@ -1081,7 +1255,11 @@ class Workers:
         if child is None:
             return "interrupted", {"error": {"code": "interrupted", "message": "the service stopped"}}, False
         try:
-            stdout, stderr = _worker_output(child, self.configuration.job_timeout_s)
+            stdout, stderr = _worker_output(
+                child,
+                self.configuration.job_timeout_s,
+                self._progress_of(job) if job.kind in PROGRESS_JOB_KINDS else None,
+            )
         except subprocess.TimeoutExpired as error:
             _signal_group(child, signal.SIGKILL)
             _, remaining_stderr = child.communicate()
@@ -1119,6 +1297,13 @@ class Workers:
                 False,
             )
         return "succeeded", {"result": result, "log": stderr}, False
+
+    def _progress_of(self, job: Job) -> Callable[[dict[str, str]], None]:
+        def record(report: dict[str, str]) -> None:
+            job.progress = report
+            self.store.save(job)
+
+        return record
 
     def _release_sandbox(self, job: Job, abnormal: bool) -> None:
         """Removes the job's sandbox containers and checks that none is left,
@@ -1228,6 +1413,8 @@ _FAILURE_CODES = {
     "registration": "registration_failed",
     "import": "import_failed",
     "comparison": "comparison_failed",
+    "walk_forward_plan": "plan_failed",
+    "walk_forward": "study_failed",
 }
 _REFUSAL_CODES = {
     "NameVersionTakenError": "name_version_taken",
@@ -1238,6 +1425,9 @@ _REFUSAL_CODES = {
     "SandboxFailedError": "sandbox_failed",
     "SandboxUnavailableError": "sandbox_unavailable",
     "ComparisonError": "comparison_refused",
+    "CollectionError": "collection_refused",
+    "PlanError": "plan_refused",
+    "StudyError": "study_refused",
 }
 
 
@@ -1296,6 +1486,20 @@ class Service:
             (r"/imports/([^/]+)", {"GET": self.staged_import}, ()),
             (r"/imports/([^/]+)/model", {"PUT": self.upload_model}, ()),
             (r"/imports/([^/]+)/validation", {"POST": self.start_import}, ()),
+            (r"/collections", {"GET": self.collections}, ("limit", "cursor")),
+            (r"/collections/([^/]+)", {"GET": self.collection}, ()),
+            (
+                r"/walk-forward/plans",
+                {"GET": self.walk_forward_plans, "POST": self.start_walk_forward_plan},
+                ("limit", "cursor"),
+            ),
+            (r"/walk-forward/plans/([^/]+)", {"GET": self.walk_forward_plan}, ()),
+            (
+                r"/walk-forward/studies",
+                {"GET": self.walk_forward_studies, "POST": self.start_walk_forward_study},
+                ("limit", "cursor"),
+            ),
+            (r"/walk-forward/studies/([^/]+)", {"GET": self.walk_forward_study}, ()),
             (r"/jobs", {"GET": self.jobs}, ("limit", "cursor", "kind")),
             (r"/jobs/([^/]+)", {"GET": self.job}, ()),
         ]
@@ -1341,6 +1545,13 @@ class Service:
             "imports": {
                 "profile": onnx_profile.limits(),
                 "sandbox": self.configuration.sandbox.capability(),
+            },
+            "walk_forward": {
+                "max_folds": str(walk_forward.MAX_FOLDS),
+                "max_scenarios": str(walk_forward.MAX_SCENARIOS),
+                "max_sources": str(collections.MAX_SOURCES),
+                "max_strategy_runs": str(walk_forward.MAX_STRATEGY_RUNS),
+                "max_training_rows_per_fold": str(walk_forward.MAX_TRAINING_ROWS_PER_FOLD),
             },
             "service": "chronos-research",
             "tools": {name: "available" if present else "missing" for name, present in tools.items()},
@@ -1697,6 +1908,140 @@ class Service:
         checks = comparison.member_artifacts(ArtifactRoots.under(self.configuration.artifacts), manifest)
         return HTTPStatus.OK, {"artifacts": checks, "comparison": with_timestamps(manifest)}
 
+    # Walk-forward evaluation (ADR 0022): collections, plans, and studies.
+    def _collection(self, collection_id: str) -> dict[str, Any]:
+        if not is_artifact_id(collection_id):
+            raise malformed(
+                "invalid_identifier", "a collection ID is 64 lowercase hexadecimal digits", "collection_id"
+            )
+        root = collections.collections_root(self.configuration.artifacts)
+        if collection_id not in collections.collection_ids(root):
+            raise ApiError(HTTPStatus.NOT_FOUND, "collection_not_found", "no such collection")
+        try:
+            return collections.verified_collection(root, collection_id)
+        except collections.CollectionError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "artifact_invalid", f"the collection cannot be read: {error}"
+            ) from error
+
+    def collections(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        root = collections.collections_root(self.configuration.artifacts)
+        page = page_after_id(
+            collections.collection_ids(root), limit_of(query), query.get("cursor"), "collections"
+        )
+        items, invalid = [], []
+        for collection_id in page.items:
+            try:
+                items.append(collection_summary(collections.verified_collection(root, collection_id)))
+            except (collections.CollectionError, KeyError, TypeError, ValueError) as error:
+                invalid.append({"collection_id": collection_id, "reason": str(error)})
+        return HTTPStatus.OK, {
+            "collections": items,
+            "invalid_entries": invalid,
+            "next_cursor": page.next_cursor,
+        }
+
+    def collection(self, collection_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        return HTTPStatus.OK, {"collection": collection_summary(self._collection(collection_id))}
+
+    def _plan(self, plan_id: str) -> dict[str, Any]:
+        if not is_artifact_id(plan_id):
+            raise malformed("invalid_identifier", "a plan ID is 64 lowercase hexadecimal digits", "plan_id")
+        root = walk_forward.plans_root(self.configuration.artifacts)
+        if plan_id not in walk_forward.plan_ids(root):
+            raise ApiError(HTTPStatus.NOT_FOUND, "plan_not_found", "no such walk-forward plan")
+        try:
+            return walk_forward.verified_plan(root, plan_id)
+        except walk_forward.PlanError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "artifact_invalid", f"the plan cannot be read: {error}"
+            ) from error
+
+    def walk_forward_plans(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        root = walk_forward.plans_root(self.configuration.artifacts)
+        page = page_after_id(walk_forward.plan_ids(root), limit_of(query), query.get("cursor"), "plans")
+        items, invalid = [], []
+        for plan_id in page.items:
+            try:
+                items.append(plan_listing(walk_forward.verified_plan(root, plan_id)))
+            except (walk_forward.PlanError, KeyError, TypeError) as error:
+                invalid.append({"plan_id": plan_id, "reason": str(error)})
+        return HTTPStatus.OK, {"invalid_entries": invalid, "next_cursor": page.next_cursor, "plans": items}
+
+    def walk_forward_plan(self, plan_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        return HTTPStatus.OK, {"plan": with_timestamps(self._plan(plan_id))}
+
+    def start_walk_forward_plan(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        """Preview: a job that verifies the collection's sources and
+        publishes the plan of exactly this request, never a request thread."""
+        request = validate_walk_forward_request(parse_body(data))
+        try:
+            self._collection(request["collection_id"])
+        except ApiError as error:
+            if error.code != "collection_not_found":
+                raise
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "collection_not_found", "no such collection", "collection_id"
+            ) from error
+        key = hashlib.sha256(canonical_bytes({"kind": "walk_forward_plan", "request": request})).hexdigest()
+        job, created = self.store.create(request, key, "walk_forward_plan")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    def start_walk_forward_study(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        """Starts the study of a reviewed plan, named by its ID; the job
+        verifies the plan's sources again before anything runs."""
+        document = parse_body(data)
+        _exact_keys(document, ("plan_id",))
+        plan_id = _string(document, "plan_id")
+        if not is_artifact_id(plan_id):
+            raise malformed("invalid_identifier", "plan_id is a 64-digit lowercase ID", "plan_id")
+        try:
+            self._plan(plan_id)
+        except ApiError as error:
+            if error.code != "plan_not_found":
+                raise
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "plan_not_found", "no such walk-forward plan", "plan_id"
+            ) from error
+        request = {"plan_id": plan_id}
+        key = hashlib.sha256(canonical_bytes({"kind": "walk_forward", "request": request})).hexdigest()
+        job, created = self.store.create(request, key, "walk_forward")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    def walk_forward_studies(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        root = walk_forward_study.studies_root(self.configuration.artifacts)
+        page = page_after_id(
+            walk_forward_study.study_ids(root), limit_of(query), query.get("cursor"), "studies"
+        )
+        items, invalid = [], []
+        for study_id in page.items:
+            try:
+                items.append(walk_forward_study.listing(walk_forward_study.verified_study(root, study_id)))
+            except (walk_forward_study.StudyError, KeyError, TypeError) as error:
+                invalid.append({"reason": str(error), "study_id": study_id})
+        return HTTPStatus.OK, {"invalid_entries": invalid, "next_cursor": page.next_cursor, "studies": items}
+
+    def walk_forward_study(self, study_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        if not is_artifact_id(study_id):
+            raise malformed("invalid_identifier", "a study ID is 64 lowercase hexadecimal digits", "study_id")
+        root = walk_forward_study.studies_root(self.configuration.artifacts)
+        if study_id not in walk_forward_study.study_ids(root):
+            raise ApiError(HTTPStatus.NOT_FOUND, "study_not_found", "no such walk-forward study")
+        try:
+            manifest = walk_forward_study.verified_study(root, study_id)
+        except walk_forward_study.StudyError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY, "artifact_invalid", f"the study cannot be read: {error}"
+            ) from error
+        checks = walk_forward_study.study_artifacts(self.configuration.artifacts, manifest)
+        return HTTPStatus.OK, {"artifacts": checks, "study": with_timestamps(manifest)}
+
     def _manifest(self, run_id: str) -> dict[str, Any]:
         if not is_artifact_id(run_id):
             raise malformed("invalid_identifier", "a result ID is 64 lowercase hexadecimal digits", "run_id")
@@ -1724,7 +2069,8 @@ class Service:
         for run_id in page.items:
             try:
                 manifest = self.artifacts.result_manifest(run_id)
-                # A registered model's run is listed in its comparison.
+                # A registered model's run is listed in its comparison, and a
+                # fold model's in its walk-forward study.
                 if manifest["schema"] == EXPERIMENT_RUN_SCHEMA:
                     items.append(result_listing(manifest))
             except (ArtifactUnavailableError, OSError, ValueError, KeyError, TypeError) as error:

@@ -32,9 +32,11 @@ namespace chronos::strategy {
 
 inline constexpr std::string_view kScheduleSchemaName = "chronos.inference_schedule";
 // Version 1 schedules a verified experiment's model; version 2 a registered
-// model version (ADR 0021). Both stay readable, with their own meaning.
+// model version (ADR 0021); version 3 one fold model of a walk-forward
+// study (ADR 0022). Each stays readable, with its own meaning.
 inline constexpr std::string_view kExperimentScheduleVersion = "1";
 inline constexpr std::string_view kRegisteredScheduleVersion = "2";
+inline constexpr std::string_view kFoldScheduleVersion = "3";
 inline constexpr std::string_view kScheduleRowRecordName = "chronos.inference_row";
 inline constexpr std::string_view kScheduleRowRecordVersion = "1";
 inline constexpr std::string_view kScheduleRowsFileName = "schedule.ndjson";
@@ -87,7 +89,23 @@ struct RegisteredScheduleModel {
     std::string cutoff_basis;
 };
 
-using ScheduleModel = std::variant<ExperimentScheduleModel, RegisteredScheduleModel>;
+// The model of a version 3 schedule: one fold's freshly fitted model in a
+// walk-forward plan over a collection of recordings. It was trained only on
+// rows whose prediction and label times are both strictly before its
+// information boundary, which is at or before the window's start.
+struct FoldScheduleModel {
+    std::string plan_id;
+    std::string collection_id;
+    std::uint64_t fold{0};
+    std::string fold_model_id;
+    std::string name;
+    std::string parameters_sha256;
+    Timestamp information_boundary;
+    Timestamp training_predictions_through;
+    Timestamp training_labels_available_through;
+};
+
+using ScheduleModel = std::variant<ExperimentScheduleModel, RegisteredScheduleModel, FoldScheduleModel>;
 
 struct ScheduleManifest {
     std::string artifact_id;
@@ -96,8 +114,10 @@ struct ScheduleManifest {
     MarketDataStreamId stream;
     std::string feature_artifact_id;
     std::string features_sha256;
-    std::string label_artifact_id;
-    std::string split_artifact_id;
+    // A version 1 or 2 schedule's split and its label artifact; a version 3
+    // schedule is evaluated on a whole recording and names neither.
+    std::optional<std::string> label_artifact_id;
+    std::optional<std::string> split_artifact_id;
     std::int64_t horizon_ns{0};
     InstrumentId instrument;
     ScheduleModel model;
