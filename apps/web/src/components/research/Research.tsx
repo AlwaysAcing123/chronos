@@ -1,7 +1,7 @@
 import { useState } from 'react';
 
 import { ChronosApiError } from '../../api/errors';
-import { TRADING_HREF } from '../../state/route';
+import { TRADING_HREF, walkForwardHref } from '../../state/route';
 import { useExperiments, useResearchClient, useResearchStatus } from '../../state/research';
 import { Alert, Code } from '../ui/Alert';
 import { Button } from '../ui/Button';
@@ -143,6 +143,11 @@ export function Research({
         {resultId !== null && (
           <a className={styles.back} href="#/research">
             ← All research
+          </a>
+        )}
+        {resultId === null && (
+          <a className={styles.back} href={walkForwardHref()}>
+            Walk-forward evaluation
           </a>
         )}
         <a className={styles.back} href={TRADING_HREF}>

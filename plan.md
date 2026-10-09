@@ -1150,7 +1150,7 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
 9. **Complete:** Persist account, order, rejection, fill, and portfolio events atomically and recover after restart.
 10. **In progress:** Expose the path through a typed API and then a minimal real web order ticket, blotter, and portfolio view. The first API slice is complete: health, paper-account creation and retrieval, and immediate-or-cancel order submission against server-owned market state. The durable read side is complete: newest-first order and fill history with keyset pagination, and order lookup for reconciling uncertain submissions. Read-only portfolio valuation is complete: the durable account is marked at the server's current best bid with exact, reconciled market value, unrealized and total PnL, equity, and return, and refuses to value against missing, interrupted, suspect, or incompatible market data. The first web workspace is complete as a local React and TypeScript client: account creation and selection, market and portfolio views, a manual market/limit IOC order ticket with reconciliation of uncertain submissions, and durable order and fill history. Paced replay is complete: the server plays a recording by receive time at `1x`, `10x`, `100x`, or `max` while it serves requests, behind a provider-independent market-data source boundary with start, pause, and resume controls, and the workspace refreshes market-dependent views on coalesced Server-Sent Events change notices, falling back to polling. The first live source is complete: an optional Alpaca IEX adapter streams live Level-1 trades and quotes over one WebSocket, with an explicit connect, authenticate, and subscribe lifecycle, bounded reconnection, exact fail-closed normalization, environment-only credentials, and live freshness rules that never serve a quote while the feed is down or before a fresh quote arrives. It is labelled as IEX-only, not SIP or NBBO, and consumes market data only. Multi-instrument paper accounts are complete: an account holds one shared USD cash balance and a durable ledger per instrument, every order names one tradeable instrument and executes only against that instrument's quote and displayed liquidity, client order IDs are unique across the account, the position limit applies per instrument, portfolio valuation marks every held position all or nothing and names each one it cannot mark, PostgreSQL stores normalized position and execution-state rows with commit-time integrity checks after a transactional, loss-free migration of single-instrument data, history can be filtered by instrument, and the workspace has a watchlist, a ticket symbol selector, and position tables. Durable good-til-cancelled working orders are complete: a limit order may be GTC, executes at once as far as displayed liquidity allows, and works across restarts until later top-of-book observations of its own instrument fill it in FIFO priority, one transaction per account, synchronously with the market stream and without dropping an event; it pays one fee, on its first fill; its remaining cash or shares are reserved server-side and enforced by risk and commit-time database checks; a client can cancel its remainder idempotently by cancel request ID, without market data; PostgreSQL stores each order's current state and every fill after a transactional, validated, loss-free migration; the API lists working orders and each order's fills and lifecycle events; and the workspace has a time-in-force selector, a working-orders panel with reservations and reconciled cancellation, and an order lifecycle view refreshed by account-activity notices. Replace (amending a working order) and authentication remain.
 11. Add a small `XNAS.ITCH` recording and Level-2/Level-3 book work before introducing queue and partial-fill assumptions.
-12. **In progress:** Build the historical evaluation foundation. The first slice is complete: a provider-independent, immutable, content-addressed normalized market dataset (canonical NDJSON of every Chronos event with raw fixed-point strings, a strict manifest, and a deterministic quality report), published atomically, verified end to end by a `MarketEventReader` that replay uses unchanged, converted offline from Databento recordings; and a point-in-time `top_of_book` version 1 feature engine with exact, typed-unavailability features and reproducible feature artifacts. The second slice is complete: immutable `future_midpoint_return` version 1 label artifacts (the exact fixed-point midpoint return to the first observation of the same instrument at least one horizon later, never skipping an unavailable one, typed reasons for every unavailable label, and a label availability time separate from the prediction time); immutable `chronological_purged` version 1 split artifacts (contiguous train, validation, and test periods that never divide equal prediction times, with labels that cross a boundary purged and the no-leakage inequalities checked on writing and reading); and a Python research package that consumes those artifacts only after the C++ verifier has reproduced them, trains a no-skill majority baseline and a multinomial logistic-regression baseline per instrument on training rows only, and publishes an immutable, content-addressed evaluation artifact with plain-number model parameters, stored-parameter inference proven against scikit-learn, and exact, typed metrics. The third slice is complete: a saved, reproducible research demonstration (`python -m chronos_research demo`) takes the local recording, or synthetic events in CI, through every artifact and verifies the whole ancestry, reusing every artifact on a repeat run ([docs/research-walkthrough.md](docs/research-walkthrough.md)); a label-free, immutable inference schedule infers a fitted model on every feature row of one instrument in a validation or test window, including the unlabelled tail, without ever reading label or split rows; a deterministic C++ strategy runner (`chronos_strategy`) evaluates one versioned long/flat policy over the verified dataset through the existing `PaperOrderProcessor`, risk, fill, fee, liquidity, accounting, and valuation code, with delayed IOC orders that never fill on their own quote, beside cash and buy-and-hold benchmarks, into an immutable result with a full decision, order, execution, and valuation journal, exact PnL, fees, turnover, and drawdown, and explicit unavailable valuations ([docs/strategy-evaluation.md](docs/strategy-evaluation.md), ADR 0016); and a separate loopback research service with bounded, durable, deduplicated jobs and a Research view in the web workspace start evaluations and show their trades, equity, drawdown, costs, benchmarks, and provenance ([docs/research-service.md](docs/research-service.md), ADR 0017). On the demonstration data the policy lost money in every window, and more than buying and holding. Boosted trees, walk-forward evaluation, calibration reporting, richer policies and cost models, and model registry work are next; no result is evidence of skill or profitability yet.
+12. **In progress:** Build the historical evaluation foundation. The first slice is complete: a provider-independent, immutable, content-addressed normalized market dataset (canonical NDJSON of every Chronos event with raw fixed-point strings, a strict manifest, and a deterministic quality report), published atomically, verified end to end by a `MarketEventReader` that replay uses unchanged, converted offline from Databento recordings; and a point-in-time `top_of_book` version 1 feature engine with exact, typed-unavailability features and reproducible feature artifacts. The second slice is complete: immutable `future_midpoint_return` version 1 label artifacts (the exact fixed-point midpoint return to the first observation of the same instrument at least one horizon later, never skipping an unavailable one, typed reasons for every unavailable label, and a label availability time separate from the prediction time); immutable `chronological_purged` version 1 split artifacts (contiguous train, validation, and test periods that never divide equal prediction times, with labels that cross a boundary purged and the no-leakage inequalities checked on writing and reading); and a Python research package that consumes those artifacts only after the C++ verifier has reproduced them, trains a no-skill majority baseline and a multinomial logistic-regression baseline per instrument on training rows only, and publishes an immutable, content-addressed evaluation artifact with plain-number model parameters, stored-parameter inference proven against scikit-learn, and exact, typed metrics. The third slice is complete: a saved, reproducible research demonstration (`python -m chronos_research demo`) takes the local recording, or synthetic events in CI, through every artifact and verifies the whole ancestry, reusing every artifact on a repeat run ([docs/research-walkthrough.md](docs/research-walkthrough.md)); a label-free, immutable inference schedule infers a fitted model on every feature row of one instrument in a validation or test window, including the unlabelled tail, without ever reading label or split rows; a deterministic C++ strategy runner (`chronos_strategy`) evaluates one versioned long/flat policy over the verified dataset through the existing `PaperOrderProcessor`, risk, fill, fee, liquidity, accounting, and valuation code, with delayed IOC orders that never fill on their own quote, beside cash and buy-and-hold benchmarks, into an immutable result with a full decision, order, execution, and valuation journal, exact PnL, fees, turnover, and drawdown, and explicit unavailable valuations ([docs/strategy-evaluation.md](docs/strategy-evaluation.md), ADR 0016); and a separate loopback research service with bounded, durable, deduplicated jobs and a Research view in the web workspace start evaluations and show their trades, equity, drawdown, costs, benchmarks, and provenance ([docs/research-service.md](docs/research-service.md), ADR 0017). On the demonstration data the policy lost money in every window, and more than buying and holding. Boosted trees, calibration reporting, and richer policies and cost models are next (the model registry is item 14 and walk-forward evaluation item 15); no result is evidence of skill or profitability yet.
 13. **In progress:** Controlled model-driven paper deployment. The first slice is complete ([docs/model-deployments.md](docs/model-deployments.md), ADR 0018).
     - **Running.** A verified `logistic` or `majority` research model runs in the paper-trading server, with an explicit `--model-deployments` opt-in. It is served by a long-lived Python inference worker whose predictions are bit-identical to the historical schedules'. It trades one instrument, long or flat and at most one share, under the shared `long_flat_threshold` version 1 policy, in a dedicated paper account it owns from creation.
     - **Handoff and timing.** A bounded handoff runs from the feed (the matcher first, then point-in-time features, then a one-slot mailbox per deployment with counted supersession) to a runner thread. The runner never decides before the training cutoff or on an observation at or before its durable watermark.
@@ -1233,10 +1233,9 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
         crash remain unexercised on real data. No broker order was sent.
 
     Measured limitation: under a fast replay, orders wait for the market-event gate, so the realized signal-to-execution delay (median 0.4–1.1 s of market time at 10x) far exceeds the configured latency, and a few signals expire. Durable live-stream continuity is code-reviewed and fresh-account live-verified, pending milestone acceptance; a fairer gate or matching outside it follows. Several things remain: multi-share and multi-instrument deployments, limit orders, durable run counters, broader real-live reconnect/pending-order acceptance, and authentication.
-14. **Implemented, awaiting Codex review (not committed):** a versioned
+14. **Complete, reviewed and merged in PR #26** (`1e3b1a1`): a versioned
     model library, constrained model imports, fair historical comparisons,
-    and paper deployment of registered versions, on branch
-    `feature/model-registry-import-comparison`
+    and paper deployment of registered versions
     ([ADR 0021](docs/decisions/0021-model-registry-imports-and-comparisons.md)).
     - **A. Model library.** Immutable, content-addressed model versions
       (`chronos.model_version/1`). The record separates the version ID, the
@@ -1286,6 +1285,70 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
       declaration and cannot be verified. Only one profile, one instrument,
       and one target exist. No retraining, champion promotion, or
       authentication.
+15. **Implemented and revised after Codex review, awaiting re-review (not
+    committed):** walk-forward
+    evaluation over independent recordings, with fee and latency robustness
+    scenarios, on branch `feature/walk-forward-robustness`
+    ([ADR 0022](docs/decisions/0022-walk-forward-evaluation.md),
+    [docs/walk-forward-evaluation.md](docs/walk-forward-evaluation.md)).
+    - **A. Collections and plans.** A verified collection
+      (`chronos.research_collection/1`) references existing recordings by
+      their label, feature, and dataset artifacts, each re-verified by the
+      C++ tools, with coverage, provenance, and declared session labels
+      recorded and never upgraded; duplicates, aliases, overlaps,
+      inconsistent contracts, and synthetic/observed mixtures are refused.
+      An immutable plan (`chronos.walk_forward_plan/1`) fixes expanding
+      folds, whole-recording windows, an exclusive information boundary
+      (training prediction AND label-availability times strictly before
+      it), eligible rows and class support, the strategy configuration, one
+      to four fee × latency scenarios, the scoring rule, and a bounded
+      workload before any result. Too few recordings is refused with what
+      is needed.
+    - **B. Fold-local models and execution.** Each fold fits a fresh
+      majority and a fresh logistic model (its own scaler) on its training
+      rows only, published as historical-only fold models outside registry
+      version 1. Schedule version 3 predicts every evaluation feature row
+      from features and frozen parameters alone; strategy-run version 3
+      names the fold provenance; the C++ engine recomputes every row.
+      Versions 1 and 2 are unchanged.
+    - **C. Studies.** `chronos.walk_forward_study/1` runs every fold, model,
+      and scenario through `chronos_strategy` in its own accounts, replays
+      each run, scores only after predictions exist, keeps every outcome
+      (completed, unevaluable, failed, not run), pools classification over
+      rows, and sums money exactly over reset accounts (return = total PnL /
+      total capital, rounded once); a missing valuation or cell leaves only
+      a labelled partial aggregate. Inspection rebuilds and replays
+      everything.
+    - **D. Service and web.** Preview and Start are deduplicated research
+      jobs with bounded fold progress; sources are re-verified at
+      execution. A Walk-forward workflow inside Research previews a frozen
+      plan, starts it, and shows trading per fold first, exact totals, and
+      prediction quality separately, with synthetic and partial results
+      labelled and fold runs' journals one click away.
+    - **Revision after Codex review.** Inspection and the auditor hold every
+      run to its cell: the plan's schedule, source, window, and all eight
+      frozen options under the cell's scenario; a completed cell needs a run,
+      and a cell without one is kept only as exactly a run that failed to
+      start. The study page shows each run's verification, and labels
+      unverified every row and total that rests on one that does not verify
+      or was not checked. The CLI and HTTP share one check of every option
+      against the engine's exact limits.
+    - **Proven on synthetic recordings only:** three generated days (plus a
+      thin day for an unevaluable fold) through the CLI, the service, and
+      the browser, at desktop and phone widths with accessibility checks;
+      an independent standard-library audit (`tools/walk_forward_audit`)
+      recomputed fold membership, cutoffs, training support, confusion
+      counts, every fill, fee, cash, position, PnL, and every aggregate
+      exactly, with zero differences, and caught planted errors.
+    - **Real data:** the only real recording is ten minutes of one session.
+      Its collection verifies and its plan is correctly refused for
+      insufficient coverage, so **no real multi-session result exists**;
+      that evidence is unverified, not passed. More recordings need a
+      separate, quote-first, cost-capped acquisition step.
+    - **Limits.** One instrument per study, the existing features, horizon,
+      two baselines, and long/flat policy; whole-recording windows;
+      same-environment reproducibility; no significance claims, promotion,
+      or deployment of fold models.
 
 The repository currently implements type-specific fixed-point price, money,
 and quantity values; provider-independent market-event types; structured
@@ -1348,8 +1411,9 @@ through the paper-execution engine beside cash and buy-and-hold benchmarks;
 and a local research service and the workspace's Research view start those
 evaluations and show their results. A model library, constrained ONNX
 imports, comparisons, and paper deployments of registered versions are
-implemented and awaiting review, as item 14 describes. Chronos does not yet
-implement boosted-tree or temporal models, walk-forward evaluation,
+reviewed and merged, as item 14 describes, and walk-forward evaluation with
+cost and latency scenarios is implemented and awaiting review, as item 15
+describes. Chronos does not yet implement boosted-tree or temporal models,
 authentication, or the Experiments and Data areas of the web application. A
 first, controlled model-driven deployment to dedicated paper accounts is
 implemented, as item 13 describes.

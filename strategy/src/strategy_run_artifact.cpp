@@ -99,18 +99,44 @@ json::Value environment_json() {
     });
 }
 
+// A version 3 run's source: the walk-forward plan, fold, and fold model, and
+// the evaluation recording's dataset and features.
+json::Value fold_source_json(const ScheduleManifest& source, const FoldScheduleModel& model, const std::string& events_sha256) {
+    return json::Value(json::Object{
+        {"collection_id", model.collection_id},
+        {"dataset_id", source.dataset_id},
+        {"events_sha256", events_sha256},
+        {"feature_artifact_id", source.feature_artifact_id},
+        {"fold", std::to_string(model.fold)},
+        {"fold_model_id", model.fold_model_id},
+        {"information_boundary_ns", std::to_string(model.information_boundary.nanoseconds())},
+        {"instrument", source.instrument.value()},
+        {"model", model.name},
+        {"parameters_sha256", model.parameters_sha256},
+        {"plan_id", model.plan_id},
+        {"schedule_id", source.artifact_id},
+        {"schedule_sha256", source.schedule.sha256},
+        {"stream", source.stream.value()},
+        {"training_labels_available_through_ns", std::to_string(model.training_labels_available_through.nanoseconds())},
+        {"training_predictions_through_ns", std::to_string(model.training_predictions_through.nanoseconds())},
+    });
+}
+
 // What a run came from: the dataset and schedule, and the schedule's model,
 // as that schedule's version names it.
 json::Value source_json(const ScheduleManifest& source, const std::string& events_sha256) {
+    if (const auto* fold = std::get_if<FoldScheduleModel>(&source.model)) {
+        return fold_source_json(source, *fold, events_sha256);
+    }
     json::Object members{
         {"dataset_id", source.dataset_id},
         {"events_sha256", events_sha256},
         {"feature_artifact_id", source.feature_artifact_id},
         {"instrument", source.instrument.value()},
-        {"label_artifact_id", source.label_artifact_id},
+        {"label_artifact_id", source.label_artifact_id.value()},
         {"schedule_id", source.artifact_id},
         {"schedule_sha256", source.schedule.sha256},
-        {"split_artifact_id", source.split_artifact_id},
+        {"split_artifact_id", source.split_artifact_id.value()},
         {"stream", source.stream.value()},
     };
     if (const auto* model = std::get_if<ExperimentScheduleModel>(&source.model)) {
@@ -132,6 +158,15 @@ json::Value source_json(const ScheduleManifest& source, const std::string& event
         members.emplace_back("payload_sha256", registered.payload_sha256);
     }
     return json::Value(std::move(members));
+}
+
+// The run version that names this schedule's kind of model.
+std::string_view run_version(const ScheduleModel& model) {
+    if (std::holds_alternative<FoldScheduleModel>(model)) {
+        return kFoldStrategyRunVersion;
+    }
+    return std::holds_alternative<RegisteredScheduleModel>(model) ? kRegisteredStrategyRunVersion
+                                                                  : kExperimentStrategyRunVersion;
 }
 
 struct Simulated {
@@ -169,9 +204,8 @@ std::variant<Simulated, DatasetError> simulate(
             "the dataset is not the schedule's source"
         );
     }
-    const bool registered = std::holds_alternative<RegisteredScheduleModel>(source.model);
     Simulated simulated{
-        .schema_version = registered ? kRegisteredStrategyRunVersion : kExperimentStrategyRunVersion,
+        .schema_version = run_version(source.model),
         .source = source_json(source, dataset.events.sha256),
         .window = json::Value(json::Object{
             {"end_at_ns", source.window.end_at ? json::Value(std::to_string(source.window.end_at->nanoseconds()))
@@ -377,7 +411,8 @@ std::variant<StrategyRunManifest, DatasetError> parse_strategy_run_manifest(std:
     const json::Value& value = std::get<json::Value>(document);
     ObjectFields fields(value, "manifest");
     const std::string version = datasets::require_name_and_one_of_versions(
-        fields, "schema", kStrategyRunSchemaName, {kExperimentStrategyRunVersion, kRegisteredStrategyRunVersion}
+        fields, "schema", kStrategyRunSchemaName,
+        {kExperimentStrategyRunVersion, kRegisteredStrategyRunVersion, kFoldStrategyRunVersion}
     );
     if (!fields.ok()) {
         return *fields.error();
@@ -409,7 +444,16 @@ std::variant<StrategyRunManifest, DatasetError> parse_strategy_run_manifest(std:
     }
     if (const json::Value* source = fields.value("source"); source != nullptr && fields.ok()) {
         ObjectFields entry(*source, "manifest.source");
-        if (version == kRegisteredStrategyRunVersion) {
+        if (version == kFoldStrategyRunVersion) {
+            entry.require_keys({
+                "collection_id", "dataset_id", "events_sha256", "feature_artifact_id", "fold", "fold_model_id",
+                "information_boundary_ns", "instrument", "model", "parameters_sha256", "plan_id", "schedule_id",
+                "schedule_sha256", "stream", "training_labels_available_through_ns",
+                "training_predictions_through_ns",
+            });
+            (void)entry.sha256("plan_id");
+            (void)entry.sha256("fold_model_id");
+        } else if (version == kRegisteredStrategyRunVersion) {
             entry.require_keys({
                 "dataset_id", "events_sha256", "family", "feature_artifact_id", "information_cutoff", "instrument",
                 "label_artifact_id", "model_version_id", "payload_sha256", "schedule_id", "schedule_sha256",

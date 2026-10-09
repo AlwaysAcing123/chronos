@@ -359,8 +359,18 @@ jobs:
       - name: Type-check
         run: python -m mypy
 
+      # Includes the synthetic walk-forward path end to end: recordings
+      # collected, planned, run through chronos_strategy, inspected, and
+      # audited by tools/walk_forward_audit with the standard library alone.
       - name: Test
         run: python -m pytest
+
+      - name: Check the independent walk-forward auditor (standard library only)
+        working-directory: .
+        run: |
+          python -m ruff format --check tools/walk_forward_audit
+          python -m ruff check tools/walk_forward_audit
+          python -m mypy --strict tools/walk_forward_audit/audit.py
 
       - name: Check deployment validation tools (no credentials or database)
         working-directory: .

@@ -32,6 +32,17 @@
     compare-models    runs a chronos.model_comparison_spec/1 and publishes
                       the comparison; the research service runs it as a job
     inspect-comparison  verifies a comparison and replays every member's run
+    create-collection   publishes a chronos.research_collection/1 of recordings,
+                      each verified from its sources
+    list-collections, inspect-collection
+    plan-walk-forward   builds a chronos.walk_forward_plan/1 from a request and
+                      publishes it, or with --preview only shows it
+    list-walk-forward-plans, inspect-walk-forward-plan
+    run-walk-forward    runs a plan's every fold, model, and scenario through
+                      chronos_strategy and publishes the
+                      chronos.walk_forward_study/1; the research service runs
+                      it as a job, with --progress
+    list-walk-forward-studies, inspect-walk-forward-study
 
 Every option is given at most once, never abbreviated, and never empty.
 Success prints one JSON document on stdout and exits 0; a refused input or
@@ -49,7 +60,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from chronos_research import comparison, model_library
+from chronos_research import collection, comparison, model_library, walk_forward, walk_forward_study
 from chronos_research.artifacts import ArtifactError, is_artifact_id, verify_sources
 from chronos_research.demo import DEFAULT_HORIZON_NS, DemoSource, run_demo
 from chronos_research.encoding import StrictJsonError, strict_json_object
@@ -318,6 +329,7 @@ def _parser() -> argparse.ArgumentParser:
     inspect_comparison.add_argument(
         "--comparison", required=True, type=_artifact_id, action=_Once, help="the comparison ID"
     )
+    _walk_forward_commands(commands)
     serve = commands.add_parser("serve", allow_abbrev=False, help="the local research service")
     for option, help_text in (
         ("--tools", "the directory of built Chronos tools"),
@@ -337,6 +349,185 @@ def _parser() -> argparse.ArgumentParser:
     )
     _docker_options(serve)
     return parser
+
+
+def _roots(parser: argparse.ArgumentParser, tools: bool = True) -> None:
+    if tools:
+        parser.add_argument(
+            "--tools", required=True, type=_path, action=_Once, help="the directory of built Chronos tools"
+        )
+    parser.add_argument(
+        "--artifacts", required=True, type=_path, action=_Once, help="the directory of artifact roots"
+    )
+
+
+def _session_label(text: str) -> tuple[str, str]:
+    label_id, separator, label = text.partition("=")
+    if not separator or not is_artifact_id(label_id) or not label:
+        raise argparse.ArgumentTypeError("must be <label-artifact-id>=<declared session label>")
+    return label_id, label
+
+
+def _walk_forward_commands(commands: Any) -> None:
+    create = commands.add_parser(
+        "create-collection", allow_abbrev=False, help="publish a collection of verified recordings"
+    )
+    _roots(create)
+    create.add_argument(
+        "--label-artifact",
+        required=True,
+        type=_artifact_id,
+        action="append",
+        help="a member recording's label artifact; once per member",
+    )
+    create.add_argument(
+        "--session-label",
+        type=_session_label,
+        action="append",
+        help="<label-artifact-id>=<text>: a declared session or date label, recorded as declared",
+    )
+    _roots(commands.add_parser("list-collections", allow_abbrev=False, help="list collections"), tools=False)
+    inspect = commands.add_parser(
+        "inspect-collection", allow_abbrev=False, help="verify a collection and every member's sources"
+    )
+    _roots(inspect)
+    inspect.add_argument(
+        "--collection", required=True, type=_artifact_id, action=_Once, help="the collection ID"
+    )
+    plan = commands.add_parser(
+        "plan-walk-forward", allow_abbrev=False, help="build a walk-forward plan from a request"
+    )
+    _roots(plan)
+    plan.add_argument(
+        "--request", required=True, action=_Once, help="the chronos.walk_forward_request/1, as JSON"
+    )
+    plan.add_argument("--preview", action="store_true", help="show the plan without publishing it")
+    _roots(
+        commands.add_parser("list-walk-forward-plans", allow_abbrev=False, help="list walk-forward plans"),
+        tools=False,
+    )
+    inspect_plan = commands.add_parser(
+        "inspect-walk-forward-plan",
+        allow_abbrev=False,
+        help="verify a plan by rebuilding it from its request",
+    )
+    _roots(inspect_plan)
+    inspect_plan.add_argument("--plan", required=True, type=_artifact_id, action=_Once, help="the plan ID")
+    study = commands.add_parser(
+        "run-walk-forward", allow_abbrev=False, help="run a walk-forward plan and publish its study"
+    )
+    _roots(study)
+    study.add_argument("--plan", required=True, type=_artifact_id, action=_Once, help="the plan ID")
+    study.add_argument(
+        "--progress", action="store_true", help='write {"progress": {...}} lines to stderr as it runs'
+    )
+    _roots(
+        commands.add_parser(
+            "list-walk-forward-studies", allow_abbrev=False, help="list walk-forward studies"
+        ),
+        tools=False,
+    )
+    inspect_study = commands.add_parser(
+        "inspect-walk-forward-study",
+        allow_abbrev=False,
+        help="verify a study by rebuilding every fold and replaying every run",
+    )
+    _roots(inspect_study)
+    inspect_study.add_argument("--study", required=True, type=_artifact_id, action=_Once, help="the study ID")
+
+
+def _create_collection(arguments: argparse.Namespace) -> dict[str, Any]:
+    labels = dict(arguments.session_label or [])
+    if len(labels) != len(arguments.session_label or []):
+        raise collection.CollectionError("invalid_request", "a member has at most one session label")
+    return collection.create_collection(
+        Tools(arguments.tools), arguments.artifacts, arguments.label_artifact, labels
+    )
+
+
+def _listing(root: Path, ids: list[str], verify: Any, key: str) -> dict[str, Any]:
+    """Every entry that verifies, in ID order, and every other one with why."""
+    entries, invalid = [], []
+    for identifier in ids:
+        try:
+            entries.append(verify(root, identifier))
+        except (
+            collection.CollectionError,
+            walk_forward.PlanError,
+            walk_forward_study.StudyError,
+        ) as error:
+            invalid.append({"id": identifier, "reason": str(error)})
+    return {key: entries, "invalid_entries": invalid}
+
+
+def _list_collections(arguments: argparse.Namespace) -> dict[str, Any]:
+    root = collection.collections_root(arguments.artifacts)
+    return _listing(root, collection.collection_ids(root), collection.verified_collection, "collections")
+
+
+def _inspect_collection(arguments: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "collection": collection.inspect_collection(
+            Tools(arguments.tools), arguments.artifacts, arguments.collection
+        ),
+        "verified": "every member re-verified from its sources; the collection they give is identical",
+    }
+
+
+def _plan_walk_forward(arguments: argparse.Namespace) -> dict[str, Any]:
+    try:
+        request = strict_json_object(arguments.request.encode())
+    except StrictJsonError as error:
+        raise walk_forward.PlanError("invalid_request", f"the request: {error}") from error
+    if arguments.preview:
+        return {
+            "outcome": "preview",
+            "plan": walk_forward.build_plan(Tools(arguments.tools), arguments.artifacts, request),
+        }
+    return walk_forward.create_plan(Tools(arguments.tools), arguments.artifacts, request)
+
+
+def _list_walk_forward_plans(arguments: argparse.Namespace) -> dict[str, Any]:
+    root = walk_forward.plans_root(arguments.artifacts)
+    return _listing(root, walk_forward.plan_ids(root), walk_forward.verified_plan, "plans")
+
+
+def _inspect_walk_forward_plan(arguments: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "plan": walk_forward.inspect_plan(Tools(arguments.tools), arguments.artifacts, arguments.plan),
+        "verified": "the collection's sources re-verified; the plan rebuilt from its request is identical",
+    }
+
+
+def _progress(update: Any) -> None:
+    sys.stderr.write(json.dumps({"progress": dict(update)}, sort_keys=True) + "\n")
+    sys.stderr.flush()
+
+
+def _run_walk_forward(arguments: argparse.Namespace) -> dict[str, Any]:
+    return walk_forward_study.run_study(
+        Tools(arguments.tools),
+        arguments.artifacts,
+        arguments.plan,
+        _progress if arguments.progress else walk_forward_study.no_progress,
+    )
+
+
+def _list_walk_forward_studies(arguments: argparse.Namespace) -> dict[str, Any]:
+    root = walk_forward_study.studies_root(arguments.artifacts)
+    listed = _listing(
+        root,
+        walk_forward_study.study_ids(root),
+        lambda root, identifier: walk_forward_study.listing(
+            walk_forward_study.verified_study(root, identifier)
+        ),
+        "studies",
+    )
+    return listed
+
+
+def _inspect_walk_forward_study(arguments: argparse.Namespace) -> dict[str, Any]:
+    return walk_forward_study.inspect_study(Tools(arguments.tools), arguments.artifacts, arguments.study)
 
 
 def _docker_options(parser: argparse.ArgumentParser, supervised: bool = False) -> None:
@@ -693,15 +884,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "export-onnx": _export_onnx,
         "compare-models": _compare_models,
         "inspect-comparison": _inspect_comparison,
+        "create-collection": _create_collection,
+        "list-collections": _list_collections,
+        "inspect-collection": _inspect_collection,
+        "plan-walk-forward": _plan_walk_forward,
+        "list-walk-forward-plans": _list_walk_forward_plans,
+        "inspect-walk-forward-plan": _inspect_walk_forward_plan,
+        "run-walk-forward": _run_walk_forward,
+        "list-walk-forward-studies": _list_walk_forward_studies,
+        "inspect-walk-forward-study": _inspect_walk_forward_study,
     }
     try:
         result = commands[arguments.command](arguments)
     except (
+        collection.CollectionError,
         ModelImportError,
         SandboxFailedError,
         SandboxRejectedError,
         SandboxUnavailableError,
         StagingError,
+        walk_forward.PlanError,
+        walk_forward_study.StudyError,
     ) as error:
         return _fail(type(error).__name__, str(error), error.reason)
     except (

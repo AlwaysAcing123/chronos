@@ -31,9 +31,12 @@ namespace chronos::strategy {
 inline constexpr std::string_view kStrategyRunSchemaName = "chronos.strategy_run";
 // A version 1 run names the experiment model its version 1 schedule came
 // from; a version 2 run the registered model version of a version 2
-// schedule, and no experiment. Both stay readable.
+// schedule, and no experiment; a version 3 run the walk-forward fold model
+// of a version 3 schedule, and no experiment, split, or labels. Each stays
+// readable.
 inline constexpr std::string_view kExperimentStrategyRunVersion = "1";
 inline constexpr std::string_view kRegisteredStrategyRunVersion = "2";
+inline constexpr std::string_view kFoldStrategyRunVersion = "3";
 inline constexpr std::string_view kJournalFileName = "journal.ndjson";
 inline constexpr datasets::DerivedArtifactLayout kStrategyRunLayout{
     .kind = "strategy run",

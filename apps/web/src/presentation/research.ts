@@ -22,6 +22,15 @@ export const WINDOW_LABEL: Readonly<Record<WindowName, string>> = {
   test: 'Test',
 };
 
+/** A split's window by name, or a walk-forward fold's evaluation recording. */
+export function windowLabel(name: string): string {
+  if (name === 'validation' || name === 'test') {
+    return WINDOW_LABEL[name];
+  }
+  const fold = /^fold_([1-9][0-9]*)$/.exec(name);
+  return fold === null ? name : `Fold ${fold[1] ?? ''}`;
+}
+
 export const MODEL_LABEL: Readonly<Record<ModelName, string>> = {
   logistic: 'Logistic regression',
   majority: 'Majority class (no skill)',

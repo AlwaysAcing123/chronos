@@ -20,6 +20,17 @@ data/schedules/
 data/strategies/
 data/research/
 data/downloads/
+# Model library and comparisons (ADR 0021)
+data/models/
+data/model-names/
+data/model-lifecycle/
+data/comparisons/
+# Walk-forward collections, plans, fold models, and studies (ADR 0022)
+data/collections/
+data/walk_forward_plans/
+data/walk_forward_models/
+data/walk_forward_studies/
+data/walk-forward-demo/
 *.dbn
 *.dbn.zst
 *.pcap

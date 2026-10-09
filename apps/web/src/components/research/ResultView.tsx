@@ -9,13 +9,13 @@ import { CUTOFF_BASIS, familyLabel } from '../../presentation/models';
 import {
   ACCOUNT_LABEL,
   MODEL_LABEL,
-  WINDOW_LABEL,
   decisionReason,
   ppbAsPercent,
   tradeOutcome,
+  windowLabel,
 } from '../../presentation/research';
 import { useDecisions, useEquity, useResult, useTrades } from '../../state/research';
-import { modelsHref } from '../../state/route';
+import { modelsHref, walkForwardHref } from '../../state/route';
 import historyStyles from '../history/history.module.css';
 import { Alert, Code } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
@@ -369,9 +369,70 @@ function Decisions({ result }: { readonly result: ResearchResult }) {
   );
 }
 
-// An experiment's model, or a registered version's family.
+// An experiment's model, a registered version's family, or a fold model.
 function runModelLabel(source: RunSource): string {
-  return 'model_version_id' in source ? familyLabel(source.family) : MODEL_LABEL[source.model];
+  if ('model_version_id' in source) {
+    return familyLabel(source.family);
+  }
+  return 'fold_model_id' in source ? `${MODEL_LABEL[source.model]}, fold ${source.fold} model` : MODEL_LABEL[source.model];
+}
+
+function trainingFacts(source: RunSource) {
+  if ('model_version_id' in source) {
+    return [
+      {
+        label: 'Information cutoff',
+        value: (
+          <>
+            <MarketTime value={source.information_cutoff.at} stacked />
+            <Badge tone={CUTOFF_BASIS[source.information_cutoff.basis].tone}>
+              {CUTOFF_BASIS[source.information_cutoff.basis].label}
+            </Badge>
+          </>
+        ),
+      },
+    ];
+  }
+  if ('fold_model_id' in source) {
+    return [
+      { label: 'Information boundary (exclusive)', value: <MarketTime value={source.information_boundary} stacked /> },
+      { label: 'Training labels known by', value: <MarketTime value={source.training_labels_available_through} stacked /> },
+      { label: 'Training predictions through', value: <MarketTime value={source.training_predictions_through} stacked /> },
+    ];
+  }
+  return [{ label: 'Training labels known by', value: <MarketTime value={source.training_labels_available_through} stacked /> }];
+}
+
+function sourceFacts(source: RunSource, id: (value: string) => ReactNode) {
+  if ('model_version_id' in source) {
+    return [
+      { label: 'Model version', value: <a href={modelsHref(source.model_version_id)}>{id(source.model_version_id)}</a> },
+      { label: 'Payload SHA-256', value: id(source.payload_sha256) },
+      { label: 'Dataset', value: id(source.dataset_id) },
+      { label: 'Features', value: id(source.feature_artifact_id) },
+      { label: 'Labels', value: id(source.label_artifact_id) },
+      { label: 'Split', value: id(source.split_artifact_id) },
+    ];
+  }
+  if ('fold_model_id' in source) {
+    return [
+      { label: 'Walk-forward plan', value: <a href={walkForwardHref({ planId: source.plan_id })}>{id(source.plan_id)}</a> },
+      { label: 'Fold', value: source.fold },
+      { label: 'Fold model', value: id(source.fold_model_id) },
+      { label: 'Parameters SHA-256', value: id(source.parameters_sha256) },
+      { label: 'Collection', value: id(source.collection_id) },
+      { label: 'Dataset', value: id(source.dataset_id) },
+      { label: 'Features', value: id(source.feature_artifact_id) },
+    ];
+  }
+  return [
+    { label: 'Experiment', value: id(source.experiment_id) },
+    { label: 'Parameters SHA-256', value: id(source.parameters_sha256) },
+    { label: 'Dataset', value: id(source.dataset_id) },
+    { label: 'Features', value: id(source.feature_artifact_id) },
+    { label: 'Labels', value: id(source.label_artifact_id) },
+    { label: 'Split', value: id(source.split_artifact_id) },
+  ];
 }
 
 function Provenance({ result }: { readonly result: ResearchResult }) {
@@ -410,7 +471,7 @@ function Provenance({ result }: { readonly result: ResearchResult }) {
         <h3 className={styles.sectionTitle}>Window</h3>
         <Facts
           facts={[
-            { label: 'Window', value: WINDOW_LABEL[window.name] },
+            { label: 'Window', value: windowLabel(window.name) },
             { label: 'Starts', value: <MarketTime value={window.start_at} stacked /> },
             {
               label: 'Ends',
@@ -420,19 +481,7 @@ function Provenance({ result }: { readonly result: ResearchResult }) {
               label: 'Valued at',
               value: window.valued_at === null ? <Unavailable /> : <MarketTime value={window.valued_at} stacked />,
             },
-            'model_version_id' in source
-              ? {
-                  label: 'Information cutoff',
-                  value: (
-                    <>
-                      <MarketTime value={source.information_cutoff.at} stacked />
-                      <Badge tone={CUTOFF_BASIS[source.information_cutoff.basis].tone}>
-                        {CUTOFF_BASIS[source.information_cutoff.basis].label}
-                      </Badge>
-                    </>
-                  ),
-                }
-              : { label: 'Training labels known by', value: <MarketTime value={source.training_labels_available_through} stacked /> },
+            ...trainingFacts(source),
             { label: 'Warm-up events', value: result.events.warmup },
             { label: 'Events in the window', value: result.events.window },
             { label: 'Events after it, unused', value: result.events.after_window_unused },
@@ -446,19 +495,7 @@ function Provenance({ result }: { readonly result: ResearchResult }) {
             { label: 'Result', value: id(result.run_id) },
             { label: 'Schedule', value: id(source.schedule_id) },
             { label: 'Model', value: `${runModelLabel(source)}, ${source.instrument}` },
-            ...('model_version_id' in source
-              ? [
-                  { label: 'Model version', value: <a href={modelsHref(source.model_version_id)}>{id(source.model_version_id)}</a> },
-                  { label: 'Payload SHA-256', value: id(source.payload_sha256) },
-                ]
-              : [
-                  { label: 'Experiment', value: id(source.experiment_id) },
-                  { label: 'Parameters SHA-256', value: id(source.parameters_sha256) },
-                ]),
-            { label: 'Dataset', value: id(source.dataset_id) },
-            { label: 'Features', value: id(source.feature_artifact_id) },
-            { label: 'Labels', value: id(source.label_artifact_id) },
-            { label: 'Split', value: id(source.split_artifact_id) },
+            ...sourceFacts(source, id),
             { label: 'Stream', value: id(source.stream) },
             { label: 'Runner', value: `${result.runner.name} v${result.runner.version}` },
             ...Object.entries(result.environment).map(([label, value]) => ({ label, value })),
@@ -493,7 +530,7 @@ export function ResultView({ runId }: { readonly runId: string }) {
   const data = result.data;
   return (
     <>
-      <Alert tone="info" title={`${data.source.instrument} · ${WINDOW_LABEL[data.window.name]} window · ${runModelLabel(data.source)}`}>
+      <Alert tone="info" title={`${data.source.instrument} · ${windowLabel(data.window.name)} window · ${runModelLabel(data.source)}`}>
         <p>
           {data.scope.charAt(0).toUpperCase() + data.scope.slice(1)}. Prediction accuracy is reported with the model,
           not here: these are simulated trading results. <Code>{data.run_id}</Code>

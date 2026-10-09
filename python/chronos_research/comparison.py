@@ -53,7 +53,6 @@ from chronos_research.onnx_sandbox import (
 from chronos_research.pipeline import (
     ArtifactRoots,
     PipelineError,
-    StrategyOptions,
     Tools,
     inspect_strategy,
     run_strategy,
@@ -72,19 +71,16 @@ from chronos_research.schedule import (
     verify_schedule,
 )
 from chronos_research.scoring import ScoringError, score_schedule, window_labels
+from chronos_research.strategy_configuration import (
+    configuration_problem,
+    strategy_options,
+)
 
 SPEC_SCHEMA = {"name": "chronos.model_comparison_spec", "version": "1"}
 SCHEMA = {"name": "chronos.model_comparison", "version": "1"}
 MIN_MODELS = 2
 MAX_MODELS = 6
 ACCOUNTS = ("strategy", "buy_and_hold", "cash")
-# The strategy runner's options; the runner validates their values, as it
-# does for any evaluation, and the whole-number ones must be whole numbers.
-CONFIGURATION_KEYS = (
-    "decision_interval_ns", "fee_per_fill", "latency_ns", "maximum_order_notional", "maximum_quote_age_ns",
-    "starting_cash", "target_quantity", "threshold_ppb",
-)  # fmt: skip
-_WHOLE_NUMBER_KEYS = ("decision_interval_ns", "latency_ns", "maximum_quote_age_ns", "threshold_ppb")
 FAIRNESS = (
     "every member is predicted on the same feature rows of the same verified split, instrument, and window, "
     "the unlabelled tail included, and run with the same configuration over the same recorded events",
@@ -139,33 +135,14 @@ def validated_spec(document: Any) -> dict[str, Any]:
         document["instrument"]
     ):
         raise ComparisonError("instrument must be one valid instrument identifier")
-    configuration = document["configuration"]
-    if (
-        not isinstance(configuration, dict)
-        or set(configuration) != set(CONFIGURATION_KEYS)
-        or not all(isinstance(value, str) and value for value in configuration.values())
-    ):
-        raise ComparisonError(f"configuration has exactly {', '.join(CONFIGURATION_KEYS)}, as strings")
-    if not all(configuration[key].isascii() and configuration[key].isdigit() for key in _WHOLE_NUMBER_KEYS):
-        raise ComparisonError(f"{', '.join(_WHOLE_NUMBER_KEYS)} are whole numbers")
+    problem = configuration_problem(document["configuration"])
+    if problem is not None:
+        raise ComparisonError(problem)
     return dict(document)
 
 
 def spec_digest(spec: Mapping[str, Any]) -> str:
     return sha256_hex(canonical_json(spec))
-
-
-def strategy_options(configuration: Mapping[str, str]) -> StrategyOptions:
-    return StrategyOptions(
-        threshold_ppb=int(configuration["threshold_ppb"]),
-        target_quantity=configuration["target_quantity"],
-        latency_ns=int(configuration["latency_ns"]),
-        decision_interval_ns=int(configuration["decision_interval_ns"]),
-        starting_cash=configuration["starting_cash"],
-        fee_per_fill=configuration["fee_per_fill"],
-        maximum_quote_age_ns=int(configuration["maximum_quote_age_ns"]),
-        maximum_order_notional=configuration["maximum_order_notional"],
-    )
 
 
 # --- Exact deltas ---------------------------------------------------------------------------------------
@@ -206,7 +183,7 @@ def deltas(member: Mapping[str, Any], reference: Mapping[str, Any] | None) -> di
 # --- Members --------------------------------------------------------------------------------------------
 
 
-def _account(results: Mapping[str, Any]) -> dict[str, Any]:
+def account_summary(results: Mapping[str, Any]) -> dict[str, Any]:
     valuation = results["final"]["valuation"]
     return {
         "drawdown": {
@@ -335,7 +312,7 @@ def run_member(
     except PipelineError as error:
         return {**member, "detail": str(error), "reason": "replay_failed", "state": "failed"}
     member["run"].update(replayed=True, replay=replay["reproduced"])
-    member["accounts"] = {name: _account(manifest["results"]["accounts"][name]) for name in ACCOUNTS}
+    member["accounts"] = {name: account_summary(manifest["results"]["accounts"][name]) for name in ACCOUNTS}
     return {**member, "state": "completed"}
 
 
