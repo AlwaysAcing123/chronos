@@ -20,9 +20,17 @@ cmake -S . -B build-databento \
 cmake --build build-databento --parallel
 ```
 
+To acquire several recordings for an evaluation, use the request-plan
+workflow in [real-market-validation.md](real-market-validation.md): it binds
+an exact plan, a human authorization with per-recording caps, and a durable
+attempt ledger around this tool, and never retries a download that may have
+been charged. The commands below are its single-recording building blocks.
+
 ## Quote before downloading
 
-Use a completed market interval expressed explicitly in UTC. This example is
+Use a completed market interval expressed explicitly in UTC. Databento
+applies `--start` (inclusive) and `--end` (exclusive) to each MBP-1 record's
+`ts_recv`, not its `ts_event`. This example is
 the first ten minutes of the regular US session for AAPL and SPY on September
 25, 2026:
 
@@ -38,6 +46,8 @@ export DATABENTO_API_KEY='replace-with-your-key'
 
 The JSON response contains the estimated provider record count, uncompressed
 billable bytes, and cost in US dollars. Databento says metadata calls are free.
+An estimate that is not a finite, nonnegative number is refused by the
+acquisition code for any provider, before anything is downloaded.
 Its cost estimate can overstate requests whose durations are not multiples of
 ten minutes, while actual billing is based on bytes delivered. The Chronos
 cost limit is therefore a preflight guard against an unexpectedly large
@@ -60,6 +70,10 @@ mkdir -p data/raw/databento/equs-mini
   --stream-id databento-equs-mini-mbp1-20260925-1330-1340 \
   --max-cost-usd 0.25
 ```
+
+`--max-cost-usd` is read as a binary double. The request-plan workflow passes
+the largest double that is at most the authorized whole cents, so the limit
+the tool enforces never exceeds what a person approved.
 
 The download command:
 

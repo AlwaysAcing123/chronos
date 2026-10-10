@@ -31,6 +31,10 @@ data/walk_forward_plans/
 data/walk_forward_models/
 data/walk_forward_studies/
 data/walk-forward-demo/
+# Real-recording acquisition state (licensed recordings, ledgers, receipts) and
+# the artifacts prepared from it (docs/real-market-validation.md).
+data/real-acquisition/
+data/real-pilot/
 *.dbn
 *.dbn.zst
 *.pcap

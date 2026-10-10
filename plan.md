@@ -1285,10 +1285,9 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
       declaration and cannot be verified. Only one profile, one instrument,
       and one target exist. No retraining, champion promotion, or
       authentication.
-15. **Implemented and revised after Codex review, awaiting re-review (not
-    committed):** walk-forward
+15. **Complete (PR #27):** walk-forward
     evaluation over independent recordings, with fee and latency robustness
-    scenarios, on branch `feature/walk-forward-robustness`
+    scenarios, from branch `feature/walk-forward-robustness`
     ([ADR 0022](docs/decisions/0022-walk-forward-evaluation.md),
     [docs/walk-forward-evaluation.md](docs/walk-forward-evaluation.md)).
     - **A. Collections and plans.** A verified collection
@@ -1349,6 +1348,38 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
       two baselines, and long/flat policy; whole-recording windows;
       same-environment reproducibility; no significance claims, promotion,
       or deployment of fold models.
+16. **Implemented, reviewed, and accepted (real multi-session results
+    pending):** a safe,
+    repeatable path to walk-forward studies over several real recordings, on
+    branch `feature/real-market-walk-forward-validation`
+    ([ADR 0023](docs/decisions/0023-authorized-real-recording-acquisition.md),
+    [docs/real-market-validation.md](docs/real-market-validation.md)).
+    - **Plans and authorization.** A `chronos.recording_request_plan/1`
+      binds the provider query, symbols, each recording's `ts_recv` window,
+      stream, session label, and destination or existing file, and freezes
+      the evaluation settings before any data. Metadata quotes are read as
+      exact decimals; a human authorization binds the plan ID, state root,
+      and whole-cent allowance and caps. No default budget exists.
+    - **Acquisition.** The only spending command reserves each attempt's
+      full cap in an fsynced ledger before the provider child starts, holds
+      a root lock the child inherits, never retries or refunds an attempt
+      that did not end in a verified recording, and reuses recordings only
+      after verifying bytes, manifest, replay, and receipt. The state root is
+      a trusted, private directory: links, foreign directories, and ledgers
+      that disagree with their authorization and plan are refused before
+      anything is reserved.
+    - **Preparation and studies.** An offline command verifies, normalizes,
+      collects, and runs each instrument's frozen walk-forward study and the
+      independent auditor, reporting pending recordings and refusals with
+      their reasons.
+    - **Fixes.** Dataset provenance now names Databento's `ts_recv` window;
+      the generic acquisition seam refuses a non-finite or negative estimate
+      before downloading.
+    - **Real data:** no new recording was acquired; no paid request was
+      made. The pilot plan of five ten-minute AAPL/SPY windows (four new,
+      one existing) awaits free quotes and a human budget decision; until
+      then the one real recording is verified and correctly refused for a
+      multi-session study.
 
 The repository currently implements type-specific fixed-point price, money,
 and quantity values; provider-independent market-event types; structured
@@ -1412,8 +1443,10 @@ and a local research service and the workspace's Research view start those
 evaluations and show their results. A model library, constrained ONNX
 imports, comparisons, and paper deployments of registered versions are
 reviewed and merged, as item 14 describes, and walk-forward evaluation with
-cost and latency scenarios is implemented and awaiting review, as item 15
-describes. Chronos does not yet implement boosted-tree or temporal models,
+cost and latency scenarios is complete, as item 15 describes. Authorized
+acquisition of further real recordings for those studies is implemented,
+reviewed, and accepted, with real multi-session results pending a budget decision,
+as item 16 describes. Chronos does not yet implement boosted-tree or temporal models,
 authentication, or the Experiments and Data areas of the web application. A
 first, controlled model-driven deployment to dedicated paper accounts is
 implemented, as item 13 describes.

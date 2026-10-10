@@ -171,6 +171,10 @@ command-line tool that quotes and downloads small real recordings. It refuses
 to download without an explicit maximum quoted cost and never overwrites an
 existing recording. See
 [docs/historical-data-acquisition.md](docs/historical-data-acquisition.md).
+Several recordings for a walk-forward evaluation are planned, quoted, and
+acquired only under a recorded human authorization with per-recording caps
+and a durable attempt ledger that never retries a possibly charged download;
+see [docs/real-market-validation.md](docs/real-market-validation.md).
 
 `chronos_databento_replay` reads a local recording without network access,
 validates and replays every event, recomputes its checksum-backed manifest, and

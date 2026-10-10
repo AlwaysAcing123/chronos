@@ -74,6 +74,10 @@ void test_a_recording_becomes_an_equivalent_dataset() {
     REQUIRE(source.coverage->start.nanoseconds() == static_cast<std::int64_t>(recording_day_nanoseconds()));
     REQUIRE(source.coverage->end.nanoseconds() ==
         static_cast<std::int64_t>(recording_day_nanoseconds() + 1'000'000'000));
+    // Databento filters an MBP-1 request on ts_recv, its index timestamp,
+    // not on ts_event.
+    REQUIRE(source.coverage->semantics ==
+        "Databento query window by receive timestamp (ts_recv); start inclusive, end exclusive");
     // The recording's checksum came from OpenSSL in the adapter; Chronos's
     // own SHA-256 of the same bytes must agree.
     REQUIRE(source.recording_sha256 == chronos::Sha256::hex(read_file(recording.path())));

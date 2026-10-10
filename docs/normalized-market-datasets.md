@@ -253,6 +253,16 @@ demonstration dataset's, indented here for reading:
 `coverage` is the provider query window, which can be wider than the events
 it returned; it is `null` when the window cannot be represented.
 
+Databento filters an MBP-1 request on `ts_recv`, the record's index
+timestamp, not on `ts_event`. The example above was published before that
+was recorded correctly, and its `semantics` says "by event timestamp".
+Datasets normalized since then say "Databento query window by receive
+timestamp (ts_recv); start inclusive, end exclusive". The events, and the
+window the provider applied, are the same either way. Readers accept any
+non-empty `semantics`, so earlier datasets still verify, but normalizing the
+same recording again now gives a dataset whose manifest, and so its ID,
+differs in that text alone ([real-market-validation.md](real-market-validation.md)).
+
 The parser checks, and fails closed on, each of these:
 - **Form:** canonical bytes and one trailing newline.
 - **Fields:** no unknown, missing, or duplicate field.

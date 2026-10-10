@@ -905,6 +905,57 @@ void test_historical_acquisition_removes_invalid_recording() {
     REQUIRE(!std::filesystem::exists(destination.manifest_path()));
 }
 
+// The cost limit compares the estimate with `>`, which is false for NaN, so
+// any provider (not only Databento's, which already refuses these) must be
+// held to a finite, nonnegative estimate before anything is downloaded.
+void test_historical_acquisition_refuses_an_invalid_cost_estimate() {
+    for (const double estimate : {
+             std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::infinity(),
+             -0.01,
+         }) {
+        TemporaryDbnFile source;
+        source.write(valid_metadata(), valid_records());
+        TemporaryRecordingDestination destination;
+        FakeHistoricalRecordingProvider provider(
+            source.path(),
+            HistoricalRecordingQuote{
+                .estimated_record_count = 2,
+                .estimated_billable_size_bytes = 1'024,
+                .estimated_cost_usd = estimate,
+            }
+        );
+
+        require_acquisition_error(
+            adapter::acquire_historical_recording(
+                provider,
+                HistoricalRecordingAcquisitionRequest{
+                    .query = valid_historical_query(),
+                    .destination = destination.path(),
+                    .stream = MarketDataStreamId("invalid-estimate"),
+                    .maximum_cost_usd = 1.00,
+                }
+            ),
+            HistoricalRecordingErrorCode::ProviderQuoteFailed
+        );
+        REQUIRE(provider.quote_calls == 1);
+        REQUIRE(provider.download_calls == 0);
+        REQUIRE(!std::filesystem::exists(destination.path()));
+        REQUIRE(!std::filesystem::exists(destination.manifest_path()));
+
+        const auto quoted = adapter::quote_historical_recording(
+            provider,
+            valid_historical_query()
+        );
+        REQUIRE(std::holds_alternative<HistoricalRecordingError>(quoted));
+        REQUIRE(
+            std::get<HistoricalRecordingError>(quoted).code ==
+            HistoricalRecordingErrorCode::ProviderQuoteFailed
+        );
+        REQUIRE(provider.download_calls == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -986,6 +1037,10 @@ int main() {
         {
             "invalid historical recording cleanup",
             test_historical_acquisition_removes_invalid_recording,
+        },
+        {
+            "invalid historical cost estimate",
+            test_historical_acquisition_refuses_an_invalid_cost_estimate,
         },
     });
 }
