@@ -11,6 +11,7 @@ import { Alert, Code } from '../ui/Alert';
 import { Badge } from '../ui/Badge';
 import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
+import { ScrollingTable } from './ScrollingTable';
 
 export const CREATE_COLLECTION_COMMAND =
   'python -m chronos_research create-collection --tools <build> --artifacts ../data --label-artifact <id> …';
@@ -69,7 +70,7 @@ export function CollectionList() {
                   Collection <span className={styles.ids}>{shortId(collection.collection_id)}</span>{' '}
                   <Badge tone={EVIDENCE[collection.evidence].tone}>{EVIDENCE[collection.evidence].label}</Badge>
                 </h3>
-                <div className={historyStyles.scroll}>
+                <ScrollingTable label={`Members of collection ${shortId(collection.collection_id)}`}>
                   <table className={historyStyles.table}>
                     <caption className="visually-hidden">
                       Members of collection {collection.collection_id}, in time order
@@ -117,7 +118,7 @@ export function CollectionList() {
                       ))}
                     </tbody>
                   </table>
-                </div>
+                </ScrollingTable>
               </div>
             ))
           )}

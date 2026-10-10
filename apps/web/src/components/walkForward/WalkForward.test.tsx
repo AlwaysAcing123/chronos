@@ -62,6 +62,23 @@ describe('Walk-forward evaluation', () => {
     expect(screen.getByRole('region', { name: 'Study jobs' })).toBeInTheDocument();
   });
 
+  it('lets every collection’s member table scroll with the keyboard, as real stream names widen it', async () => {
+    const research = createFakeResearch();
+    serveHome(
+      research,
+      collectionPageJson([collectionJson(WEEK_COLLECTION_ID), collectionJson(ONE_RECORDING_COLLECTION_ID)]),
+    );
+    renderWithServices(<WalkForward planId={null} studyId={null} />, { research });
+
+    const list = await screen.findByRole('region', { name: 'Recording collections' });
+    for (const id of [WEEK_COLLECTION_ID, ONE_RECORDING_COLLECTION_ID]) {
+      const table = await within(list).findByRole('table', { name: new RegExp(id) });
+      const scroller = table.parentElement;
+      expect(scroller).toHaveAttribute('tabindex', '0');
+      expect(scroller).toHaveAccessibleName(new RegExp(`Members of collection ${id.slice(0, 12)}`));
+    }
+  });
+
   it('explains why one recording cannot be planned and offers no Preview', async () => {
     const research = createFakeResearch();
     serveHome(research, collectionPageJson([collectionJson(ONE_RECORDING_COLLECTION_ID)]));

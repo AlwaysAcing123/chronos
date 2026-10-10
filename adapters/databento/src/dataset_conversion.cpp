@@ -33,7 +33,10 @@ datasets::DatasetSource dataset_source(const RecordingManifest& manifest) {
         coverage = datasets::DatasetCoverage{
             .start = *start,
             .end = *end,
-            .semantics = "Databento query window by event timestamp; start inclusive, end exclusive",
+            // Databento filters an MBP-1 request on ts_recv, its index
+            // timestamp (the pinned SDK's Mbp1Msg::IndexTs), not ts_event.
+            .semantics = "Databento query window by receive timestamp (ts_recv); "
+                         "start inclusive, end exclusive",
         };
     }
     return datasets::DatasetSource{

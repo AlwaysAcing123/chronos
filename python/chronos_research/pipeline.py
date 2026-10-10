@@ -30,9 +30,16 @@ from chronos_research.publication import publish
 # Every executable a step may run, by its fixed name.
 CHRONOS_DATASET = "chronos_dataset"
 DATABENTO_NORMALIZE = "chronos_databento_normalize"
+# Offline: recomputes a raw recording's manifest from its bytes.
+DATABENTO_REPLAY = "chronos_databento_replay"
+# The only tool that can contact the provider; only acquisition.py runs it.
+DATABENTO_HISTORICAL = "chronos_databento_historical"
 SYNTHETIC_DATASET = "chronos_synthetic_dataset"
 CHRONOS_STRATEGY = "chronos_strategy"
-_TOOLS = (CHRONOS_DATASET, DATABENTO_NORMALIZE, SYNTHETIC_DATASET, CHRONOS_STRATEGY)
+_TOOLS = (
+    CHRONOS_DATASET, DATABENTO_NORMALIZE, DATABENTO_REPLAY, DATABENTO_HISTORICAL, SYNTHETIC_DATASET,
+    CHRONOS_STRATEGY,
+)  # fmt: skip
 _TOOL_TIMEOUT_SECONDS = 3600
 
 

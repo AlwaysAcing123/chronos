@@ -43,6 +43,12 @@
                       chronos.walk_forward_study/1; the research service runs
                       it as a job, with --progress
     list-walk-forward-studies, inspect-walk-forward-study
+    plan-recordings, quote-recordings, authorize-acquisition,
+    acquire-recordings, recover-acquisition, prepare-recordings
+                      a real-recording request plan, its free metadata
+                      quotes, a human authorization, the one command that
+                      can spend money, recovery, and offline preparation;
+                      see acquisition_cli.py and docs/real-market-validation.md
 
 Every option is given at most once, never abbreviated, and never empty.
 Success prints one JSON document on stdout and exits 0; a refused input or
@@ -60,7 +66,16 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from chronos_research import collection, comparison, model_library, walk_forward, walk_forward_study
+from chronos_research import (
+    acquisition_cli,
+    collection,
+    comparison,
+    model_library,
+    walk_forward,
+    walk_forward_study,
+)
+from chronos_research.acquisition import AcquisitionError
+from chronos_research.acquisition_budget import BudgetError
 from chronos_research.artifacts import ArtifactError, is_artifact_id, verify_sources
 from chronos_research.demo import DEFAULT_HORIZON_NS, DemoSource, run_demo
 from chronos_research.encoding import StrictJsonError, strict_json_object
@@ -90,6 +105,8 @@ from chronos_research.pipeline import (
     verified_sources,
 )
 from chronos_research.publication import PublicationError
+from chronos_research.recording_plan import RecordingPlanError
+from chronos_research.recording_verification import RecordingVerificationError
 from chronos_research.registry import (
     EXPERIMENT_FAMILIES,
     LIFECYCLE_STATES,
@@ -330,6 +347,7 @@ def _parser() -> argparse.ArgumentParser:
         "--comparison", required=True, type=_artifact_id, action=_Once, help="the comparison ID"
     )
     _walk_forward_commands(commands)
+    acquisition_cli.add_commands(commands, _Once, _path, _artifact_id)
     serve = commands.add_parser("serve", allow_abbrev=False, help="the local research service")
     for option, help_text in (
         ("--tools", "the directory of built Chronos tools"),
@@ -893,12 +911,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run-walk-forward": _run_walk_forward,
         "list-walk-forward-studies": _list_walk_forward_studies,
         "inspect-walk-forward-study": _inspect_walk_forward_study,
+        **acquisition_cli.COMMANDS,
     }
     try:
         result = commands[arguments.command](arguments)
     except (
+        AcquisitionError,
+        BudgetError,
         collection.CollectionError,
         ModelImportError,
+        RecordingPlanError,
+        RecordingVerificationError,
         SandboxFailedError,
         SandboxRejectedError,
         SandboxUnavailableError,

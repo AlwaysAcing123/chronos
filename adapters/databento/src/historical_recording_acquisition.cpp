@@ -96,6 +96,24 @@ std::optional<HistoricalRecordingError> validate_query(
     return std::nullopt;
 }
 
+// Any provider's estimate, not only Databento's: the cost limit compares
+// with `>`, which is false for NaN, so an invalid estimate must stop here.
+HistoricalRecordingQuoteResult validated_quote(
+    HistoricalRecordingQuoteResult result
+) {
+    if (const auto* quote = std::get_if<HistoricalRecordingQuote>(&result)) {
+        if (!std::isfinite(quote->estimated_cost_usd) ||
+            quote->estimated_cost_usd < 0.0) {
+            return acquisition_error(
+                HistoricalRecordingErrorCode::ProviderQuoteFailed,
+                "estimated_cost_usd",
+                "provider returned an invalid cost estimate"
+            );
+        }
+    }
+    return result;
+}
+
 std::filesystem::path manifest_path_for(
     const std::filesystem::path& recording_path
 ) {
@@ -406,7 +424,7 @@ HistoricalRecordingQuoteResult quote_historical_recording(
     if (const auto error = validate_query(query)) {
         return *error;
     }
-    return provider.quote(query);
+    return validated_quote(provider.quote(query));
 }
 
 HistoricalRecordingAcquisitionResult acquire_historical_recording(
@@ -417,7 +435,7 @@ HistoricalRecordingAcquisitionResult acquire_historical_recording(
         return *error;
     }
 
-    auto quote_result = provider.quote(request.query);
+    auto quote_result = validated_quote(provider.quote(request.query));
     if (std::holds_alternative<HistoricalRecordingError>(quote_result)) {
         return std::get<HistoricalRecordingError>(std::move(quote_result));
     }
