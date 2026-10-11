@@ -382,10 +382,13 @@ def audit_run(
     threshold = int(policy["threshold_ppb"])
     target_quantity = Decimal(policy["target_quantity"])
     interval = int(policy["decision_interval_ns"])
+    # Only the instrument's top-of-book events are quotes: as in the engine,
+    # an order executes, and an account is marked, only on one of them; a
+    # trade print has no bid or ask.
     quotes = {
         event["ingest_sequence"]: event
         for event in events
-        if event["instrument"] == instrument
+        if event["instrument"] == instrument and event["type"] == "top_of_book"
     }
     # The instrument's quotes in ingest order, which is receive order.
     timeline = sorted(quotes.values(), key=lambda quote: int(quote["ingest_sequence"]))

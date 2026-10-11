@@ -33,6 +33,8 @@ class Recording:
     instruments: tuple[str, ...] = ("AAPL", "SPY")
     # Nanoseconds after the session start at which it begins.
     offset_ns: int = 0
+    # Quotes of the first instrument alone, 100 ms apart, after the others stop.
+    tail_quotes: int = 0
 
 
 @dataclass(frozen=True)
@@ -58,16 +60,21 @@ class Recordings:
 def recording_events(recording: Recording) -> str:
     """CSV for chronos_synthetic_dataset, in receive order."""
     generator = np.random.default_rng(recording.seed)
-    midpoints = {"AAPL": 10_000, "SPY": 50_000}
-    imbalance = {"AAPL": 0.0, "SPY": 0.0}
+    midpoints = {
+        instrument: {"AAPL": 10_000, "SPY": 50_000}.get(instrument, 20_000)
+        for instrument in recording.instruments
+    }
+    imbalance = dict.fromkeys(recording.instruments, 0.0)
     at = FIRST_SESSION_NS + recording.day * DAY_NS + recording.offset_ns
+    # Spacing is spread so the last instrument still quotes before the next step.
+    gaps = max(len(recording.instruments) - 1, 1)
     lines: list[str] = []
     for step in range(recording.quotes):
         at += int(generator.integers(50_000, 400_000))
         if step and step % 97 == 0:
             at += 20_000_000
         # Every eleventh step, the instruments quote at the same receive time.
-        spacing = 0 if step % 11 == 0 else int(generator.integers(1, 40_000))
+        spacing = 0 if step % 11 == 0 else int(generator.integers(1, 40_000)) // gaps
         for position, instrument in enumerate(recording.instruments):
             draw = generator.random()
             up = recording.up_bias + 0.3 * imbalance[instrument]
@@ -80,6 +87,11 @@ def recording_events(recording: Recording) -> str:
             lines.append(
                 f"quote,{instrument},{at + position * spacing},{bid:.2f},{bid_size},{ask:.2f},{ask_size}"
             )
+    first = recording.instruments[0]
+    for _ in range(recording.tail_quotes):
+        at += 100_000_000
+        bid, ask = (midpoints[first] - 1) / 100, (midpoints[first] + 1) / 100
+        lines.append(f"quote,{first},{at},{bid:.2f},10,{ask:.2f},10")
     return "\n".join(lines) + "\n"
 
 
