@@ -370,6 +370,20 @@ The result view reads fold runs too (window `Fold <k>`, the information
 boundary and training bounds, and the plan, fold, and fold model, with no
 labels or split).
 
+- **Strategy diagnostics.** A study page lists its diagnostics and can
+  request them (a job; reads never generate). The page
+  `#/research/walk-forward/diagnostics/<id>` and its run deep links
+  (`…/runs/<run-id>/<strategy|buy_and_hold|cash>`) show each verification
+  level apart, every run, the selected run's PnL bridge, account, timing,
+  decision cohorts, future returns, confidence bins, episodes, and fills,
+  and the pools. Each run, cohort, and pool carries the service's trust of
+  it: one resting on a source that did not verify on the read is labelled
+  unverified, with recorded identities shown as recorded, and nothing else
+  is. Figures are the decoders' own 18-place `DiagnosticDecimal` strings
+  (`src/api/diagnosticsSchemas.ts`), shown as sent; the simulated account in
+  the link is never the paper-trading account, which stays selected. See
+  [strategy-diagnostics.md](strategy-diagnostics.md).
+
 ### Model deployments
 
 Research also deploys a model to a paper account

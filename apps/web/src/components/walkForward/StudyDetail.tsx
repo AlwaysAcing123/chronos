@@ -44,6 +44,7 @@ import { MarketTime } from '../ui/MarketTime';
 import { Panel } from '../ui/Panel';
 import { SyntheticNotice } from './PlanReview';
 import { ScrollingTable } from './ScrollingTable';
+import { StudyDiagnostics } from './StudyDiagnostics';
 
 const MODELS: readonly ModelName[] = ['majority', 'logistic'];
 
@@ -785,6 +786,7 @@ export function StudyDetailView({ studyId }: { readonly studyId: string }) {
       <Summary study={study} verification={verification} />
       <TradingByFold study={study} verification={verification} />
       <Aggregates study={study} verification={verification} />
+      <StudyDiagnostics studyId={study.study_id} />
       <PredictionQuality study={study} verification={verification} />
       <FoldModels study={study} artifacts={artifacts} />
       <Reproducibility study={study} />

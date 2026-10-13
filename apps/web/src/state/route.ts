@@ -2,9 +2,10 @@
 // the same view. Trading is the default; its in-page section links (such as
 // #portfolio) keep working because only #/research... selects Research and
 // only #/models... the model library and #/comparisons... its comparisons.
-// Walk-forward evaluation lives inside Research, under #/research/walk-forward.
-// The account selection is separate browser state, so switching views never
-// changes it.
+// Walk-forward evaluation lives inside Research, under #/research/walk-forward,
+// and so do strategy diagnostics, whose deep link names one run and one of its
+// simulated accounts. The paper-trading account selection is separate browser
+// state, so switching views, runs, or simulated accounts never changes it.
 import { useCallback, useEffect, useState } from 'react';
 
 export type Route =
@@ -12,7 +13,17 @@ export type Route =
   | { readonly view: 'research'; readonly resultId: string | null }
   | { readonly view: 'models'; readonly modelId: string | null }
   | { readonly view: 'comparisons'; readonly comparisonId: string | null }
-  | { readonly view: 'walk-forward'; readonly planId: string | null; readonly studyId: string | null };
+  | { readonly view: 'walk-forward'; readonly planId: string | null; readonly studyId: string | null }
+  | {
+      readonly view: 'diagnostics';
+      readonly diagnosticId: string;
+      readonly runId: string | null;
+      readonly account: SimulatedAccount;
+    };
+
+// The simulated accounts of a strategy run: never a paper-trading account.
+export type SimulatedAccount = 'strategy' | 'buy_and_hold' | 'cash';
+const SIMULATED: readonly SimulatedAccount[] = ['strategy', 'buy_and_hold', 'cash'];
 
 const RESULT = /^#\/research\/results\/([0-9a-f]{64})$/;
 const MODEL = /^#\/models\/([0-9a-f]{64})$/;
@@ -20,11 +31,18 @@ const COMPARISON = /^#\/comparisons\/([0-9a-f]{64})$/;
 const WALK_FORWARD = '#/research/walk-forward';
 const PLAN = /^#\/research\/walk-forward\/plans\/([0-9a-f]{64})$/;
 const STUDY = /^#\/research\/walk-forward\/studies\/([0-9a-f]{64})$/;
+const DIAGNOSTICS =
+  /^#\/research\/walk-forward\/diagnostics\/([0-9a-f]{64})(?:\/runs\/([0-9a-f]{64})(?:\/(strategy|buy_and_hold|cash))?)?$/;
 
 export function parseRoute(hash: string): Route {
   const plan = PLAN.exec(hash);
   if (plan !== null) {
     return { view: 'walk-forward', planId: plan[1] ?? null, studyId: null };
+  }
+  const diagnostics = DIAGNOSTICS.exec(hash);
+  if (diagnostics?.[1] !== undefined) {
+    const account = SIMULATED.find((name) => name === diagnostics[3]) ?? 'strategy';
+    return { view: 'diagnostics', diagnosticId: diagnostics[1], runId: diagnostics[2] ?? null, account };
   }
   const study = STUDY.exec(hash);
   if (study !== null) {
@@ -75,6 +93,18 @@ export function walkForwardHref(target: { readonly planId?: string; readonly stu
     return `${WALK_FORWARD}/studies/${target.studyId}`;
   }
   return target.planId === undefined ? WALK_FORWARD : `${WALK_FORWARD}/plans/${target.planId}`;
+}
+
+export function diagnosticsHref(target: {
+  readonly diagnosticId: string;
+  readonly runId?: string | null;
+  readonly account?: SimulatedAccount;
+}): string {
+  const base = `${WALK_FORWARD}/diagnostics/${target.diagnosticId}`;
+  if (target.runId === undefined || target.runId === null) {
+    return base;
+  }
+  return `${base}/runs/${target.runId}/${target.account ?? 'strategy'}`;
 }
 
 export const TRADING_HREF = '#/';
