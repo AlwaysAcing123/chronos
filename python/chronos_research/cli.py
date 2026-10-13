@@ -43,6 +43,14 @@
                       chronos.walk_forward_study/1; the research service runs
                       it as a job, with --progress
     list-walk-forward-studies, inspect-walk-forward-study
+    diagnose-strategies explains studies' runs: exact PnL attribution and
+                      decision cohorts, published as
+                      chronos.strategy_diagnostics/2 without refitting,
+                      scheduling, or running anything; the research service
+                      runs it as a job, with --progress
+    list-strategy-diagnostics, show-strategy-diagnostics (verified, as
+                      stored), inspect-strategy-diagnostics (rebuilt from
+                      its sources: identical bytes, nothing published)
     plan-recordings, quote-recordings, authorize-acquisition,
     acquire-recordings, recover-acquisition, prepare-recordings
                       a real-recording request plan, its free metadata
@@ -71,6 +79,7 @@ from chronos_research import (
     collection,
     comparison,
     model_library,
+    strategy_diagnostics,
     walk_forward,
     walk_forward_study,
 )
@@ -119,6 +128,7 @@ from chronos_research.registry import (
     verified_model_version,
 )
 from chronos_research.schedule import SCHEDULE_MODELS, WINDOWS, ScheduleError, reproduce_schedule
+from chronos_research.strategy_attribution import DiagnosticsError
 
 
 class _Once(argparse.Action):
@@ -347,6 +357,7 @@ def _parser() -> argparse.ArgumentParser:
         "--comparison", required=True, type=_artifact_id, action=_Once, help="the comparison ID"
     )
     _walk_forward_commands(commands)
+    _diagnostics_commands(commands)
     acquisition_cli.add_commands(commands, _Once, _path, _artifact_id)
     serve = commands.add_parser("serve", allow_abbrev=False, help="the local research service")
     for option, help_text in (
@@ -452,6 +463,73 @@ def _walk_forward_commands(commands: Any) -> None:
     )
     _roots(inspect_study)
     inspect_study.add_argument("--study", required=True, type=_artifact_id, action=_Once, help="the study ID")
+
+
+def _diagnostics_commands(commands: Any) -> None:
+    diagnose = commands.add_parser(
+        "diagnose-strategies", allow_abbrev=False, help="explain studies' PnL and decisions, and publish it"
+    )
+    _roots(diagnose)
+    diagnose.add_argument(
+        "--study", required=True, type=_artifact_id, action="append", help="a study ID; once per study"
+    )
+    diagnose.add_argument(
+        "--progress", action="store_true", help='write {"progress": {...}} lines to stderr as it runs'
+    )
+    _roots(
+        commands.add_parser(
+            "list-strategy-diagnostics", allow_abbrev=False, help="list strategy diagnostics"
+        ),
+        tools=False,
+    )
+    for name, help_text, tools in (
+        ("show-strategy-diagnostics", "print verified strategy diagnostics as stored", False),
+        ("inspect-strategy-diagnostics", "rebuild strategy diagnostics from their sources", True),
+    ):
+        command = commands.add_parser(name, allow_abbrev=False, help=help_text)
+        _roots(command, tools=tools)
+        command.add_argument(
+            "--diagnostics", required=True, type=_artifact_id, action=_Once, help="the diagnostics ID"
+        )
+
+
+def _diagnose_strategies(arguments: argparse.Namespace) -> dict[str, Any]:
+    if len(set(arguments.study)) != len(arguments.study):
+        raise DiagnosticsError("invalid_request", "each study is given once")
+    return strategy_diagnostics.generate_diagnostics(
+        Tools(arguments.tools),
+        arguments.artifacts,
+        strategy_diagnostics.request_for(arguments.study),
+        _progress if arguments.progress else strategy_diagnostics.no_progress,
+    )
+
+
+def _list_strategy_diagnostics(arguments: argparse.Namespace) -> dict[str, Any]:
+    root = strategy_diagnostics.diagnostics_root(arguments.artifacts)
+    entries, invalid = [], []
+    for identifier in strategy_diagnostics.diagnostic_ids(root):
+        try:
+            entries.append(
+                strategy_diagnostics.listing(strategy_diagnostics.verified_diagnostics(root, identifier)[0])
+            )
+        except DiagnosticsError as error:
+            invalid.append({"id": identifier, "reason": str(error)})
+    return {"diagnostics": entries, "invalid_entries": invalid}
+
+
+def _show_strategy_diagnostics(arguments: argparse.Namespace) -> dict[str, Any]:
+    root = strategy_diagnostics.diagnostics_root(arguments.artifacts)
+    manifest, _ = strategy_diagnostics.verified_diagnostics(root, arguments.diagnostics)
+    return {
+        "diagnostics": manifest,
+        "verified": "the artifact's identity and every file's checksum; nothing rebuilt",
+    }
+
+
+def _inspect_strategy_diagnostics(arguments: argparse.Namespace) -> dict[str, Any]:
+    return strategy_diagnostics.inspect_diagnostics(
+        Tools(arguments.tools), arguments.artifacts, arguments.diagnostics
+    )
 
 
 def _create_collection(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -911,6 +989,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run-walk-forward": _run_walk_forward,
         "list-walk-forward-studies": _list_walk_forward_studies,
         "inspect-walk-forward-study": _inspect_walk_forward_study,
+        "diagnose-strategies": _diagnose_strategies,
+        "list-strategy-diagnostics": _list_strategy_diagnostics,
+        "show-strategy-diagnostics": _show_strategy_diagnostics,
+        "inspect-strategy-diagnostics": _inspect_strategy_diagnostics,
         **acquisition_cli.COMMANDS,
     }
     try:
@@ -919,6 +1001,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         AcquisitionError,
         BudgetError,
         collection.CollectionError,
+        DiagnosticsError,
         ModelImportError,
         RecordingPlanError,
         RecordingVerificationError,

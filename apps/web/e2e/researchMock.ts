@@ -10,6 +10,17 @@ import {
   comparisonJobJson,
   comparisonPageJson,
 } from '../src/test/comparisonFixtures';
+import {
+  DIAGNOSTICS_JOB_ID,
+  DIAGNOSTIC_ID,
+  DIAGNOSED_RUN_ID,
+  diagnosticsDetailJson,
+  diagnosticsJobJson,
+  diagnosticsPageJson,
+  emptyDiagnosticsPageJson,
+  episodePageJson,
+  fillPageJson,
+} from '../src/test/diagnosticsFixtures';
 import { errorJson } from '../src/test/fixtures';
 import {
   ONE_RECORDING_COLLECTION_ID,
@@ -70,6 +81,14 @@ export interface ResearchMockOptions {
   readonly oneRecording?: boolean;
   // The study's fold 2 logistic base run journal no longer matches its manifest.
   readonly corruptStudyRun?: boolean;
+  // Diagnostics already exist, without a job in this session.
+  readonly seededDiagnostics?: boolean;
+  // The diagnosed logistic base run's journal no longer matches, and its
+  // final valuation was unavailable.
+  readonly corruptDiagnosticsRun?: boolean;
+  // One source no longer matches on the read, as the service reported it:
+  // the logistic base run's journal, the logistic schedule, or the study.
+  readonly unverifiedDiagnostics?: 'run' | 'schedule' | 'study';
 }
 
 function reply(route: Route, status: number, body: unknown) {
@@ -103,6 +122,10 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
   let planPolls = 0;
   let studyJob: Json | null = null;
   let studyPolls = 0;
+  // Strategy diagnostics: a job reporting its stages, then the artifact.
+  let diagnosticsJob: Json | null = null;
+  let diagnosticsPolls = 0;
+  const diagnosed = () => options.seededDiagnostics === true || diagnosticsJob?.state === 'succeeded';
 
   await page.route('**/api/v1/research/**', async (route) => {
     if (options.unreachable === true) {
@@ -309,6 +332,75 @@ export async function mockResearchService(page: Page, options: ResearchMockOptio
         runs.base = 'invalid: journal.ndjson differs from its manifest’s checksum';
       }
       return reply(route, 200, detail);
+    }
+    if (path === '/strategy-diagnostics' && request.method() === 'POST') {
+      if (diagnosticsJob !== null) {
+        return reply(route, 200, { deduplicated: true, job: diagnosticsJob });
+      }
+      const requested = request.postDataJSON() as { study_ids: string[] };
+      diagnosticsJob = diagnosticsJobJson({
+        finished_at: null,
+        progress: null,
+        request: { study_ids: [...requested.study_ids].sort() },
+        result: null,
+        started_at: null,
+        state: 'queued',
+      });
+      diagnosticsPolls = 0;
+      return reply(route, 202, { deduplicated: false, job: diagnosticsJob });
+    }
+    if (path === `/jobs/${DIAGNOSTICS_JOB_ID}` && diagnosticsJob !== null) {
+      diagnosticsPolls += 1;
+      const progress = [
+        { stage: 'verify_sources' },
+        { fold: '1', folds: '1', model: 'logistic', scenario: 'stress', stage: 'attribute' },
+      ][diagnosticsPolls - 1];
+      diagnosticsJob =
+        progress === undefined
+          ? diagnosticsJobJson({ request: diagnosticsJob.request })
+          : { ...diagnosticsJob, progress, started_at: '2026-10-12T15:00:00.100000000Z', state: 'running' };
+      return reply(route, 200, { job: diagnosticsJob });
+    }
+    if (path === '/strategy-diagnostics') {
+      return reply(route, 200, diagnosed() ? diagnosticsPageJson() : emptyDiagnosticsPageJson());
+    }
+    if (path === `/strategy-diagnostics/${DIAGNOSTIC_ID}` && diagnosed()) {
+      const detail = diagnosticsDetailJson(
+        options.corruptDiagnosticsRun === true ? 'run' : options.unverifiedDiagnostics,
+      );
+      if (options.corruptDiagnosticsRun === true) {
+        const runs = ((detail.diagnostics as { studies: { folds: { runs: Json[] }[] }[] }).studies[0]?.folds[0]?.runs ??
+          []);
+        const run = runs.find((entry) => entry.run_id === DIAGNOSED_RUN_ID) ?? {};
+        const strategy = (run.accounts as Json).strategy as Json;
+        const reason = 'final_valuation_unavailable:position_mark_unavailable';
+        for (const name of ['booked_net_pnl', 'midpoint_inventory_pnl', 'terminal_bid_markdown', 'rounding_adjustment']) {
+          (strategy.components as Json)[name] = { unavailable: reason };
+        }
+        strategy.reconciliation = { booked_net_pnl: { unavailable: reason }, signal_reference: { unavailable: reason } };
+      }
+      return reply(route, 200, detail);
+    }
+    if (path === `/strategy-diagnostics/${DIAGNOSTIC_ID}/fills` && diagnosed()) {
+      const account = url.searchParams.get('account');
+      const run = url.searchParams.get('run');
+      if (run !== DIAGNOSED_RUN_ID) {
+        return reply(route, 200, { fills: [], next_cursor: null });
+      }
+      if (account === 'buy_and_hold') {
+        return reply(route, 200, fillPageJson('buy_and_hold'));
+      }
+      if (account === 'strategy') {
+        return reply(route, 200, fillPageJson(url.searchParams.get('cursor') === null ? 'first' : 'next'));
+      }
+      return reply(route, 200, { fills: [], next_cursor: null });
+    }
+    if (path === `/strategy-diagnostics/${DIAGNOSTIC_ID}/episodes` && diagnosed()) {
+      const strategy = url.searchParams.get('run') === DIAGNOSED_RUN_ID && url.searchParams.get('account') === 'strategy';
+      return reply(route, 200, strategy ? episodePageJson() : { episodes: [], next_cursor: null });
+    }
+    if (path.startsWith('/strategy-diagnostics/')) {
+      return reply(route, 404, errorJson('diagnostics_not_found', 'no such strategy diagnostics'));
     }
     if (path === '/results') {
       return reply(route, 200, { results: published() ? [resultListingJson()] : [], invalid_entries: [], next_cursor: null });

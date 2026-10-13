@@ -372,6 +372,13 @@ jobs:
           python -m ruff check tools/walk_forward_audit
           python -m mypy --strict tools/walk_forward_audit/audit.py
 
+      - name: Check the independent strategy-diagnostics auditor (standard library only)
+        working-directory: .
+        run: |
+          python -m ruff format --check tools/strategy_diagnostics_audit
+          python -m ruff check tools/strategy_diagnostics_audit
+          python -m mypy --strict tools/strategy_diagnostics_audit/audit.py
+
       - name: Check deployment validation tools (no credentials or database)
         working-directory: .
         run: |

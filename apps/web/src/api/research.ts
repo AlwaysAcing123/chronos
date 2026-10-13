@@ -8,6 +8,23 @@ import { ChronosApiError } from './errors';
 import type { HttpResponse, ResponseIdentity, TransportOptions } from './http';
 import { decodeBody, failureOf, sendRequest } from './http';
 import type { ComparisonDetail, ComparisonPage, ComparisonRequest, StartedComparison } from './comparisonSchemas';
+import type {
+  DiagnosticsDetail,
+  DiagnosticsJob,
+  DiagnosticsPage,
+  EpisodePage,
+  FillPage,
+  SimulatedAccount,
+  StartedDiagnostics,
+} from './diagnosticsSchemas';
+import {
+  DiagnosticsEnvelopeSchema,
+  DiagnosticsJobEnvelopeSchema,
+  DiagnosticsPageSchema,
+  EpisodePageSchema,
+  FillPageSchema,
+  StartedDiagnosticsSchema,
+} from './diagnosticsSchemas';
 import { ComparisonEnvelopeSchema, ComparisonPageSchema, StartedComparisonSchema } from './comparisonSchemas';
 import type {
   CollectionPage,
@@ -140,6 +157,26 @@ export interface ResearchClient {
   getWalkForwardStudy(studyId: string, signal?: AbortSignal): Promise<StudyDetail>;
   getWalkForwardJob(jobId: string, signal?: AbortSignal): Promise<WalkForwardJob>;
   listStudyJobs(cursor: string | null, signal?: AbortSignal): Promise<StudyJobPage>;
+  // Strategy diagnostics of existing studies: generated only by a job, read
+  // verified; their fill and episode rows are paged per run.
+  startDiagnostics(studyIds: readonly string[]): Promise<StartedDiagnostics>;
+  getDiagnosticsJob(jobId: string, signal?: AbortSignal): Promise<DiagnosticsJob>;
+  listDiagnostics(studyId: string | null, cursor: string | null, signal?: AbortSignal): Promise<DiagnosticsPage>;
+  getDiagnostics(diagnosticId: string, signal?: AbortSignal): Promise<DiagnosticsDetail>;
+  listDiagnosticFills(
+    diagnosticId: string,
+    runId: string,
+    account: SimulatedAccount,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<FillPage>;
+  listDiagnosticEpisodes(
+    diagnosticId: string,
+    runId: string,
+    account: SimulatedAccount,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<EpisodePage>;
 }
 
 const DEFAULT_RESEARCH_TRANSPORT: TransportOptions = {
@@ -250,6 +287,40 @@ export function createResearchClient(transport: TransportOptions = DEFAULT_RESEA
       get(
         StudyJobPageSchema,
         `/jobs${query({ kind: 'walk_forward', limit: String(RESEARCH_PAGE_SIZE), cursor })}`,
+        signal,
+      ),
+    startDiagnostics: (studyIds) =>
+      post(StartedDiagnosticsSchema, '/strategy-diagnostics', { study_ids: studyIds }, [200, 202]),
+    getDiagnosticsJob: async (jobId, signal) =>
+      (await get(DiagnosticsJobEnvelopeSchema, `/jobs/${encodeURIComponent(jobId)}`, signal)).job,
+    listDiagnostics: (studyId, cursor, signal) =>
+      get(
+        DiagnosticsPageSchema,
+        `/strategy-diagnostics${query({ limit: String(RESEARCH_PAGE_SIZE), cursor, study: studyId })}`,
+        signal,
+      ),
+    getDiagnostics: (diagnosticId, signal) =>
+      get(DiagnosticsEnvelopeSchema, `/strategy-diagnostics/${encodeURIComponent(diagnosticId)}`, signal),
+    listDiagnosticFills: (diagnosticId, runId, account, cursor, signal) =>
+      get(
+        FillPageSchema,
+        `/strategy-diagnostics/${encodeURIComponent(diagnosticId)}/fills${query({
+          run: runId,
+          account,
+          limit: String(RESEARCH_PAGE_SIZE),
+          cursor,
+        })}`,
+        signal,
+      ),
+    listDiagnosticEpisodes: (diagnosticId, runId, account, cursor, signal) =>
+      get(
+        EpisodePageSchema,
+        `/strategy-diagnostics/${encodeURIComponent(diagnosticId)}/episodes${query({
+          run: runId,
+          account,
+          limit: String(RESEARCH_PAGE_SIZE),
+          cursor,
+        })}`,
         signal,
       ),
     listExperiments: (cursor, signal) =>

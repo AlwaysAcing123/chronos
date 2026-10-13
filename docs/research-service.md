@@ -26,7 +26,10 @@ It also runs **walk-forward evaluation**: collections of independent
 recordings, frozen plans, and studies that fit fresh models per fold and run
 them through the engine under fee and latency scenarios
 ([walk-forward-evaluation.md](walk-forward-evaluation.md),
-[ADR 0022](decisions/0022-walk-forward-evaluation.md)).
+[ADR 0022](decisions/0022-walk-forward-evaluation.md)), and **strategy
+diagnostics** that explain those studies' runs exactly without running
+anything again ([strategy-diagnostics.md](strategy-diagnostics.md),
+[ADR 0024](decisions/0024-strategy-diagnostics.md)).
 
 ## Running it
 
@@ -86,7 +89,11 @@ npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, defaul
 | `POST /api/v1/research/walk-forward/studies` | Start a reviewed plan's study: `{"plan_id"}` (a `walk_forward` job) |
 | `GET /api/v1/research/walk-forward/studies` | Published studies |
 | `GET /api/v1/research/walk-forward/studies/{study_id}` | One study, with each fold model, schedule, and run verified again |
-| `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison\|walk_forward_plan\|walk_forward` | Every job, newest first, optionally of one kind |
+| `POST /api/v1/research/strategy-diagnostics` | Explain studies' runs: `{"study_ids"}` (a `strategy_diagnostics` job) |
+| `GET /api/v1/research/strategy-diagnostics` | Verified diagnostics, optionally `?study=` |
+| `GET /api/v1/research/strategy-diagnostics/{diagnostic_id}` | One artifact, with each verification level reported apart, every source checked again, and each figure's trust |
+| `GET /api/v1/research/strategy-diagnostics/{diagnostic_id}/fills` and `/episodes` | One run's rows: `?run` required, `account`, `limit`, `cursor` |
+| `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison\|walk_forward_plan\|walk_forward\|strategy_diagnostics` | Every job, newest first, optionally of one kind |
 | `GET /api/v1/research/jobs/{job_id}` | One job of any kind |
 
 A run request names everything; nothing is defaulted silently:
@@ -178,15 +185,17 @@ The conventions are the paper-trading API's
 - **Kinds.** `evaluation` (`evaluate-strategy`), `registration`
   (`register-model`), `import` (`import-model --staged`), `comparison`
   (`compare-models --spec`), `walk_forward_plan` (`plan-walk-forward
-  --request`), and `walk_forward` (`run-walk-forward --plan --progress`),
+  --request`), `walk_forward` (`run-walk-forward --plan --progress`), and
+  `strategy_diagnostics` (`diagnose-strategies --study … --progress`),
   each one fixed child command. `GET /runs` lists evaluations only, as
   before; `GET /jobs` lists every kind.
 - **Progress.** A `walk_forward` job's child writes `{"progress": {...}}`
   lines to stderr. The worker reads complete lines as they arrive: a line
   that is a progress report (at most six known keys, each a short lowercase
   token) replaces the job's `progress` and is saved; every other line stays
-  the bounded log, so an error still parses. Only walk-forward jobs show
-  `progress`, and an interrupted one keeps its last report.
+  the bounded log, so an error still parses. Only walk-forward and
+  diagnostics jobs show `progress`, and an interrupted one keeps its last
+  report.
 - **Sandbox containers.** An import or comparison job's child may start
   ONNX sandbox containers.
   - Each such job gets a supervisor token, recorded in its job record

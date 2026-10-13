@@ -30,7 +30,7 @@ export function App() {
   return (
     <MarketDataStreamProvider>
       <AppShell
-        view={route.view === 'walk-forward' ? 'research' : route.view}
+        view={route.view === 'walk-forward' || route.view === 'diagnostics' ? 'research' : route.view}
         accountContext={
           accountId === null ? null : <AccountContext accountId={accountId} onSwitch={selection.closeAccount} />
         }
@@ -46,6 +46,14 @@ export function App() {
         ) : route.view === 'walk-forward' ? (
           <Suspense fallback={<p role="status">Loading walk-forward evaluation…</p>}>
             <WalkForward planId={route.planId} studyId={route.studyId} />
+          </Suspense>
+        ) : route.view === 'diagnostics' ? (
+          <Suspense fallback={<p role="status">Loading strategy diagnostics…</p>}>
+            <WalkForward
+              planId={null}
+              studyId={null}
+              diagnostics={{ diagnosticId: route.diagnosticId, runId: route.runId, account: route.account }}
+            />
           </Suspense>
         ) : route.view === 'research' ? (
           // Research changes the account selection only when asked to open

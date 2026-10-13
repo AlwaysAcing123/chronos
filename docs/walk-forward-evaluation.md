@@ -79,6 +79,10 @@ REQUEST='{"schema": {"name": "chronos.walk_forward_request", "version": "1"},
 python3.12 -I -S ../tools/walk_forward_audit/audit.py "$ROOT" <study>
 ```
 
+To explain a study's runs (exact PnL attribution and decision cohorts,
+without refitting or running anything), see
+[strategy-diagnostics.md](strategy-diagnostics.md).
+
 `list-collections`, `inspect-collection`, `list-walk-forward-plans`,
 `inspect-walk-forward-plan` (rebuilds the plan from its request over sources
 verified again), and `list-walk-forward-studies` complete the CLI. Success

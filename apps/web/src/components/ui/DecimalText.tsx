@@ -1,16 +1,18 @@
+import type { DiagnosticDecimal } from '../../api/diagnosticsSchemas';
 import type { ExactDecimal } from '../../api/schemas';
 import { decimalSign } from '../../api/decimal';
 import { cx } from './cx';
 import styles from './ui.module.css';
 
-// Renders the server's exact decimal string. `signed` colours gains and
-// losses; the minus sign still carries the meaning in text.
+// Renders the server's exact decimal string, including the diagnostics' own
+// 18-place figures. `signed` colours gains and losses; the minus sign still
+// carries the meaning in text.
 export function DecimalText({
   value,
   signed = false,
   suffix,
 }: {
-  readonly value: ExactDecimal;
+  readonly value: ExactDecimal | DiagnosticDecimal;
   readonly signed?: boolean;
   readonly suffix?: string;
 }) {

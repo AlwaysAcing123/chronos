@@ -10,6 +10,7 @@ time. Everything is labelled synthetic by the dataset tool itself.
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,11 @@ class Recording:
     offset_ns: int = 0
     # Quotes of the first instrument alone, 100 ms apart, after the others stop.
     tail_quotes: int = 0
+    # Optional: billionths added to every bid and ask, so prices are sub-cent
+    # and notionals round; and a fixed displayed ask size, such as "0.37", so
+    # buys of one share fill in part. Unset, a recording's bytes are unchanged.
+    price_nanos: int = 0
+    ask_size: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,13 @@ class Recordings:
 
     def label_ids(self, *streams: str) -> list[str]:
         return [self.prepared[stream].label_id for stream in streams]
+
+
+def _price(value: float, recording: Recording) -> str:
+    if not recording.price_nanos:
+        return f"{value:.2f}"
+    exact = Decimal(f"{value:.2f}") + Decimal(recording.price_nanos) / Decimal(10**9)
+    return format(exact.normalize(), "f")
 
 
 def recording_events(recording: Recording) -> str:
@@ -85,7 +98,8 @@ def recording_events(recording: Recording) -> str:
             imbalance[instrument] = (bid_size - ask_size) / (bid_size + ask_size)
             bid, ask = (midpoints[instrument] - 1) / 100, (midpoints[instrument] + 1) / 100
             lines.append(
-                f"quote,{instrument},{at + position * spacing},{bid:.2f},{bid_size},{ask:.2f},{ask_size}"
+                f"quote,{instrument},{at + position * spacing},{_price(bid, recording)},{bid_size},"
+                f"{_price(ask, recording)},{recording.ask_size or ask_size}"
             )
     first = recording.instruments[0]
     for _ in range(recording.tail_quotes):

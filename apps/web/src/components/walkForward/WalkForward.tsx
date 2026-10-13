@@ -1,3 +1,4 @@
+import type { SimulatedAccount } from '../../state/route';
 import { TRADING_HREF, researchHref, walkForwardHref } from '../../state/route';
 import { useResearchClient, useResearchStatus } from '../../state/research';
 import { ResearchFailure } from '../research/Research';
@@ -6,6 +7,7 @@ import { Alert } from '../ui/Alert';
 import { Panel } from '../ui/Panel';
 import workspaceStyles from '../workspace/workspace.module.css';
 import { CollectionList } from './CollectionList';
+import { DiagnosticsDetailView } from './DiagnosticsDetail';
 import { PlanReview } from './PlanReview';
 import { StudyDetailView } from './StudyDetail';
 import { StudyJobs } from './StudyJobs';
@@ -46,9 +48,30 @@ function WalkForwardHome() {
 
 // Walk-forward evaluation, inside Research: fresh models fitted on earlier
 // independent recordings and measured on each later one.
-export function WalkForward({ planId, studyId }: { readonly planId: string | null; readonly studyId: string | null }) {
+export interface DiagnosticsTarget {
+  readonly diagnosticId: string;
+  readonly runId: string | null;
+  readonly account: SimulatedAccount;
+}
+
+export function WalkForward({
+  planId,
+  studyId,
+  diagnostics = null,
+}: {
+  readonly planId: string | null;
+  readonly studyId: string | null;
+  readonly diagnostics?: DiagnosticsTarget | null;
+}) {
   const client = useResearchClient();
-  const title = studyId !== null ? 'Walk-forward study' : planId !== null ? 'Review the plan' : 'Walk-forward evaluation';
+  const title =
+    diagnostics !== null
+      ? 'Strategy diagnostics'
+      : studyId !== null
+        ? 'Walk-forward study'
+        : planId !== null
+          ? 'Review the plan'
+          : 'Walk-forward evaluation';
   return (
     <div className={styles.research}>
       <div className={workspaceStyles.heading}>
@@ -59,7 +82,7 @@ export function WalkForward({ planId, studyId }: { readonly planId: string | nul
         <p className={workspaceStyles.workspaceNote}>Fresh models per fold, measured on later independent recordings</p>
       </div>
       <nav aria-label="Walk-forward navigation" className={styles.inline}>
-        {(planId !== null || studyId !== null) && (
+        {(planId !== null || studyId !== null || diagnostics !== null) && (
           <a className={styles.back} href={walkForwardHref()}>
             ← All walk-forward studies
           </a>
@@ -80,6 +103,12 @@ export function WalkForward({ planId, studyId }: { readonly planId: string | nul
         <Alert tone="caution" title="Research is not configured">
           <p>This page was built without a research service client.</p>
         </Alert>
+      ) : diagnostics !== null ? (
+        <DiagnosticsDetailView
+          diagnosticId={diagnostics.diagnosticId}
+          runId={diagnostics.runId}
+          account={diagnostics.account}
+        />
       ) : studyId !== null ? (
         <StudyDetailView studyId={studyId} />
       ) : planId !== null ? (

@@ -34,6 +34,11 @@ accounts, the replay, or a live source. It uses only the standard library.
     GET  /api/v1/research/walk-forward/studies        ?limit&cursor
     POST /api/v1/research/walk-forward/studies        start a reviewed plan's study
     GET  /api/v1/research/walk-forward/studies/{study_id}
+    GET  /api/v1/research/strategy-diagnostics        ?limit&cursor&study
+    POST /api/v1/research/strategy-diagnostics        explain studies' runs
+    GET  /api/v1/research/strategy-diagnostics/{diagnostic_id}
+    GET  /api/v1/research/strategy-diagnostics/{diagnostic_id}/fills     ?run&account&limit&cursor
+    GET  /api/v1/research/strategy-diagnostics/{diagnostic_id}/episodes  ?run&account&limit&cursor
     GET  /api/v1/research/jobs                        ?limit&cursor&kind
     GET  /api/v1/research/jobs/{job_id}
 
@@ -87,7 +92,15 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from chronos_research import collection as collections
-from chronos_research import comparison, model_library, onnx_profile, walk_forward, walk_forward_study
+from chronos_research import (
+    comparison,
+    diagnostic_sources,
+    model_library,
+    onnx_profile,
+    strategy_diagnostics,
+    walk_forward,
+    walk_forward_study,
+)
 from chronos_research.artifact_files import (
     ArtifactUnavailableError,
     artifact_directory,
@@ -119,6 +132,7 @@ from chronos_research.registry import (
     set_lifecycle,
     verified_model_version,
 )
+from chronos_research.strategy_attribution import DiagnosticsError
 from chronos_research.strategy_configuration import (
     ConfigurationError,
     canonical_configuration,
@@ -149,9 +163,17 @@ REGISTERED_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "2"}
 # A walk-forward fold model's run (ADR 0022): readable here, and listed by
 # the study it belongs to.
 FOLD_RUN_SCHEMA = {"name": "chronos.strategy_run", "version": "3"}
-JOB_KINDS = ("evaluation", "registration", "import", "comparison", "walk_forward_plan", "walk_forward")
+JOB_KINDS = (
+    "evaluation",
+    "registration",
+    "import",
+    "comparison",
+    "walk_forward_plan",
+    "walk_forward",
+    "strategy_diagnostics",
+)
 # Jobs whose child reports progress, as {"progress": {...}} lines on stderr.
-PROGRESS_JOB_KINDS = ("walk_forward",)
+PROGRESS_JOB_KINDS = ("walk_forward", "strategy_diagnostics")
 _PROGRESS_KEYS = ("fold", "folds", "model", "scenario", "stage", "step")
 _PROGRESS_VALUE = re.compile(r"[a-z0-9_]{1,32}")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
@@ -184,6 +206,37 @@ DEFAULT_CONFIGURATION = {
     "fee_per_fill": "0.01",
     "maximum_quote_age_ns": "5000000000",
     "maximum_order_notional": "1000000",
+}
+
+
+# What a read of strategy diagnostics says about each level of verification
+# (ADR 0024); `sources.now` is what the read finds (diagnostic_sources).
+DIAGNOSTICS_VERIFICATION: dict[str, Any] = {
+    "artifact": {
+        "detail": "the manifest's identity and every file's checksum and row count, read now",
+        "state": "verified",
+    },
+    "engine_replay": {
+        "detail": (
+            "each run's replay by chronos_strategy inspect was recorded by its study when the study ran; "
+            "diagnostics never replay or refit"
+        ),
+        "state": "recorded_by_study",
+    },
+    "independent_audit": {
+        "command": "python -I -S tools/strategy_diagnostics_audit/audit.py <artifacts> <diagnostic_id>",
+        "detail": "a standard-library recomputation of every figure from the raw files, run from the CLI",
+        "state": "not_run_by_this_read",
+    },
+    "recomputed_inspection": {
+        "command": (
+            "python -m chronos_research inspect-strategy-diagnostics --tools <tools> "
+            "--artifacts <artifacts> --diagnostics <diagnostic_id>"
+        ),
+        "detail": "rebuilds the artifact from its sources, verified again, and requires identical bytes",
+        "state": "not_run_by_this_read",
+    },
+    "sources": {},
 }
 
 
@@ -1009,6 +1062,12 @@ def job_arguments(
             configuration.python, "-m", "chronos_research", "run-walk-forward", *roots,
             "--plan", request["plan_id"], "--progress",
         ]  # fmt: skip
+    if kind == "strategy_diagnostics":
+        studies = [part for study in request["study_ids"] for part in ("--study", study)]
+        return [
+            configuration.python, "-m", "chronos_research", "diagnose-strategies", *roots, *studies,
+            "--progress",
+        ]  # fmt: skip
     if kind == "import":
         return [
             configuration.python, "-m", "chronos_research", "import-model",
@@ -1049,6 +1108,14 @@ def job_result(kind: str, output: Mapping[str, Any]) -> dict[str, Any]:
             "folds": str(len(output["plan"]["folds"])),
             "outcome": output["outcome"],
             "plan_id": output["plan"]["plan_id"],
+        }
+    if kind == "strategy_diagnostics":
+        diagnostics = output["diagnostics"]
+        return {
+            "diagnostic_id": diagnostics["diagnostic_id"],
+            "outcome": output["outcome"],
+            "status": diagnostics["status"],
+            "study_ids": [study["study_id"] for study in diagnostics["studies"]],
         }
     if kind == "walk_forward":
         study = output["study"]
@@ -1415,6 +1482,7 @@ _FAILURE_CODES = {
     "comparison": "comparison_failed",
     "walk_forward_plan": "plan_failed",
     "walk_forward": "study_failed",
+    "strategy_diagnostics": "diagnostics_failed",
 }
 _REFUSAL_CODES = {
     "NameVersionTakenError": "name_version_taken",
@@ -1428,6 +1496,7 @@ _REFUSAL_CODES = {
     "CollectionError": "collection_refused",
     "PlanError": "plan_refused",
     "StudyError": "study_refused",
+    "DiagnosticsError": "diagnostics_refused",
 }
 
 
@@ -1457,6 +1526,7 @@ class Service:
         self.store = JobStore(configuration.state / "jobs", configuration.retain_jobs)
         self.imports = ImportStore(configuration.state / "imports", now)
         self.workers = Workers(configuration, self.store)
+        self.digests = diagnostic_sources.ContentDigests()
 
     # Routes.
     def route(
@@ -1500,6 +1570,22 @@ class Service:
                 ("limit", "cursor"),
             ),
             (r"/walk-forward/studies/([^/]+)", {"GET": self.walk_forward_study}, ()),
+            (
+                r"/strategy-diagnostics",
+                {"GET": self.strategy_diagnostics_list, "POST": self.start_strategy_diagnostics},
+                ("limit", "cursor", "study"),
+            ),
+            (r"/strategy-diagnostics/([^/]+)", {"GET": self.strategy_diagnostics}, ()),
+            (
+                r"/strategy-diagnostics/([^/]+)/fills",
+                {"GET": self.strategy_diagnostics_fills},
+                ("run", "account", "limit", "cursor"),
+            ),
+            (
+                r"/strategy-diagnostics/([^/]+)/episodes",
+                {"GET": self.strategy_diagnostics_episodes},
+                ("run", "account", "limit", "cursor"),
+            ),
             (r"/jobs", {"GET": self.jobs}, ("limit", "cursor", "kind")),
             (r"/jobs/([^/]+)", {"GET": self.job}, ()),
         ]
@@ -2041,6 +2127,155 @@ class Service:
             ) from error
         checks = walk_forward_study.study_artifacts(self.configuration.artifacts, manifest)
         return HTTPStatus.OK, {"artifacts": checks, "study": with_timestamps(manifest)}
+
+    # --- Strategy diagnostics (ADR 0024) ---------------------------------------------------------------
+
+    def start_strategy_diagnostics(self, data: bytes) -> tuple[HTTPStatus, Any]:
+        """Queues the diagnostics of existing studies, named by their IDs; the
+        job verifies every source again and refits, schedules, and runs
+        nothing. The only way to generate diagnostics."""
+        document = parse_body(data)
+        for key in document:
+            if key != "study_ids":
+                raise malformed("unexpected_field", f"{key} is not a field of this request", key)
+        if "study_ids" not in document:
+            raise malformed("missing_field", "study_ids is required", "study_ids")
+        studies = document["study_ids"]
+        if not isinstance(studies, list) or not all(isinstance(study, str) for study in studies):
+            raise malformed("invalid_type", "study_ids is a list of study IDs", "study_ids")
+        if not all(is_artifact_id(study) for study in studies):
+            raise malformed(
+                "invalid_identifier", "a study ID is 64 lowercase hexadecimal digits", "study_ids"
+            )
+        if not 1 <= len(studies) <= strategy_diagnostics.MAX_STUDIES or len(set(studies)) != len(studies):
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_configuration",
+                f"diagnostics name 1 to {strategy_diagnostics.MAX_STUDIES} distinct studies",
+                "study_ids",
+                "out_of_domain",
+            )
+        root = walk_forward_study.studies_root(self.configuration.artifacts)
+        known = set(walk_forward_study.study_ids(root))
+        for study in studies:
+            if study not in known:
+                raise ApiError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY, "study_not_found", f"no such study {study}", "study_ids"
+                )
+        request = {"study_ids": sorted(studies)}
+        key = hashlib.sha256(
+            canonical_bytes({"kind": "strategy_diagnostics", "request": request})
+        ).hexdigest()
+        job, created = self.store.create(request, key, "strategy_diagnostics")
+        if created:
+            self.workers.submit(job)
+            return HTTPStatus.ACCEPTED, {"deduplicated": False, "job": job.public()}
+        return HTTPStatus.OK, {"deduplicated": True, "job": job.public()}
+
+    def _diagnostics(self, diagnostic_id: str) -> tuple[dict[str, Any], dict[str, bytes]]:
+        if not is_artifact_id(diagnostic_id):
+            raise malformed(
+                "invalid_identifier", "a diagnostics ID is 64 lowercase hexadecimal digits", "diagnostic_id"
+            )
+        root = strategy_diagnostics.diagnostics_root(self.configuration.artifacts)
+        if diagnostic_id not in strategy_diagnostics.diagnostic_ids(root):
+            raise ApiError(HTTPStatus.NOT_FOUND, "diagnostics_not_found", "no such strategy diagnostics")
+        try:
+            return strategy_diagnostics.verified_diagnostics(root, diagnostic_id)
+        except DiagnosticsError as error:
+            raise ApiError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "artifact_invalid",
+                f"the diagnostics cannot be read: {error}",
+            ) from error
+
+    def strategy_diagnostics_list(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        root = strategy_diagnostics.diagnostics_root(self.configuration.artifacts)
+        study = query.get("study")
+        if study is not None and not is_artifact_id(study):
+            raise malformed("invalid_identifier", "study is a 64-digit lowercase study ID", "study")
+        items, invalid = [], []
+        for identifier in strategy_diagnostics.diagnostic_ids(root):
+            try:
+                entry = strategy_diagnostics.listing(
+                    strategy_diagnostics.verified_diagnostics(root, identifier)[0]
+                )
+            except (DiagnosticsError, KeyError, TypeError) as error:
+                invalid.append({"diagnostic_id": identifier, "reason": str(error)})
+                continue
+            if study is None or study in [member["study_id"] for member in entry["studies"]]:
+                items.append(entry)
+        page = page_after_id(
+            [item["diagnostic_id"] for item in items],
+            limit_of(query),
+            query.get("cursor"),
+            f"diagnostics-{study}",
+        )
+        selected = [item for item in items if item["diagnostic_id"] in set(page.items)]
+        return HTTPStatus.OK, {
+            "diagnostics": selected,
+            "invalid_entries": invalid,
+            "next_cursor": page.next_cursor,
+        }
+
+    def strategy_diagnostics(self, diagnostic_id: str, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        manifest, _ = self._diagnostics(diagnostic_id)
+        return HTTPStatus.OK, {
+            "diagnostics": with_timestamps(manifest),
+            "verification": self._diagnostics_verification(manifest),
+        }
+
+    def _diagnostics_verification(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        """Each level of verification kept apart: what this read checked now,
+        what generation checked, and what only the CLI does. Nothing here
+        rebuilds, audits, or replays."""
+        verification: dict[str, Any] = json.loads(json.dumps(DIAGNOSTICS_VERIFICATION))
+        verification["sources"] = {
+            "at_generation": manifest["verification"],
+            "now": diagnostic_sources.current_sources(self.configuration.artifacts, manifest, self.digests),
+        }
+        return verification
+
+    def _diagnostic_rows(
+        self, diagnostic_id: str, name: str, query: Mapping[str, str]
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        manifest, files = self._diagnostics(diagnostic_id)
+        run_id = query.get("run")
+        if run_id is None or not is_artifact_id(run_id):
+            raise malformed("invalid_identifier", "run is a 64-digit lowercase run ID", "run")
+        known = {
+            entry["run_id"]
+            for section in manifest["studies"]
+            for fold in section["folds"]
+            for entry in fold["runs"]
+            if "run_id" in entry
+        }
+        if run_id not in known:
+            raise ApiError(HTTPStatus.NOT_FOUND, "run_not_found", "these diagnostics have no such run")
+        account = query.get("account")
+        if account is not None and account not in ACCOUNTS:
+            raise malformed("unknown_enum_value", f"account is one of {', '.join(ACCOUNTS)}", "account")
+        rows = [
+            row
+            for row in (json.loads(line) for line in files[name].splitlines())
+            if row["run_id"] == run_id and (account is None or row["account"] == account)
+        ]
+        page = paginate(
+            rows, limit_of(query), query.get("cursor"), name, diagnostic_id, run_id, account or "all"
+        )
+        return [with_timestamps(row) for row in page.items], page.next_cursor
+
+    def strategy_diagnostics_fills(
+        self, diagnostic_id: str, query: Mapping[str, str]
+    ) -> tuple[HTTPStatus, Any]:
+        rows, cursor = self._diagnostic_rows(diagnostic_id, strategy_diagnostics.FILLS, query)
+        return HTTPStatus.OK, {"fills": rows, "next_cursor": cursor}
+
+    def strategy_diagnostics_episodes(
+        self, diagnostic_id: str, query: Mapping[str, str]
+    ) -> tuple[HTTPStatus, Any]:
+        rows, cursor = self._diagnostic_rows(diagnostic_id, strategy_diagnostics.EPISODES, query)
+        return HTTPStatus.OK, {"episodes": rows, "next_cursor": cursor}
 
     def _manifest(self, run_id: str) -> dict[str, Any]:
         if not is_artifact_id(run_id):
