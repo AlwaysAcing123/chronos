@@ -103,6 +103,7 @@ describe('source bar', () => {
   it('offers no replay controls without a replay source', async () => {
     renderSource({
       mode: 'none',
+      synthetic: false,
       provider: null,
       feed: null,
       label: 'No market-data source',

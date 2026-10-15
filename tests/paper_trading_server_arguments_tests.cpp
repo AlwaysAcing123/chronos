@@ -88,9 +88,52 @@ void test_invalid_speeds_are_rejected() {
 
 void test_replay_options_require_a_recording() {
     REQUIRE(rejection({"--stream-id", "s", "--instrument", "AAPL", "--replay-speed", "10x"}) ==
-            "--replay-speed requires --replay-dbn");
+            "--replay-speed requires --replay-dbn or --replay-dataset");
     REQUIRE(rejection({"--stream-id", "s", "--instrument", "AAPL", "--replay-autostart"}) ==
-            "--replay-autostart requires --replay-dbn");
+            "--replay-autostart requires --replay-dbn or --replay-dataset");
+}
+
+// A normalized dataset replays in every build, Databento or not, with the
+// same pacing and the same explicit Start (ADR 0025).
+void test_a_dataset_replay_needs_no_provider_adapter() {
+    for (const auto capabilities : {kWithReplay, kWithoutReplay}) {
+        const auto parsed = parse(
+            {"--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", "data/normalized/abc"},
+            capabilities
+        );
+        REQUIRE(parsed.replay.has_value());
+        REQUIRE(parsed.replay->format == chronos::paper_trading::ReplayFormat::NormalizedDataset);
+        REQUIRE(parsed.replay->recording == "data/normalized/abc");
+        REQUIRE(parsed.replay->speed == ReplaySpeed::RealTime);
+        REQUIRE(!parsed.replay->start_immediately);
+    }
+    const auto paced = parse({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", "d",
+        "--replay-speed", "100x", "--replay-autostart",
+    }, kWithoutReplay);
+    REQUIRE(paced.replay->speed == ReplaySpeed::HundredTimes);
+    REQUIRE(paced.replay->start_immediately);
+    REQUIRE(parse({"--stream-id", "s", "--instrument", "AAPL", "--replay-dbn", "r"}).replay->format ==
+            chronos::paper_trading::ReplayFormat::DatabentoDbn);
+}
+
+void test_a_dataset_replay_is_exclusive_and_strict() {
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dbn", "r", "--replay-dataset", "d",
+    }) == "choose one market-data source: --replay-dbn or --replay-dataset");
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", "d", "--alpaca-iex",
+    }) == "choose one market-data source: --replay-dataset or --alpaca-iex");
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", "d", "--replay-dataset", "d",
+    }) == "--replay-dataset may be provided only once");
+    REQUIRE(rejection({"--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", ""}) ==
+            "--replay-dataset requires a dataset directory");
+    REQUIRE(rejection({"--stream-id", "s", "--instrument", "AAPL", "--replay-dataset"}) ==
+            "--replay-dataset requires a value");
+    REQUIRE(rejection({
+        "--stream-id", "s", "--instrument", "AAPL", "--replay-dataset", "d", "--adopt-live-stream-history",
+    }) == "--adopt-live-stream-history requires --alpaca-iex");
 }
 
 void test_replay_requires_a_databento_build() {
@@ -133,7 +176,7 @@ void test_malformed_command_lines_are_rejected() {
 void test_usage_describes_every_source_option() {
     const std::string usage = server_usage();
     for (const auto* option : {
-             "--replay-dbn", "--replay-speed", "--replay-autostart", "--stream-id", "--alpaca-iex",
+             "--replay-dbn", "--replay-dataset", "--replay-speed", "--replay-autostart", "--stream-id", "--alpaca-iex",
              "APCA_API_KEY_ID", "APCA_API_SECRET_KEY", "not SIP or NBBO",
          }) {
         REQUIRE(usage.find(option) != std::string::npos);
@@ -173,10 +216,10 @@ void test_alpaca_iex_is_exclusive_strict_and_limited() {
     }) == "choose one market-data source: --replay-dbn or --alpaca-iex");
     REQUIRE(rejection({
         "--stream-id", "s", "--instrument", "AAPL", "--alpaca-iex", "--replay-speed", "10x",
-    }) == "--replay-speed requires --replay-dbn");
+    }) == "--replay-speed requires --replay-dbn or --replay-dataset");
     REQUIRE(rejection({
         "--stream-id", "s", "--instrument", "AAPL", "--alpaca-iex", "--replay-autostart",
-    }) == "--replay-autostart requires --replay-dbn");
+    }) == "--replay-autostart requires --replay-dbn or --replay-dataset");
     REQUIRE(rejection(
         {"--stream-id", "s", "--instrument", "AAPL", "--alpaca-iex"},
         kWithoutAlpaca
@@ -224,6 +267,8 @@ int main() {
         {"invalid speeds are rejected", test_invalid_speeds_are_rejected},
         {"replay options require a recording", test_replay_options_require_a_recording},
         {"replay requires a Databento build", test_replay_requires_a_databento_build},
+        {"a dataset replay needs no provider adapter", test_a_dataset_replay_needs_no_provider_adapter},
+        {"a dataset replay is exclusive and strict", test_a_dataset_replay_is_exclusive_and_strict},
         {"options may not repeat", test_options_may_not_repeat},
         {"malformed command lines are rejected", test_malformed_command_lines_are_rejected},
         {"usage describes every source option", test_usage_describes_every_source_option},

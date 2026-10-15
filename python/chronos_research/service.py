@@ -94,6 +94,7 @@ from urllib.parse import unquote, urlsplit
 from chronos_research import collection as collections
 from chronos_research import (
     comparison,
+    demo_seed,
     diagnostic_sources,
     model_library,
     onnx_profile,
@@ -1009,6 +1010,17 @@ class JobStore:
 
 
 @dataclass(frozen=True)
+class DemoConfiguration:
+    """A demo workspace's guide data (ADR 0025): its verified seed and the
+    session the supervisor opened. Only a service given one serves /demo."""
+
+    seed_id: str
+    session: int
+    # "playback": a fresh session with a replay; "history": a retained one, with none.
+    mode: str
+
+
+@dataclass(frozen=True)
 class ServiceConfiguration:
     tools: Tools
     artifacts: Path
@@ -1023,6 +1035,8 @@ class ServiceConfiguration:
     python: str = field(default=sys.executable)
     # How import jobs reach Docker for the ONNX sandbox.
     sandbox: Sandbox = field(default_factory=Sandbox)
+    # Absent unless the service runs a demo workspace.
+    demo: DemoConfiguration | None = None
 
 
 def job_arguments(
@@ -1589,6 +1603,10 @@ class Service:
             (r"/jobs", {"GET": self.jobs}, ("limit", "cursor", "kind")),
             (r"/jobs/([^/]+)", {"GET": self.job}, ()),
         ]
+        # Only a demo workspace's service has its guide's route; elsewhere the
+        # path is not found, exactly as before.
+        if self.configuration.demo is not None:
+            routes.append((r"/demo", {"GET": self.demo}, ()))
         if not path.startswith(API + "/"):
             raise ApiError(HTTPStatus.NOT_FOUND, "route_not_found", "no such path")
         tail = path[len(API) :]
@@ -1609,6 +1627,20 @@ class Service:
                 )
             return handler(*matched.groups(), parse_query(query, allowed))
         raise ApiError(HTTPStatus.NOT_FOUND, "route_not_found", "no such path")
+
+    def demo(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
+        """The guide's navigation manifest, verified on every read, and the
+        session's number and mode. IDs and routes only: no path, no metric."""
+        demo = self.configuration.demo
+        assert demo is not None
+        try:
+            manifest = demo_seed.verified_seed(self.configuration.artifacts, demo.seed_id)
+        except demo_seed.SeedError as error:
+            raise ApiError(HTTPStatus.UNPROCESSABLE_ENTITY, "artifact_invalid", str(error)) from error
+        return HTTPStatus.OK, {
+            "seed": with_timestamps(manifest),
+            "session": {"mode": demo.mode, "number": str(demo.session)},
+        }
 
     def status(self, query: Mapping[str, str]) -> tuple[HTTPStatus, Any]:
         jobs = self.store.newest_first()

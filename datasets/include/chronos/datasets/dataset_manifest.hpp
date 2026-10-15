@@ -46,6 +46,12 @@ struct DatasetCoverage {
     friend bool operator==(const DatasetCoverage&, const DatasetCoverage&) = default;
 };
 
+// The provider of a dataset whose events were invented by a generator, not
+// observed on a market. The research collection (collection.py) classifies
+// evidence by the same rule, and a replay of such a dataset says it is
+// synthetic (ADR 0025).
+inline constexpr std::string_view kSyntheticProvider = "synthetic";
+
 // Where the events came from. Every field is part of the dataset's identity;
 // none may name a machine, a path, or a time of conversion.
 struct DatasetSource {

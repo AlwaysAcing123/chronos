@@ -1,0 +1,18 @@
+/* The guide's concepts: short paragraphs side by side where there is room,
+   in the research view's tokens. */
+.concepts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: var(--space-4) var(--space-5);
+}
+
+.concept {
+  min-width: 0;
+}
+
+.conceptText {
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+  max-width: 70ch;
+}

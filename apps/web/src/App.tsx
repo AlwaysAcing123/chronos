@@ -22,6 +22,8 @@ const Comparisons = lazy(() =>
 const WalkForward = lazy(() =>
   import('./components/walkForward/WalkForward').then((module) => ({ default: module.WalkForward })),
 );
+// The demo workspace's guide, in a demo build only; it changes nothing.
+const DemoGuide = lazy(() => import('./components/demo/DemoGuide').then((module) => ({ default: module.DemoGuide })));
 
 export function App() {
   const selection = useAccountSelection();
@@ -35,7 +37,11 @@ export function App() {
           accountId === null ? null : <AccountContext accountId={accountId} onSwitch={selection.closeAccount} />
         }
       >
-        {route.view === 'models' ? (
+        {route.view === 'demo' ? (
+          <Suspense fallback={<p role="status">Loading the guide…</p>}>
+            <DemoGuide selectedAccountId={accountId} />
+          </Suspense>
+        ) : route.view === 'models' ? (
           <Suspense fallback={<p role="status">Loading the model library…</p>}>
             <Models modelId={route.modelId} />
           </Suspense>

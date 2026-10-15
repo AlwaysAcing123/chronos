@@ -21,10 +21,19 @@ struct ServerCapabilities {
     bool alpaca_live{false};
 };
 
+// What a replay plays: a Databento DBN file (--replay-dbn, Databento builds
+// only) or a normalized dataset directory (--replay-dataset, every build),
+// verified completely before the server exposes any of it (ADR 0025).
+enum class ReplayFormat {
+    DatabentoDbn,
+    NormalizedDataset,
+};
+
 struct ReplayArguments {
     std::filesystem::path recording;
     ReplaySpeed speed{ReplaySpeed::RealTime};
     bool start_immediately{false};
+    ReplayFormat format{ReplayFormat::DatabentoDbn};
 };
 
 // Model deployments (ADR 0018), enabled only by --model-deployments: the
@@ -41,7 +50,8 @@ struct DeploymentArguments {
 };
 
 // A validated server command line. At most one market-data source is
-// selected, a replay or Alpaca IEX; without one the market stays empty.
+// selected, a DBN or dataset replay or Alpaca IEX; without one the market
+// stays empty.
 struct ServerArguments {
     std::string stream_id;
     std::vector<InstrumentId> instruments;

@@ -356,10 +356,20 @@ changes add a new file.
   stopped: a server built before it cannot take or release a stream
   afterwards. It rewrites no other data. See
   [ADR 0020](decisions/0020-restart-safe-live-stream-identity.md).
+- `008_registered_model_deployments.sql`: deployments of registered model
+  versions. Adds `model_reference` (`experiment` or `registered`),
+  `model_version_id`, and `training_cutoff_basis` to `model_deployments`, with
+  the constraint `model_deployments_one_model_reference`. Existing rows become
+  experiment rows, unchanged. See
+  [model-deployments.md](model-deployments.md#registered-model-versions) and
+  [ADR 0021](decisions/0021-model-registry-imports-and-comparisons.md).
 
 PostgreSQL's image runs the mounted files only when it initializes an empty
-volume, so a fresh volume gets 001 to 007 in order. An existing local
-volume needs each newer file applied once, in order.
+volume, so a fresh volume gets 001 to 008 in order. An existing local
+volume needs each newer file applied once, in order. The demo workspace
+never relies on the init scripts: it applies 001 to 008 to each new session
+database itself, then verifies the version rows and the deployment guards
+([demo-workspace.md](demo-workspace.md#migrations)).
 
 Sending a file on standard input avoids depending on the container's
 `/docker-entrypoint-initdb.d` bind mount, which Docker Desktop on macOS can

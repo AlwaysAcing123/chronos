@@ -9,6 +9,9 @@ Makefile
 Testing/
 compile_commands.json
 
+# The demo workspace's private state root and toolchain (ADR 0025)
+/.chronos-demo/
+
 # Market data and licensed artifacts
 data/raw/
 data/normalized/

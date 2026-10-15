@@ -135,9 +135,9 @@ export function Research({
   return (
     <div className={styles.research}>
       {resultId === null ? (
-        <Heading title="Historical evaluation" note="Model-driven paper simulation on recorded market data" />
+        <Heading title="Historical evaluation" note="Model-driven paper simulation on a dataset’s quotes" />
       ) : (
-        <Heading title="Evaluation result" note="Paper simulation on recorded market data" />
+        <Heading title="Evaluation result" note="Paper simulation on a dataset’s quotes" />
       )}
       <nav aria-label="Research navigation" className={styles.inline}>
         {resultId !== null && (

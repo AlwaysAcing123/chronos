@@ -522,6 +522,13 @@ class LiveStreamPreflightTests(unittest.TestCase):
             any("007_live_stream_writer_fence.sql" in p for p in report["problems"])
         )
 
+    def test_a_database_without_migration_008_is_not_safe(self) -> None:
+        report = self.preflight(range(1, 8), [], [])
+        self.assertFalse(report["safe"])
+        self.assertTrue(
+            any("008_registered_model_deployments.sql" in p for p in report["problems"])
+        )
+
     def test_streams_are_reported_and_history_beyond_them_is_unsafe(self) -> None:
         stream = [
             "alpaca-iex-validation",
@@ -534,7 +541,7 @@ class LiveStreamPreflightTests(unittest.TestCase):
             "",
         ]
         maxima = [["alpaca-iex-validation", "1100"], ["databento-replay", "121297"]]
-        report = self.preflight(range(1, 8), [stream], maxima)
+        report = self.preflight(range(1, 9), [stream], maxima)
         self.assertTrue(report["safe"], report["problems"])
         self.assertEqual(
             report["live_streams"]["alpaca-iex-validation"]["durable_maximum"], "1100"
@@ -545,7 +552,7 @@ class LiveStreamPreflightTests(unittest.TestCase):
         # A replay, or a live stream that needs one explicit adoption.
         self.assertEqual(report["unregistered_streams"], {"databento-replay": "121297"})
         maxima[0][1] = "1049663"
-        self.assertFalse(self.preflight(range(1, 8), [stream], maxima)["safe"])
+        self.assertFalse(self.preflight(range(1, 9), [stream], maxima)["safe"])
 
 
 class ContinuityServer:

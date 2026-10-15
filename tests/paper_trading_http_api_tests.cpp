@@ -1,3 +1,5 @@
+#include "chronos/datasets/dataset_manifest.hpp"
+#include "chronos/market_data/dataset_replay.hpp"
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_data_source.hpp"
 #include "chronos/market_data/market_state_feed.hpp"
@@ -6,6 +8,7 @@
 #include "chronos/paper_trading/history_cursor.hpp"
 #include "chronos/paper_trading/paper_trading_http_api.hpp"
 #include "chronos/paper_trading/paper_trading_http_server.hpp"
+#include "dataset_test_support.hpp"
 #include "json_test_support.hpp"
 #include "market_data_test_support.hpp"
 #include "paper_trading_test_support.hpp"
@@ -1671,6 +1674,7 @@ void test_market_data_resource_describes_source_stream_and_instruments() {
     REQUIRE(data.at("revision") == "0");
     const Json& source = data.at("source");
     REQUIRE(source.at("mode") == "none");
+    REQUIRE(source.at("synthetic") == false);
     REQUIRE(source.at("state") == "none");
     REQUIRE(source.at("label") == "No market-data source");
     REQUIRE(source.at("provider").is_null());
@@ -1718,6 +1722,7 @@ void test_replay_commands_follow_the_source_lifecycle() {
     REQUIRE(ready.at("state") == "ready");
     REQUIRE(ready.at("replay_speed") == "10x");
     REQUIRE(ready.at("label") == "Databento EQUS.MINI MBP-1 replay");
+    REQUIRE(ready.at("synthetic") == false);
 
     const ApiResponse started = replay_command(api, "start");
     REQUIRE(started.status == 200);
@@ -1738,6 +1743,69 @@ void test_replay_commands_follow_the_source_lifecycle() {
     REQUIRE(require_error(replay_command(api, "resume"), 409, "invalid_replay_transition").at("reason") == "running");
     api.source->stop();
     REQUIRE(require_error(replay_command(api, "resume"), 409, "invalid_replay_transition").at("reason") == "stopped");
+}
+
+// A verified synthetic dataset, opened as --replay-dataset opens it
+// (ADR 0025): the resource says the data is synthetic, and the replay waits
+// for Start like any other.
+TestApi::SourceFactory synthetic_dataset_replay(const std::filesystem::path& catalog) {
+    return [catalog](market_data::MarketStateFeed& feed, const market_data::MonotonicClock& clock) {
+        auto source = chronos::test::sample_source();
+        source.provider = std::string(chronos::datasets::kSyntheticProvider);
+        source.description = "invented quotes for an API test";
+        const auto dataset = chronos::test::published(chronos::test::write_dataset(
+            catalog,
+            {
+                chronos::test::validated(quote(0, 0)),
+                chronos::test::validated(quote(1, 1'000'000, "SPY")),
+            },
+            source,
+            chronos::test::kTestStream
+        ));
+        auto opened = market_data::open_dataset_replay(
+            dataset.directory,
+            chronos::MarketDataStreamId(std::string(chronos::test::kTestStream)),
+            paper_service_config().tradeable_instruments
+        );
+        REQUIRE(std::holds_alternative<market_data::DatasetReplay>(opened));
+        auto replay = std::get<market_data::DatasetReplay>(std::move(opened));
+        return std::make_unique<market_data::PacedReplaySource>(
+            std::move(replay.reader),
+            feed,
+            clock,
+            std::move(replay.description),
+            market_data::PacedReplayOptions{.speed = chronos::ReplaySpeed::Maximum},
+            nullptr
+        );
+    };
+}
+
+void test_a_synthetic_dataset_replay_is_labelled_and_waits_for_start() {
+    const chronos::test::TemporaryDirectory catalog;
+    TestApi api(connection_string, synthetic_dataset_replay(catalog.path()));
+    const Json ready = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    const Json& source = ready.at("source");
+    REQUIRE(source.at("mode") == "historical_replay");
+    REQUIRE(source.at("synthetic") == true);
+    REQUIRE(source.at("state") == "ready");
+    REQUIRE(source.at("provider") == "synthetic");
+    REQUIRE(source.at("label") == "Synthetic replay: invented prices, not market data");
+    REQUIRE(source.at("coverage_label") == "Synthetic, not market data");
+    REQUIRE(source.at("coverage_notice").get<std::string>().find("invented quotes for an API test") !=
+        std::string::npos);
+    REQUIRE(source.at("events_applied") == "0");
+    REQUIRE(ready.at("instruments").at(0).at("execution_quote_available") == false);
+
+    REQUIRE(replay_command(api, "start").status == 200);
+    REQUIRE(chronos::test::eventually([&] {
+        return call(api, "GET", "/api/v1/market-data").body.at("market_data").at("source").at("state") ==
+            "completed";
+    }));
+    const Json done = call(api, "GET", "/api/v1/market-data").body.at("market_data");
+    REQUIRE(done.at("source").at("events_applied") == "2");
+    REQUIRE(done.at("source").at("recording_sha256").is_string());
+    REQUIRE(done.at("instruments").at(1).at("execution_quote_available") == true);
+    api.source->stop();
 }
 
 void test_replay_commands_accept_only_an_empty_object() {
@@ -2166,6 +2234,10 @@ int main() {
         {
             "replay commands follow the source lifecycle",
             test_replay_commands_follow_the_source_lifecycle,
+        },
+        {
+            "a synthetic dataset replay is labelled and waits for Start",
+            test_a_synthetic_dataset_replay_is_labelled_and_waits_for_start,
         },
         {
             "replay commands accept only an empty object",

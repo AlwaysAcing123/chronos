@@ -94,6 +94,7 @@ npm run dev        # proxies /api/v1/research to CHRONOS_RESEARCH_ORIGIN, defaul
 | `GET /api/v1/research/strategy-diagnostics/{diagnostic_id}` | One artifact, with each verification level reported apart, every source checked again, and each figure's trust |
 | `GET /api/v1/research/strategy-diagnostics/{diagnostic_id}/fills` and `/episodes` | One run's rows: `?run` required, `account`, `limit`, `cursor` |
 | `GET /api/v1/research/jobs?kind=evaluation\|registration\|import\|comparison\|walk_forward_plan\|walk_forward\|strategy_diagnostics` | Every job, newest first, optionally of one kind |
+| `GET /api/v1/research/demo` | Only in a demo workspace (`serve --demo-seed`): its verified `chronos.demo_seed/1` navigation manifest and the session's number and mode; elsewhere `404 route_not_found`, as before |
 | `GET /api/v1/research/jobs/{job_id}` | One job of any kind |
 
 A run request names everything; nothing is defaulted silently:
@@ -161,6 +162,23 @@ The conventions are the paper-trading API's
 - **Headers.** Every response carries `X-Chronos-Service: research`; the
   web client trusts no response without it, as it requires
   `X-Chronos-Trading-Mode: paper` from the trading API.
+
+### The demo workspace's guide
+
+`serve --demo-seed <seed_id> --demo-session <n> --demo-mode playback|history`
+(all three, or none) is how the demo workspace's supervisor starts the
+service ([demo-workspace.md](demo-workspace.md), ADR 0025). Only then does
+`GET /api/v1/research/demo` exist. Every read verifies the seed manifest's
+identity, name, and schema, and answers `422 artifact_invalid` if it does
+not verify. The response has the manifest and the session, with timestamps
+converted as everywhere else. The manifest holds artifact IDs, hash routes,
+the chronology, and the audits' verdicts: no path and no metric. Without
+the options, the path is not found, for every method, exactly as before.
+
+`python -m chronos_research seed-demo --tools <build> --artifacts <root>`
+writes and verifies that seed, and `check-demo-seed` verifies a published
+one and every event of its playback dataset without rebuilding anything
+([demo_seed.py](../python/chronos_research/demo_seed.py)).
 
 ## Jobs
 

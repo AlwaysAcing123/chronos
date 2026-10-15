@@ -164,6 +164,21 @@ def synthesize_dataset(tools: Tools, events: Path, stream_id: str, catalog: Path
     )
 
 
+def write_synthetic_dataset(
+    tools: Tools, table: Path, stream_id: str, catalog: Path, scenario: str, version: str
+) -> Step:
+    """Writes a named, versioned scenario's event table as a dataset with the
+    production producer, `chronos_dataset synthetic write`, whose provenance
+    says the events are synthetic (ADR 0025)."""
+    catalog.mkdir(parents=True, exist_ok=True)
+    document = run_tool(
+        tools.path(CHRONOS_DATASET),
+        ["synthetic", "write", "--events", str(table), "--catalog", str(catalog), "--stream-id", stream_id,
+         "--scenario", scenario, "--scenario-version", version],
+    )  # fmt: skip
+    return _artifact_step("dataset", catalog, document, key="dataset")
+
+
 def extract_features(tools: Tools, roots: ArtifactRoots, dataset_id: str) -> Step:
     document = run_tool(
         tools.path(CHRONOS_DATASET),

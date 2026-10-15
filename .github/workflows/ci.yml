@@ -317,7 +317,8 @@ jobs:
   python-research:
     name: Python research package
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # The demo seed's end-to-end tests (seeding twice) add about four minutes.
+    timeout-minutes: 25
 
     env:
       CC: clang-18
@@ -378,6 +379,15 @@ jobs:
           python -m ruff format --check tools/strategy_diagnostics_audit
           python -m ruff check tools/strategy_diagnostics_audit
           python -m mypy --strict tools/strategy_diagnostics_audit/audit.py
+
+      - name: Check the demo workspace supervisor (standard library only, no Docker)
+        working-directory: .
+        run: |
+          python -m ruff format --check tools/demo
+          python -m ruff check tools/demo
+          cd tools/demo
+          python -m mypy --strict chronos_demo.py demo_workspace acceptance.py test_demo_workspace.py
+          python -m unittest discover -s . -p 'test_*.py'
 
       - name: Check deployment validation tools (no credentials or database)
         working-directory: .
@@ -440,6 +450,66 @@ jobs:
 
       - name: Test
         run: python -m pytest
+
+  # The demo workspace on the real stack (ADR 0025): the supervisor builds the
+  # server, seeds the synthetic scenario, runs its own Compose PostgreSQL, the
+  # trading server, research service, inference worker, and web client, and
+  # the browser drives the three guided flows with no mocked response. The
+  # harness then checks every lifecycle edge. Synthetic data and no
+  # credentials; setup downloads only pinned dependencies and the image.
+  demo-workspace:
+    name: Demo workspace on the real stack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: python/.python-version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: apps/web/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install the PostgreSQL client library
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libpq-dev
+
+      # The supervisor installs its own copy of the web client from the same
+      # lockfile; this only provides the matching Playwright browser.
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run the real-stack acceptance suite
+        run: python tools/demo/acceptance.py --evidence demo-evidence --port-base 18710 --repeat 2
+
+      - name: Upload the acceptance evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: demo-workspace-evidence
+          path: |
+            demo-evidence
+            !demo-evidence/root/toolchain
+            !demo-evidence/root/artifacts
+          retention-days: 7
 
   web:
     name: Web client

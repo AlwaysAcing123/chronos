@@ -30,6 +30,7 @@ export function renderWithServices(
     openNoticeStream,
     research,
     deployments = false,
+    demo = false,
   }: {
     api?: FakeApi;
     refresh?: RefreshPolicy;
@@ -37,6 +38,8 @@ export function renderWithServices(
     research?: FakeResearch;
     // Serves the deployment routes from `api`.
     deployments?: boolean;
+    // Serves the demo guide's data from `research`, as a demo build does.
+    demo?: boolean;
   } = {},
 ) {
   const queryClient = createQueryClient();
@@ -47,6 +50,7 @@ export function renderWithServices(
     ...(openNoticeStream ? { openNoticeStream } : {}),
     ...(research ? { research: research.client } : {}),
     ...(deployments ? { deployments: api.deployments } : {}),
+    ...(demo && research ? { demo: research.demo } : {}),
   };
   const view = render(
     <QueryClientProvider client={queryClient}>

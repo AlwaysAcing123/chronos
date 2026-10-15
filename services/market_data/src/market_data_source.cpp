@@ -12,6 +12,7 @@ NoMarketDataSource::NoMarketDataSource(std::vector<InstrumentId> instruments)
     : status_{
           .description = MarketDataSourceDescription{
               .mode = MarketDataMode::None,
+              .synthetic = false,
               .provider = "",
               .feed = "",
               .label = "No market-data source",

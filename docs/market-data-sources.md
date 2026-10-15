@@ -8,8 +8,10 @@ them to the server-owned `MarketState`; nothing after that boundary depends on
 the provider.
 
 ```text
-Databento DBN reader --> PacedReplaySource --+
-                                             +--> MarketStateFeed --> MarketState
+Databento DBN reader -----+
+Normalized dataset reader +--> PacedReplaySource --+
+                                                   |
+                                             +-----+--> MarketStateFeed --> MarketState
 Alpaca IEX WebSocket --> AlpacaLiveSource ---+     |    |                  |
                                                    |    v                  v
                                                    | MarketEventObserver  execution, risk,
@@ -56,6 +58,45 @@ The Alpaca adapter is documented in [alpaca-adapter.md](alpaca-adapter.md).
   provider-specific conditionals.
 
 Switching sources requires restarting the server; there is no hot swap.
+
+## Normalized-dataset replay
+
+`--replay-dataset <catalog>/<dataset-id>` replays a normalized dataset
+([normalized-market-datasets.md](normalized-market-datasets.md)) through the
+same `PacedReplaySource`, in every API build, with or without a provider
+adapter ([ADR 0025](decisions/0025-demo-workspace.md)). `--replay-speed`
+and `--replay-autostart` apply as for a DBN replay. The three sources are
+mutually exclusive.
+
+- **Verified before it is exposed.** Before the server listens,
+  `open_dataset_replay` (`services/market_data/src/dataset_replay.cpp`)
+  checks the whole dataset with `verify_dataset`: every event is read, and
+  the count, checksum, summary, and quality report must equal the
+  manifest's. A dataset's metadata and file sizes prove nothing about its
+  events, so a same-size corruption is refused here. The playback reader
+  is then opened again, must name the same dataset, and checks the checksum
+  once more at the end.
+- **The stream and instruments must match.** `--stream-id` must be the
+  manifest's stream, and the `--instrument` set exactly its instruments. A
+  subset is refused, because every event of a dataset enters the market
+  state. Nothing is relabelled or rewritten: timestamps, sequences, the
+  stream, and quality flags are the dataset's.
+- **Labels come from provenance.** A dataset whose provider is `synthetic`
+  is labelled `Synthetic replay: invented prices, not market data`. Its
+  coverage notice says that its prices, sizes, and times were generated,
+  and the market-data resource reports `"synthetic": true`. Any other
+  dataset is a recorded replay: its label names its provider, dataset, and
+  schema, and its notice names its normalizer and query window.
+- **Refusals are safe.** A dataset that does not verify, a stream or
+  instrument mismatch, or an unsupported version stops the server with
+  exit 1 and a diagnostic of the dataset error's code and field, never
+  event bytes.
+- **Trust boundary.** Verification and playback read the files twice. They
+  assume the dataset's directory is immutable and private to its owner, as
+  a published, read-only dataset is. A file changed in between fails the
+  replay at its first invalid event or at the end, after any valid prefix
+  was played. Defending against an owner who rewrites the files concurrently
+  is out of scope.
 
 ## Lifecycle
 

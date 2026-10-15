@@ -1,6 +1,8 @@
 // An in-memory stand-in for the research service at the fetch boundary, like
 // fakeApi.ts for the trading API: tests declare responses per route and
 // assert on the requests the page sent.
+import type { DemoClient } from '../api/demo';
+import { createDemoClient } from '../api/demo';
 import type { ResearchClient } from '../api/research';
 import { createResearchClient } from '../api/research';
 import type { RecordedRequest } from './fakeApi';
@@ -24,6 +26,8 @@ type Method = 'GET' | 'POST' | 'PUT';
 
 export interface FakeResearch {
   readonly client: ResearchClient;
+  // The demo guide's read from the same fake service.
+  readonly demo: DemoClient;
   readonly requests: RecordedResearchRequest[];
   on(method: Method, path: string, respond: Responder | FakeResearchResponse): void;
   requestsTo(method: Method, path: string): RecordedResearchRequest[];
@@ -67,6 +71,7 @@ export function createFakeResearch(): FakeResearch {
   };
   return {
     client: createResearchClient({ fetch: fetchImpl, readTimeoutMs: 5_000, writeTimeoutMs: 5_000 }),
+    demo: createDemoClient({ fetch: fetchImpl, readTimeoutMs: 5_000, writeTimeoutMs: 5_000 }),
     requests,
     on(method, path, respond) {
       routes.set(`${method} ${path}`, typeof respond === 'function' ? respond : () => respond);
