@@ -24,7 +24,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import IO
 
-# How long processes killed with SIGKILL get to disappear.
+# How long termination or the leader's exit notification gets to complete.
 _KILL_GRACE_S = 5.0
 
 
@@ -141,7 +141,11 @@ class OwnedProcess:
                         os.killpg(self.pid, signal.SIGKILL)
                     if not self._gone(_KILL_GRACE_S):
                         self.survivors = group_members(self.pid)
-            if not self.exited():
+            # Process-list snapshots and exit notifications are independent:
+            # ps can already omit the leader while waitid/kqueue still has
+            # no event. Wait for that event before reaping or declaring a
+            # cleanup failure; keep the wait bounded if it never arrives.
+            if not self.wait(_KILL_GRACE_S):
                 return None
             self.popen.wait()
             self._exit.close()

@@ -533,6 +533,44 @@ class Children(Scratch):
         finally:
             silent.stop(5)
 
+    def test_stop_waits_for_the_leaders_exit_notification(self) -> None:
+        # A process-list snapshot can already exclude the exited leader
+        # before waitid/kqueue reports its exit. Defer that notification
+        # once, deterministically, rather than depend on the kernel race.
+        for code in (0, 3):
+            with self.subTest(code=code):
+                child = services.Child(self.spec(f"import sys; sys.exit({code})"))
+                child.start()
+                assert child.process is not None
+                try:
+                    self.assertTrue(child.process.wait(10))
+                    self.assertIsNone(child.exit_code(), "the leader was reaped early")
+                    with patch.object(
+                        child.process._exit, "exited", side_effect=[False, True]
+                    ):
+                        self.assertEqual(child.stop(1), code)
+                    self.assertEqual(child.survivors(), [])
+                finally:
+                    child.stop(1)
+
+    def test_stop_does_not_reap_a_leader_without_an_exit_notification(self) -> None:
+        child = services.Child(self.spec("import sys; sys.exit(3)"))
+        child.start()
+        assert child.process is not None
+        try:
+            self.assertTrue(child.process.wait(10))
+            with (
+                patch.object(child.process._exit, "exited", return_value=False),
+                patch.object(processes, "_KILL_GRACE_S", 0),
+                patch.object(time, "sleep", side_effect=AssertionError("slept")),
+            ):
+                self.assertIsNone(child.stop(1))
+                self.assertIsNone(child.exit_code())
+            # A later stop can observe and reap the same owned leader.
+            self.assertEqual(child.stop(1), 3)
+        finally:
+            child.stop(1)
+
     def test_a_child_that_ignores_sigterm_is_killed_with_its_group(self) -> None:
         stubborn = textwrap.dedent(
             """
