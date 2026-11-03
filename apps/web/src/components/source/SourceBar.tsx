@@ -69,13 +69,22 @@ function awaitingQuotes(marketData: MarketData): string[] {
     .map((item) => item.instrument);
 }
 
-// A single-venue feed must never read as the whole market.
+// What the source's data is, in the source's own words: invented prices
+// must never read as a market, a recording as more than its window, and a
+// single-venue feed as the whole market.
+function coverageTitle(source: MarketData['source']): string {
+  if (source.synthetic) {
+    return 'Synthetic data: invented prices, not market data';
+  }
+  return source.mode === 'live' ? `${source.label} is one exchange, not the whole market` : 'What this recording covers';
+}
+
 function CoverageNotice({ source }: { readonly source: MarketData['source'] }) {
   if (source.coverage_notice === null) {
     return null;
   }
   return (
-    <Alert tone="caution" title={`${source.label} is one exchange, not the whole market`}>
+    <Alert tone="caution" title={coverageTitle(source)}>
       <p>{source.coverage_notice}</p>
       {source.mode === 'live' && (
         <p>
@@ -175,7 +184,7 @@ export function SourceBar() {
     <>
       <div className={styles.bar} role="region" aria-label="Market-data source">
         <span className={styles.mode} data-mode={source.mode}>
-          {MARKET_DATA_MODE[source.mode]}
+          {source.synthetic ? 'Synthetic replay' : MARKET_DATA_MODE[source.mode]}
         </span>
         <span className={styles.label}>{source.label}</span>
         <Badge tone={state.tone}>{state.label}</Badge>

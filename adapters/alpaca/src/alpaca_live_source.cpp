@@ -444,6 +444,7 @@ market_data::MarketDataSourceDescription AlpacaLiveSource::description(
 ) {
     return market_data::MarketDataSourceDescription{
         .mode = market_data::MarketDataMode::Live,
+        .synthetic = false,
         .provider = "Alpaca",
         .feed = "IEX",
         .label = "Alpaca IEX",

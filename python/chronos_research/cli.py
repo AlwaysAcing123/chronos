@@ -51,6 +51,12 @@
     list-strategy-diagnostics, show-strategy-diagnostics (verified, as
                       stored), inspect-strategy-diagnostics (rebuilt from
                       its sources: identical bytes, nothing published)
+    seed-demo         writes the demo workspace's synthetic scenario and every
+                      research artifact the guide opens, audits them, and
+                      publishes the chronos.demo_seed/1 navigation manifest
+                      (demo_seed.py, ADR 0025)
+    check-demo-seed   verifies a published seed and the playback dataset before
+                      a demo session, without rebuilding anything
     plan-recordings, quote-recordings, authorize-acquisition,
     acquire-recordings, recover-acquisition, prepare-recordings
                       a real-recording request plan, its free metadata
@@ -78,6 +84,7 @@ from chronos_research import (
     acquisition_cli,
     collection,
     comparison,
+    demo_seed,
     model_library,
     strategy_diagnostics,
     walk_forward,
@@ -213,6 +220,23 @@ def _parser() -> argparse.ArgumentParser:
     demo.add_argument(
         "--horizon-ns", type=_positive_integer, action=_Once, help="label horizon (default 1 s)"
     )
+    seed = commands.add_parser(
+        "seed-demo", allow_abbrev=False, help="seed the demo workspace's synthetic research artifacts"
+    )
+    seed.add_argument(
+        "--tools", required=True, type=_path, action=_Once, help="the directory of built C++ tools"
+    )
+    seed.add_argument(
+        "--artifacts", required=True, type=_path, action=_Once, help="the demo workspace's artifact root"
+    )
+    check = commands.add_parser(
+        "check-demo-seed", allow_abbrev=False, help="verify a demo seed before a demo session starts"
+    )
+    check.add_argument(
+        "--tools", required=True, type=_path, action=_Once, help="the directory of built C++ tools"
+    )
+    check.add_argument("--artifacts", required=True, type=_path, action=_Once, help="the demo artifact root")
+    check.add_argument("--seed", required=True, type=_artifact_id, action=_Once, help="the seed's ID")
     inspect = commands.add_parser("inspect", allow_abbrev=False, help="verify a published experiment")
     inspect.add_argument("--output", required=True, type=_path, action=_Once, help="the experiment root")
     inspect.add_argument(
@@ -375,6 +399,15 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--job-timeout-s", type=_positive_integer, action=_Once, help="per job (default 1800)")
     serve.add_argument(
         "--retain-jobs", type=_positive_integer, action=_Once, help="job records (default 200)"
+    )
+    serve.add_argument(
+        "--demo-seed", type=_artifact_id, action=_Once, help="a demo workspace's seed: serves its guide data"
+    )
+    serve.add_argument(
+        "--demo-session", type=_positive_integer, action=_Once, help="the demo session's number"
+    )
+    serve.add_argument(
+        "--demo-mode", choices=("playback", "history"), action=_Once, help="the demo session's mode"
     )
     _docker_options(serve)
     return parser
@@ -685,6 +718,19 @@ def _evaluate_strategy(arguments: argparse.Namespace) -> dict[str, Any]:
     return {"reproduced": inspected["reproduced"], "run": run.as_json(), "schedule": schedule.as_json()}
 
 
+def _demo_configuration(arguments: argparse.Namespace) -> Any:
+    from chronos_research.service import DemoConfiguration
+
+    given = [arguments.demo_seed, arguments.demo_session, arguments.demo_mode]
+    if all(value is None for value in given):
+        return None
+    if any(value is None for value in given):
+        raise demo_seed.SeedError("usage", "--demo-seed, --demo-session, and --demo-mode go together")
+    return DemoConfiguration(
+        seed_id=arguments.demo_seed, session=arguments.demo_session, mode=arguments.demo_mode
+    )
+
+
 def _serve(arguments: argparse.Namespace) -> dict[str, Any]:
     from chronos_research.service import ServiceConfiguration, serve
 
@@ -699,6 +745,7 @@ def _serve(arguments: argparse.Namespace) -> dict[str, Any]:
         job_timeout_s=arguments.job_timeout_s or 1800,
         retain_jobs=arguments.retain_jobs or 200,
         sandbox=_sandbox(arguments),
+        demo=_demo_configuration(arguments),
     )
     serve(configuration)
     return {"stopped": True}
@@ -790,6 +837,15 @@ def _demo(arguments: argparse.Namespace) -> dict[str, Any]:
         ),
         arguments.horizon_ns or DEFAULT_HORIZON_NS,
     )
+
+
+def _seed_demo(arguments: argparse.Namespace) -> dict[str, Any]:
+    arguments.artifacts.mkdir(exist_ok=True)
+    return demo_seed.seed_demo(Tools(arguments.tools), arguments.artifacts)
+
+
+def _check_demo_seed(arguments: argparse.Namespace) -> dict[str, Any]:
+    return demo_seed.check_seed(Tools(arguments.tools), arguments.artifacts, arguments.seed)
 
 
 def _inspect(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -967,6 +1023,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "evaluate": _evaluate,
         "inspect": _inspect,
         "demo": _demo,
+        "seed-demo": _seed_demo,
+        "check-demo-seed": _check_demo_seed,
         "infer": _infer,
         "inspect-schedule": _inspect_schedule,
         "evaluate-strategy": _evaluate_strategy,
@@ -1002,6 +1060,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BudgetError,
         collection.CollectionError,
         DiagnosticsError,
+        demo_seed.SeedError,
         ModelImportError,
         RecordingPlanError,
         RecordingVerificationError,

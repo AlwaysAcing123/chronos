@@ -1,9 +1,11 @@
+#include "chronos/market_data/dataset_replay.hpp"
 #include "chronos/market_data/leased_ingest_sequences.hpp"
 #include "chronos/market_data/market_data_notifier.hpp"
 #include "chronos/market_data/market_data_source.hpp"
 #include "chronos/market_data/market_state_feed.hpp"
 #include "chronos/market_data/monotonic_clock.hpp"
 #include "chronos/market_data/monotonic_utc_clock.hpp"
+#include "chronos/market_data/paced_replay_source.hpp"
 #include "chronos/market_state.hpp"
 #include "chronos/paper_trading/deployment_inference.hpp"
 #include "chronos/paper_trading/deployment_runtime.hpp"
@@ -17,7 +19,6 @@
 
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_DATABENTO_REPLAY)
 #include "chronos/databento/equities_mini_mbp1_event_reader.hpp"
-#include "chronos/market_data/paced_replay_source.hpp"
 #endif
 
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_ALPACA_LIVE)
@@ -144,6 +145,36 @@ std::unique_ptr<market_data::MarketDataSource> make_source(
     static_cast<void>(receive_clock);
     static_cast<void>(live_sequences);
 #endif
+    const market_data::PacedReplayOptions replay_options{
+        .speed = arguments.replay ? arguments.replay->speed : chronos::ReplaySpeed::RealTime,
+        .start_immediately = arguments.replay && arguments.replay->start_immediately,
+    };
+    // Every build replays a normalized dataset, verified completely before
+    // the server binds (ADR 0025).
+    if (arguments.replay &&
+        arguments.replay->format == paper_trading::ReplayFormat::NormalizedDataset) {
+        auto opened = market_data::open_dataset_replay(
+            arguments.replay->recording,
+            chronos::MarketDataStreamId(arguments.stream_id),
+            arguments.instruments
+        );
+        if (const auto* refused = std::get_if<market_data::DatasetReplayRefusal>(&opened)) {
+            throw std::runtime_error("could not replay the dataset: " + refused->message);
+        }
+        auto replay = std::get<market_data::DatasetReplay>(std::move(opened));
+        log_line(
+            "dataset " + replay.dataset_id +
+            " verified: every event, its checksum, summary, and quality report"
+        );
+        return std::make_unique<market_data::PacedReplaySource>(
+            std::move(replay.reader),
+            feed,
+            clock,
+            std::move(replay.description),
+            replay_options,
+            log_line
+        );
+    }
 #if defined(CHRONOS_PAPER_TRADING_SERVER_WITH_DATABENTO_REPLAY)
     if (arguments.replay) {
         namespace adapter = chronos::databento_adapter;
@@ -165,6 +196,7 @@ std::unique_ptr<market_data::MarketDataSource> make_source(
             clock,
             market_data::MarketDataSourceDescription{
                 .mode = market_data::MarketDataMode::HistoricalReplay,
+                .synthetic = false,
                 .provider = "Databento",
                 .feed = "EQUS.MINI MBP-1",
                 .label = "Databento EQUS.MINI MBP-1 replay",
@@ -172,16 +204,10 @@ std::unique_ptr<market_data::MarketDataSource> make_source(
                 .coverage_label = std::nullopt,
                 .instruments = arguments.instruments,
             },
-            market_data::PacedReplayOptions{
-                .speed = arguments.replay->speed,
-                .start_immediately = arguments.replay->start_immediately,
-            },
+            replay_options,
             log_line
         );
     }
-#else
-    static_cast<void>(feed);
-    static_cast<void>(clock);
 #endif
     return std::make_unique<market_data::NoMarketDataSource>(
         arguments.instruments

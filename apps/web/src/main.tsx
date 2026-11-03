@@ -5,9 +5,11 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { createChronosClient } from './api/client';
+import { createDemoClient } from './api/demo';
 import { createDeploymentClient } from './api/deployments';
 import { createResearchClient } from './api/research';
 import { App } from './App';
+import { DEMO_ENABLED } from './state/demo';
 import { createQueryClient } from './state/queryClient';
 import { POLLING_REFRESH_POLICY } from './state/refreshPolicy';
 import { ChronosServicesProvider } from './state/services';
@@ -27,6 +29,7 @@ createRoot(root).render(
           deployments: createDeploymentClient(),
           refresh: POLLING_REFRESH_POLICY,
           openNoticeStream: () => new EventSource('/api/v1/market-data/events'),
+          ...(DEMO_ENABLED ? { demo: createDemoClient() } : {}),
         }}
       >
         <App />

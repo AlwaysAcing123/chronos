@@ -175,6 +175,9 @@ export type ReplaySpeed = z.infer<typeof ReplaySpeedSchema>;
 export const MarketDataSourceSchema = z
   .object({
     mode: MarketDataModeSchema,
+    // The events were invented by a generator, not observed on a market: a
+    // replay of a synthetic dataset (ADR 0025).
+    synthetic: z.boolean(),
     provider: z.string().min(1).nullable(),
     feed: z.string().min(1).nullable(),
     label: z.string().min(1),
@@ -192,6 +195,10 @@ export const MarketDataSourceSchema = z
   .refine((source) => (source.mode === 'historical_replay') === (source.replay_speed !== null), {
     message: 'only a replay has a playback speed',
     path: ['replay_speed'],
+  })
+  .refine((source) => !source.synthetic || source.mode === 'historical_replay', {
+    message: 'only a replay can be synthetic',
+    path: ['synthetic'],
   });
 export type MarketDataSource = z.infer<typeof MarketDataSourceSchema>;
 

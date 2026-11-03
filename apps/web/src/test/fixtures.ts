@@ -39,6 +39,7 @@ export function marketStreamJson(overrides: Json = {}): Json {
 export function replaySourceJson(overrides: Json = {}): Json {
   return {
     mode: 'historical_replay',
+    synthetic: false,
     provider: 'Databento',
     feed: 'EQUS.MINI MBP-1',
     label: 'Databento EQUS.MINI MBP-1 replay',
@@ -57,9 +58,29 @@ export function replaySourceJson(overrides: Json = {}): Json {
 export const IEX_COVERAGE_NOTICE =
   'IEX only: quotes and trades from the Investors Exchange alone. This is not consolidated SIP data, not the NBBO, and not every US exchange.';
 
+export const SYNTHETIC_COVERAGE_NOTICE =
+  'These events are synthetic: invented events of scenario chronos.demo_scenario version 1, not market data. Their prices, sizes, and times were generated, not observed on any exchange (chronos.synthetic.event_table version 1), so nothing here describes a real market.';
+
+// A demo workspace's replay of a synthetic dataset (ADR 0025).
+export function syntheticSourceJson(overrides: Json = {}): Json {
+  return replaySourceJson({
+    synthetic: true,
+    provider: 'synthetic',
+    feed: 'chronos.demo_scenario event_table',
+    label: 'Synthetic replay: invented prices, not market data',
+    coverage_notice: SYNTHETIC_COVERAGE_NOTICE,
+    coverage_label: 'Synthetic, not market data',
+    state: 'ready',
+    replay_speed: '1x',
+    events_applied: '0',
+    ...overrides,
+  });
+}
+
 export function liveSourceJson(overrides: Json = {}): Json {
   return {
     mode: 'live',
+    synthetic: false,
     provider: 'Alpaca',
     feed: 'IEX',
     label: 'Alpaca IEX',

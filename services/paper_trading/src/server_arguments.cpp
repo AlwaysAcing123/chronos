@@ -113,6 +113,7 @@ ServerArguments parse_server_arguments(
     std::optional<std::string> onnx_docker;
     std::optional<std::string> stream_id;
     std::optional<std::string> recording;
+    std::optional<std::string> dataset;
     std::optional<ReplaySpeed> replay_speed;
     bool replay_autostart = false;
 
@@ -143,6 +144,11 @@ ServerArguments parse_server_arguments(
             parsed.instruments.push_back(std::move(instrument));
         } else if (option == "--replay-dbn") {
             recording = cursor.value(option);
+        } else if (option == "--replay-dataset") {
+            dataset = cursor.value(option);
+            if (dataset->empty()) {
+                throw ServerUsageError("--replay-dataset requires a dataset directory");
+            }
         } else if (option == "--replay-speed") {
             const std::string name = cursor.value(option);
             replay_speed = parse_replay_speed(name);
@@ -237,10 +243,20 @@ ServerArguments parse_server_arguments(
     if (parsed.adopt_live_stream_history && !parsed.alpaca_iex) {
         throw ServerUsageError("--adopt-live-stream-history requires --alpaca-iex");
     }
+    if (recording && dataset) {
+        throw ServerUsageError(
+            "choose one market-data source: --replay-dbn or --replay-dataset"
+        );
+    }
     if (parsed.alpaca_iex) {
         if (recording) {
             throw ServerUsageError(
                 "choose one market-data source: --replay-dbn or --alpaca-iex"
+            );
+        }
+        if (dataset) {
+            throw ServerUsageError(
+                "choose one market-data source: --replay-dataset or --alpaca-iex"
             );
         }
         if (!capabilities.alpaca_live) {
@@ -257,25 +273,31 @@ ServerArguments parse_server_arguments(
             );
         }
     }
-    if (!recording) {
+    if (!recording && !dataset) {
         if (replay_speed) {
-            throw ServerUsageError("--replay-speed requires --replay-dbn");
+            throw ServerUsageError(
+                "--replay-speed requires --replay-dbn or --replay-dataset"
+            );
         }
         if (replay_autostart) {
-            throw ServerUsageError("--replay-autostart requires --replay-dbn");
+            throw ServerUsageError(
+                "--replay-autostart requires --replay-dbn or --replay-dataset"
+            );
         }
         return parsed;
     }
-    if (!capabilities.databento_replay) {
+    if (recording && !capabilities.databento_replay) {
         throw ServerUsageError(
             "--replay-dbn requires a build with "
             "CHRONOS_ENABLE_DATABENTO_ADAPTER=ON"
         );
     }
     parsed.replay = ReplayArguments{
-        .recording = std::move(*recording),
+        .recording = recording ? std::move(*recording) : std::move(*dataset),
         .speed = replay_speed.value_or(ReplaySpeed::RealTime),
         .start_immediately = replay_autostart,
+        .format = recording ? ReplayFormat::DatabentoDbn
+                            : ReplayFormat::NormalizedDataset,
     };
     return parsed;
 }
@@ -293,6 +315,11 @@ std::string server_usage() {
         "Market-data source (at most one; without one the market is empty):\n"
         "  --replay-dbn <FILE.dbn.zst>  Replay a local Databento EQUS.MINI\n"
         "                               MBP-1 recording (Databento builds).\n"
+        "  --replay-dataset <DIR>       Replay a normalized dataset directory,\n"
+        "                               verified completely first. Its stream\n"
+        "                               must be --stream-id and its instruments\n"
+        "                               exactly the --instrument list. A\n"
+        "                               synthetic dataset is labelled so.\n"
         "    --replay-speed <SPEED>     1x (default), 10x, 100x, or max.\n"
         "    --replay-autostart         Start playing at once instead of\n"
         "                               waiting for a Start command.\n"

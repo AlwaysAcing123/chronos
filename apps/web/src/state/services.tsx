@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { createContext, useContext } from 'react';
 
 import type { ChronosClient } from '../api/client';
+import type { DemoClient } from '../api/demo';
 import type { DeploymentClient } from '../api/deployments';
 import type { ResearchClient } from '../api/research';
 import type { OpenNoticeStream } from './marketDataStream';
@@ -16,6 +17,8 @@ export interface ChronosServices {
   readonly research?: ResearchClient;
   // Model deployments on the trading server; without it Research shows none.
   readonly deployments?: DeploymentClient;
+  // The demo workspace's guide data; only a demo build provides it.
+  readonly demo?: DemoClient;
 }
 
 const ChronosServicesContext = createContext<ChronosServices | null>(null);

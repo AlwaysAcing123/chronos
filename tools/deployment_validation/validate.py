@@ -200,9 +200,9 @@ def preflight(database: dict[str, str], psql: str) -> dict[str, Any]:
         else []
     )
     report: dict[str, Any] = {"migrations": versions, "problems": []}
-    if versions != [str(version) for version in range(1, 8)]:
+    if versions != [str(version) for version in range(1, 9)]:
         report["problems"].append(
-            f"migrations are {','.join(versions) or 'absent'}, not 1 to 7"
+            f"migrations are {','.join(versions) or 'absent'}, not 1 to 8"
         )
     if versions == [str(version) for version in range(1, 6)]:
         report["problems"].append(
@@ -214,6 +214,11 @@ def preflight(database: dict[str, str], psql: str) -> dict[str, Any]:
             "apply migrations/007_live_stream_writer_fence.sql, with every live "
             "server on the database stopped: without it a current server takes "
             "no live stream, and a deposed writer could not be refused (ADR 0020)"
+        )
+    if versions == [str(version) for version in range(1, 8)]:
+        report["problems"].append(
+            "apply migrations/008_registered_model_deployments.sql: without it the "
+            "server cannot read or create a deployment"
         )
     if "6" in versions:
         report["live_streams"], report["unregistered_streams"] = live_streams(

@@ -41,6 +41,9 @@ enum class MarketDataSourceState {
 // descriptive data for people; no component branches on them.
 struct MarketDataSourceDescription {
     MarketDataMode mode{MarketDataMode::None};
+    // The events were invented by a generator, not observed on a market:
+    // a replay of a dataset whose provenance says it is synthetic.
+    bool synthetic{false};
     // "Databento" or "Alpaca"; empty without a source.
     std::string provider;
     // The dataset or feed, such as "EQUS.MINI MBP-1" or "IEX".

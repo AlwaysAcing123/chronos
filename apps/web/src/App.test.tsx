@@ -4,7 +4,15 @@ import { describe, expect, it } from 'vitest';
 import { App } from './App';
 import { RECENT_ACCOUNTS_KEY, SELECTED_ACCOUNT_KEY } from './state/accountSelection';
 import { createFakeApi } from './test/fakeApi';
-import { ACCOUNT_ID, errorJson, flatAccountJson, flatPortfolioJson, healthJson } from './test/fixtures';
+import {
+  ACCOUNT_ID,
+  errorJson,
+  flatAccountJson,
+  flatPortfolioJson,
+  healthJson,
+  marketDataJson,
+  syntheticSourceJson,
+} from './test/fixtures';
 import { accountPath, rememberSelectedAccount, renderWithServices, serveAccount } from './test/renderWithServices';
 
 describe('account entry', () => {
@@ -16,6 +24,17 @@ describe('account entry', () => {
     expect(notice).toHaveTextContent('PAPER TRADING');
     expect(notice).toHaveTextContent('No order ever reaches a broker or exchange, and no real money is involved.');
     expect(await screen.findByText('API online')).toBeInTheDocument();
+  });
+
+  it('never calls a synthetic replay market data', async () => {
+    const api = createFakeApi();
+    api.on('GET', '/api/v1/market-data', {
+      status: 200,
+      body: { market_data: marketDataJson({ source: syntheticSourceJson() }) },
+    });
+    renderWithServices(<App />, { api });
+    expect(await screen.findByText(/A simulated ledger over invented, synthetic prices\./)).toBeInTheDocument();
+    expect(screen.queryByText(/real market data/)).not.toBeInTheDocument();
   });
 
   it('creates an account that trades every server-listed instrument and opens it', async () => {

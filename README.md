@@ -97,20 +97,53 @@ Chronos simulates trading only. It does not place real-money orders.
 - A Python research package that evaluates a no-skill majority baseline and a
   logistic-regression baseline per instrument on verified artifacts, into an
   immutable evaluation artifact with plain-number model parameters
+- A deterministic C++ strategy runner that trades a versioned long/flat
+  policy over a verified dataset through the same execution and accounting
+  code, beside cash and buy-and-hold benchmarks, and a local research service
+  with a Research view that starts evaluations and shows their results
+- A model library of immutable versions, constrained ONNX imports in a
+  sandbox, and fair comparisons of several versions under one frozen spec
+- Controlled model deployments to dedicated paper accounts, each started
+  explicitly, with durable decisions and model-attributed orders
+- Walk-forward studies over independent recordings with cost and latency
+  scenarios, and strategy diagnostics that explain each run's PnL exactly,
+  each checked by an independent standard-library auditor
+- The paper-trading server replays a verified normalized dataset directly
+  (`--replay-dataset`), labelling a synthetic one as invented prices
+- A one-command, isolated demo workspace with a guide through three flows on
+  real services over a versioned synthetic scenario
+  ([docs/demo-workspace.md](docs/demo-workspace.md))
 - Unit and edge-case tests for arithmetic, accounting, market data, replay,
   datasets, features, labels, splits, risk, and execution, plus Python tests,
-  and real-PostgreSQL service and API tests
+  real-PostgreSQL service and API tests, and a real-stack browser suite
 
 The core accepts, simulates, books, persists, and recovers paper orders
 through controlled paths, the optional API exposes that path to local
 clients, and the web workspace in `apps/web/` is the first of them. A
-replayed market now moves while the server runs, and an optional live IEX
-feed can replace it. Recordings become normalized datasets, feature, label,
-and split artifacts, and baseline predictive evaluations for research. These
-are predictive evaluations only: there is no trading strategy, cost model, or
-backtest over predictions yet, and no result is evidence of profitability.
-Authentication, model deployment, and historical charts are not built yet.
-See [plan.md](plan.md) for the complete roadmap.
+replayed market moves while the server runs, and an optional live IEX feed
+can replace it. Recordings become normalized datasets, feature, label, and
+split artifacts, baseline models, strategy evaluations, comparisons,
+walk-forward studies, diagnostics, and paper deployments. Every result is a
+paper simulation on minutes of data: none is evidence of skill or
+profitability. Authentication, richer models and policies, and historical
+charts are not built yet. See [plan.md](plan.md) for the complete roadmap.
+
+## Try the demo workspace
+
+After the prerequisites in
+[docs/demo-workspace.md](docs/demo-workspace.md#prerequisites) (Python 3.12,
+CMake and a C++20 compiler, libpq, Node.js 22, and Docker with Compose), one
+command builds, seeds, and starts an isolated local stack, then prints the
+guide's address:
+
+```sh
+python3.12 tools/demo/chronos_demo.py start
+```
+
+Every price in it is invented. Ctrl-C stops it, and nothing is deleted.
+`status` reports what is there, and `new-session` creates a fresh trading
+database. It uses its own ports (18510 to 18513), database, and Compose
+volume, never the development database, and needs no credential.
 
 ## Requirements
 
@@ -339,6 +372,14 @@ workspace offers the same controls. A replay cannot be rewound; restart the
 server, and use a new account, to play it again. See
 [docs/market-replay.md](docs/market-replay.md#paced-replay).
 
+Every API build, with or without the Databento adapter, can replay a
+normalized dataset instead, with `--replay-dataset <catalog>/<dataset-id>`
+in place of `--replay-dbn`. The server verifies every event of it before it
+listens. Its stream must be `--stream-id`, and its instruments exactly the
+`--instrument` list. A synthetic dataset is labelled as invented prices,
+not market data, and a recording keeps its provider's labels
+([docs/market-data-sources.md](docs/market-data-sources.md#normalized-dataset-replay)).
+
 To trade against live IEX quotes instead, build with
 `-DCHRONOS_ENABLE_ALPACA_ADAPTER=ON` and start the server with `--alpaca-iex`
 in place of the replay options. Credentials are read only from
@@ -386,9 +427,10 @@ A local database volume created before a migration existed needs it applied
 once, in order; each file is idempotent. Migration 003 turns single-instrument
 accounts into multi-instrument ones, 004 adds working orders and fills,
 005 adds model deployments and the guards on the accounts they own, 006
-adds durable live-stream sequences, and 007 adds the fence that refuses a
-deposed live writer. Stop every server on the database and back up the
-volume first, as described in
+adds durable live-stream sequences, 007 adds the fence that refuses a
+deposed live writer, and 008 adds deployments of registered model versions.
+Stop every server on the database and back up the volume first, as
+described in
 [docs/postgresql-persistence.md](docs/postgresql-persistence.md#upgrading-an-existing-volume):
 
 ```sh
@@ -404,6 +446,8 @@ docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/006_live_stream_sequences.sql
 docker compose exec -T postgres psql -U chronos -d chronos \
   -v ON_ERROR_STOP=1 < migrations/007_live_stream_writer_fence.sql
+docker compose exec -T postgres psql -U chronos -d chronos \
+  -v ON_ERROR_STOP=1 < migrations/008_registered_model_deployments.sql
 ```
 
 Migration 006 adds one table and changes no existing row. Migration 007
@@ -424,7 +468,7 @@ CHRONOS_VALIDATION_DATABASE_URL=postgresql://chronos:<password>@127.0.0.1:55432/
   python/.venv/bin/python tools/deployment_validation/validate.py preflight
 ```
 
-It lists the migrations (1 to 7 are required), both deployment triggers,
+It lists the migrations (1 to 8 are required), both deployment triggers,
 and their functions. It also lists each live stream's reservations, writer
 lease, and the first sequence of its writer's generation, and any stream
 with durable history but no live-stream record. Such a stream is a replay, or a live stream that needs
@@ -464,7 +508,9 @@ datasets/   Normalized market datasets and the shared derived-artifact layer
 features/   Point-in-time feature engine and feature artifacts
 labels/     Future-return labels and label artifacts
 splits/     Chronological, purged splits and split artifacts
-python/     Research package: baseline training and evaluation artifacts
+python/     Research package: models, evaluations, studies, and the research service
+strategy/   The C++ strategy runner's policy and engine
+tools/      Command-line tools, independent auditors, and the demo workspace
 docs/       Contracts, architecture decisions, and accounting rules
 services/   Application service and HTTP API over the core
 tests/      C++ unit, edge-case, and integration tests

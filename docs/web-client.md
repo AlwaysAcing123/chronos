@@ -440,6 +440,35 @@ in `src/state/deployments.ts`.
   order ticket it says which deployment trades the account, because the
   server refuses manual orders there.
 
+## The demo guide
+
+A build made with `VITE_CHRONOS_DEMO=1`, which only the demo workspace's
+supervisor makes ([demo-workspace.md](demo-workspace.md), ADR 0025), adds a
+**Guide** link and the `#/demo` view. An ordinary build has neither: `#/demo`
+opens trading like any unknown hash, the navigation is unchanged, and
+nothing asks for the guide's data.
+
+- **Data.** The guide reads one document, `GET /api/v1/research/demo`,
+  through the research client's identity check, and decodes it strictly:
+  every link must be an application hash route.
+- **Content.** It explains three flows step by step and links to the real
+  views: the model, its comparison, the walk-forward study, the diagnostics
+  run, and trading. It also explains synthetic, recorded, and live data,
+  market time and wall time, and configured and observed latency.
+- **No side effects.** It has no button. It creates no account, submits no
+  order, and starts neither the replay nor a deployment. It shows no figure
+  of its own: every number a step mentions is read on its own view.
+- **Session.** It states the session's mode. A fresh session's replay waits
+  for Start; a history session has no replay, and its valuation is
+  unavailable, never zero.
+- **Account selection.** It says which paper account is selected, and its
+  links never change that selection.
+
+The source bar names a synthetic replay `Synthetic replay` on every
+screen. Its coverage notice is titled "Synthetic data: invented prices, not
+market data". A recorded replay's notice is titled "What this recording
+covers", and a live feed keeps "… is one exchange, not the whole market".
+
 ## Models and comparisons
 
 **Models** (`#/models`, and `#/models/<model-version-id>` for one version)
@@ -580,9 +609,23 @@ Before the first browser run: `npx playwright install chromium`.
   CHRONOS_WEB_LIVE_API=1 npm run test:e2e -- live.spec.ts
   ```
 
+- **The guide** has component tests (`src/components/demo/DemoGuide.test.tsx`)
+  for its flows, links, session modes, an unavailable run, refused data, and
+  that it sends nothing but reads. `src/AppDemo.test.tsx` checks a demo
+  build's navigation and that the selected account survives a visit. The
+  ordinary build's routing and navigation are checked unchanged.
+- **Real-stack acceptance** (`e2e/demo-acceptance.spec.ts`, with
+  `playwright.demo.config.ts`) is skipped unless `CHRONOS_DEMO_URL` names a
+  running demo workspace. `tools/demo/acceptance.py` starts one and runs it.
+  The spec drives the three guided flows on desktop with no mocked
+  response. It runs axe on every page it opens; the trading workspace is
+  held to every rule except its pre-existing contrast findings. It checks
+  the phone layout, and a retained session's history mode.
+
 CI's `Web client` job runs type checking, lint, unit tests, the build, and the
 mocked browser suite on Node 22.22.2 from the lockfile. It needs no server,
-database, credentials, or market data; the live spec is skipped there.
+database, credentials, or market data; the live specs are skipped there. The
+`Demo workspace` job runs the real-stack acceptance suite.
 
 ## Limitations
 

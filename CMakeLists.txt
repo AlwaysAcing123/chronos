@@ -129,6 +129,7 @@ add_library(chronos_datasets
     datasets/src/dataset_reader.cpp
     datasets/src/dataset_writer.cpp
     datasets/src/derived_artifact.cpp
+    datasets/src/event_table.cpp
     datasets/src/json_fields.cpp
     datasets/src/market_event_codec.cpp
     datasets/src/ndjson_file.cpp
@@ -240,6 +241,7 @@ target_link_libraries(chronos_market_state
 # source lifecycle, and browser change notifications. Provider adapters plug
 # in through core interfaces, so this library needs none of them.
 add_library(chronos_market_data_sources
+    services/market_data/src/dataset_replay.cpp
     services/market_data/src/leased_ingest_sequences.cpp
     services/market_data/src/market_data_notifier.cpp
     services/market_data/src/market_data_source.cpp
@@ -254,8 +256,12 @@ target_include_directories(chronos_market_data_sources
     PUBLIC services/market_data/include
 )
 
+# A normalized dataset replays through the same paced source (ADR 0025);
+# the dataset library depends on nothing here, so there is no cycle.
 target_link_libraries(chronos_market_data_sources
-    PUBLIC chronos_market_state
+    PUBLIC
+        chronos_datasets
+        chronos_market_state
     PRIVATE chronos_build_options
 )
 
@@ -615,9 +621,9 @@ if(BUILD_TESTING)
         tests/normalized_dataset_tests.cpp
     )
 
+    # The market-data sources bring the dataset library with them.
     target_link_libraries(chronos_normalized_dataset_tests
         PRIVATE
-            chronos_datasets
             chronos_market_data_sources
             chronos_build_options
     )
@@ -625,6 +631,22 @@ if(BUILD_TESTING)
     add_test(
         NAME chronos_normalized_dataset_tests
         COMMAND chronos_normalized_dataset_tests
+    )
+
+    # The server's normalized-dataset replay (ADR 0025).
+    add_executable(chronos_dataset_replay_tests
+        tests/dataset_replay_tests.cpp
+    )
+
+    target_link_libraries(chronos_dataset_replay_tests
+        PRIVATE
+            chronos_market_data_sources
+            chronos_build_options
+    )
+
+    add_test(
+        NAME chronos_dataset_replay_tests
+        COMMAND chronos_dataset_replay_tests
     )
 
     add_executable(chronos_dataset_cli_tests

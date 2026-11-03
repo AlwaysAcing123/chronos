@@ -108,9 +108,10 @@ Server options and their defaults:
 | `--max-quote-age-ms` | `5000` | Maximum quote age in market time |
 | `--fee-per-fill` | `0` | Flat fee per order, paid by its first fill |
 | `--replay-dbn` | none | Local Databento EQUS.MINI MBP-1 recording to replay (Databento builds) |
-| `--replay-speed` | `1x` | `1x`, `10x`, `100x`, or `max`; requires `--replay-dbn` |
-| `--replay-autostart` | off | Start playing at once instead of waiting for Start; requires `--replay-dbn` |
-| `--alpaca-iex` | off | Stream live Alpaca IEX trades and quotes (Alpaca builds); at most 30 instruments; not with `--replay-dbn` |
+| `--replay-dataset` | none | A normalized dataset directory to replay, in every build, verified completely before the server listens; its stream must be `--stream-id` and its instruments exactly the `--instrument` list ([market-data-sources.md](market-data-sources.md#normalized-dataset-replay)) |
+| `--replay-speed` | `1x` | `1x`, `10x`, `100x`, or `max`; requires `--replay-dbn` or `--replay-dataset` |
+| `--replay-autostart` | off | Start playing at once instead of waiting for Start; requires `--replay-dbn` or `--replay-dataset` |
+| `--alpaca-iex` | off | Stream live Alpaca IEX trades and quotes (Alpaca builds); at most 30 instruments; not with a replay |
 | `--adopt-live-stream-history` | off | Continue a live stream whose durable history predates migration 006, after the largest sequence it references (ADR 0020); requires `--alpaca-iex` |
 
 Every option except `--instrument` may be given once, and each instrument once.
@@ -1042,6 +1043,7 @@ recording after a `10x` replay completed:
     "revision": "121305",
     "source": {
       "mode": "historical_replay",
+      "synthetic": false,
       "provider": "Databento",
       "feed": "EQUS.MINI MBP-1",
       "label": "Databento EQUS.MINI MBP-1 replay",
@@ -1106,6 +1108,11 @@ Before an instrument's first quote, its entry is
   `feed`, `coverage_notice`, and `coverage_label` are `null` when not
   applicable. `coverage_label` restates the notice in a few words for compact
   displays; a client must still show the full notice.
+- `source.synthetic` is `true` exactly for a replay of a synthetic dataset
+  (`--replay-dataset`, ADR 0025): its events were invented by a generator,
+  not observed on a market. Its `provider` is `synthetic`, its label says
+  "invented prices, not market data", and its `coverage_notice` says what
+  generated it; a client must say so wherever its quotes are shown.
 - `source.state` is one of `none`, `ready`, `running`, `paused`,
   `completed`, `connecting`, `authenticating`, `subscribing`, `live`,
   `reconnecting`, `failed`, or `stopped`
@@ -1133,6 +1140,7 @@ wherever its quotes are:
 ```json
 "source": {
   "mode": "live",
+  "synthetic": false,
   "provider": "Alpaca",
   "feed": "IEX",
   "label": "Alpaca IEX",

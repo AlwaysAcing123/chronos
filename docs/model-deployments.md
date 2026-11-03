@@ -393,7 +393,7 @@ crossed book, Stop, the kill switch, and restart. Real Alpaca IEX data is
 checked by an operator, with `tools/deployment_validation/`:
 
 1. **Preflight, read-only.** Use a fresh database with migrations 001 to
-   007, and confirm both deployment triggers and their functions are
+   008, and confirm both deployment triggers and their functions are
    installed:
    `CHRONOS_VALIDATION_DATABASE_URL=... validate.py preflight`.
    - Keep evidence databases in persistent storage, not Docker tmpfs, and

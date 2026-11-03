@@ -6,10 +6,15 @@
 // and so do strategy diagnostics, whose deep link names one run and one of its
 // simulated accounts. The paper-trading account selection is separate browser
 // state, so switching views, runs, or simulated accounts never changes it.
+// Only a demo workspace's build has #/demo, its guide (ADR 0025); elsewhere
+// that hash opens trading, as any unknown hash does.
 import { useCallback, useEffect, useState } from 'react';
+
+import { DEMO_ENABLED } from './demo';
 
 export type Route =
   | { readonly view: 'trading' }
+  | { readonly view: 'demo' }
   | { readonly view: 'research'; readonly resultId: string | null }
   | { readonly view: 'models'; readonly modelId: string | null }
   | { readonly view: 'comparisons'; readonly comparisonId: string | null }
@@ -34,7 +39,12 @@ const STUDY = /^#\/research\/walk-forward\/studies\/([0-9a-f]{64})$/;
 const DIAGNOSTICS =
   /^#\/research\/walk-forward\/diagnostics\/([0-9a-f]{64})(?:\/runs\/([0-9a-f]{64})(?:\/(strategy|buy_and_hold|cash))?)?$/;
 
-export function parseRoute(hash: string): Route {
+export const DEMO_HREF = '#/demo';
+
+export function parseRoute(hash: string, demo: boolean = DEMO_ENABLED): Route {
+  if (demo && (hash === DEMO_HREF || hash.startsWith(`${DEMO_HREF}/`))) {
+    return { view: 'demo' };
+  }
   const plan = PLAN.exec(hash);
   if (plan !== null) {
     return { view: 'walk-forward', planId: plan[1] ?? null, studyId: null };

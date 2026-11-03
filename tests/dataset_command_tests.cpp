@@ -1,5 +1,6 @@
 #include "artifact_test_support.hpp"
 #include "chronos/canonical_json.hpp"
+#include "chronos/sha256.hpp"
 #include "dataset_test_support.hpp"
 #include "test_support.hpp"
 
@@ -182,6 +183,58 @@ void test_the_pipeline_round_trips_through_the_command_line() {
     REQUIRE(lopsided.output.find("\"code\": \"empty_split\"") != std::string::npos);
 }
 
+// The production synthetic producer (ADR 0025): a scenario's event table
+// becomes a dataset whose provenance says it is synthetic, checksummed from
+// the table's own bytes, published once and found again after.
+void test_a_synthetic_scenario_is_published_with_its_provenance() {
+    const TemporaryDirectory scratch;
+    const std::filesystem::path table = scratch.path() / "scenario.csv";
+    const std::string rows =
+        "# invented quotes\n"
+        "status,AAPL,1000,open\n"
+        "quote,AAPL,1100,100.00,3,100.02,1\n"
+        "quote,SPY,1100,500.00,10,500.01,30\n"
+        "quote,AAPL,1200,100.01,2,,\n";
+    chronos::test::write_file(table, rows);
+    const std::string write = "synthetic write --events " + shell_quoted(table) + " --catalog " +
+        shell_quoted(scratch.path() / "catalog") + " --stream-id demo-stream --scenario chronos.demo_scenario" +
+        " --scenario-version 1";
+    const Outcome written = run(write);
+    REQUIRE(field(written, {"outcome"}) == "published");
+    REQUIRE(field(written, {"dataset", "provider"}) == "synthetic");
+    REQUIRE(field(written, {"dataset", "stream"}) == "demo-stream");
+    REQUIRE(field(written, {"dataset", "counts", "events"}) == "4");
+    REQUIRE(field(written, {"dataset", "checksums", "recording_sha256"}) == chronos::Sha256::hex(rows));
+    REQUIRE(field(written, {"provenance", "normalizer"}) == "chronos.synthetic.event_table/1");
+    REQUIRE(field(written, {"provenance", "description"}) ==
+        "invented events of scenario chronos.demo_scenario version 1, not market data");
+    REQUIRE(field(run(write), {"outcome"}) == "already_present");
+    const std::string dataset_id = field(written, {"dataset", "dataset_id"});
+    REQUIRE(field(run("inspect --catalog " + shell_quoted(scratch.path() / "catalog") + " --dataset " + dataset_id),
+        {"verified"}) == "every event, the checksums, the summary, and the quality report");
+
+    // Another version of the scenario is another dataset.
+    REQUIRE(field(run(write.substr(0, write.size() - 1) + "2"), {"dataset", "dataset_id"}) != dataset_id);
+
+    chronos::test::write_file(scratch.path() / "bad.csv", "quote,AAPL,1100,100.00,3\n");
+    const Outcome bad = run("synthetic write --events " + shell_quoted(scratch.path() / "bad.csv") + " --catalog " +
+        shell_quoted(scratch.path() / "other") + " --stream-id s --scenario a --scenario-version 1");
+    REQUIRE(bad.status == 1);
+    REQUIRE(bad.output.find("expected a quote with 7 fields or a status with 4") != std::string::npos);
+    REQUIRE(bad.output.find("\"line\": \"1\"") != std::string::npos);
+}
+
+void test_malformed_synthetic_commands_are_refused() {
+    rejects("synthetic", "synthetic needs a subcommand: write");
+    rejects("synthetic generate", "synthetic needs a subcommand: write");
+    rejects("synthetic write --events e", "--catalog is required");
+    rejects("synthetic write --events e --catalog c --stream-id s --scenario Demo --scenario-version 1",
+        "--scenario must be 1 to 64 lowercase letters");
+    rejects("synthetic write --events e --catalog c --stream-id s --scenario demo --scenario-version 01",
+        "--scenario-version must be a version");
+    rejects("synthetic write --events e --events f", "--events may be provided only once");
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -193,5 +246,10 @@ int main(int argc, char* argv[]) {
         {"malformed label commands are refused", test_malformed_label_commands_are_refused},
         {"malformed split commands are refused", test_malformed_split_commands_are_refused},
         {"the pipeline round-trips through the command line", test_the_pipeline_round_trips_through_the_command_line},
+        {
+            "a synthetic scenario is published with its provenance",
+            test_a_synthetic_scenario_is_published_with_its_provenance,
+        },
+        {"malformed synthetic commands are refused", test_malformed_synthetic_commands_are_refused},
     });
 }

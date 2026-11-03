@@ -1221,6 +1221,7 @@ ResponseJson market_source_json(const market_data::MarketDataSourceStatus& sourc
     }
     ResponseJson json = ResponseJson::object();
     json["mode"] = market_data::mode_name(description.mode);
+    json["synthetic"] = description.synthetic;
     json["provider"] = nonempty_or_null(description.provider);
     json["feed"] = nonempty_or_null(description.feed);
     json["label"] = description.label;

@@ -71,6 +71,34 @@ print usage.
 `data/normalized/` is ignored by Git, so it is the natural catalog in a
 checkout. Datasets derived from licensed data must never be committed.
 
+### Synthetic datasets
+
+`chronos_dataset synthetic write` is the default build's production producer
+of synthetic data (ADR 0025). It writes an event table: one CSV line per
+invented quote or status, in ingest order. The format is documented in
+`datasets/include/chronos/datasets/event_table.hpp`. Its provenance says the
+events are synthetic:
+
+```sh
+./build/chronos_dataset synthetic write --events h1.csv --catalog data/normalized \
+  --stream-id chronos-demo-v1-h1 --scenario chronos.demo_scenario --scenario-version 1
+```
+
+- **Provider.** `synthetic`, the rule the research collection and the
+  server's replay both use to say so.
+- **Provider dataset.** The scenario's name, with schema `event_table`.
+- **Description.** `invented events of scenario <name> version <v>, not
+  market data`.
+- **Recording checksum.** The SHA-256 of the table's own bytes, read once,
+  so the bytes hashed are the bytes converted.
+- **Normalizer.** `chronos.synthetic.event_table` version 1, and no query
+  window.
+
+The test tool `chronos_synthetic_dataset` (BUILD_TESTING only) uses the same
+conversion with its own fixed provenance, so every test dataset keeps its
+identity. Production commands never run it. The demo workspace's scenario
+generator is `python/chronos_research/demo_scenario.py`.
+
 ## Directory and identity
 
 ```text

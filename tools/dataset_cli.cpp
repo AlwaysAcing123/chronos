@@ -6,6 +6,7 @@
 #include "feature_cli_commands.hpp"
 #include "label_cli_commands.hpp"
 #include "split_cli_commands.hpp"
+#include "synthetic_cli_commands.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -39,11 +40,15 @@ std::string usage() {
         "      [--train-percent 60] [--validation-percent 20] [--test-percent 20]\n"
         "      [--split-set chronological_purged_v1]\n"
         "  chronos_dataset splits list --output <DIR>\n"
-        "  chronos_dataset splits inspect --output <DIR> --artifact <ID> [--labels <DIR>]\n\n"
+        "  chronos_dataset splits inspect --output <DIR> --artifact <ID> [--labels <DIR>]\n"
+        "  chronos_dataset synthetic write --events <TABLE.csv> --catalog <DIR> --stream-id <ID>\n"
+        "      --scenario <NAME> --scenario-version <VERSION>\n\n"
         "Lists, verifies, and inspects normalized market datasets, extracts\n"
         "point-in-time features from them, labels features with future returns,\n"
         "and splits labels chronologically with purging. Every artifact is\n"
-        "immutable; nothing is ever overwritten.\n";
+        "immutable; nothing is ever overwritten. `synthetic write` publishes a\n"
+        "scenario's invented events as a dataset whose provenance says they are\n"
+        "synthetic, not market data.\n";
 }
 
 // --catalog/--dataset, read in that order.
@@ -122,6 +127,9 @@ int run(int argc, char* argv[]) {
     }
     if (command == "splits") {
         return chronos::split_cli::run(argc, argv);
+    }
+    if (command == "synthetic") {
+        return chronos::synthetic_cli::run(argc, argv);
     }
     if (command == "--help" || command == "-h") {
         throw cli::UsageError("");

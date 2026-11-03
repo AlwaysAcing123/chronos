@@ -1,18 +1,21 @@
 import type { ReactNode } from 'react';
 
-import { TRADING_HREF, comparisonsHref, modelsHref, researchHref } from '../../state/route';
+import { DEMO_ENABLED } from '../../state/demo';
+import { DEMO_HREF, TRADING_HREF, comparisonsHref, modelsHref, researchHref } from '../../state/route';
 import { SourceBar } from '../source/SourceBar';
 import { ConnectionStatus } from './ConnectionStatus';
 import { PaperBanner } from './PaperBanner';
 import styles from './shell.module.css';
 
-export type View = 'trading' | 'models' | 'comparisons' | 'research';
+export type View = 'trading' | 'models' | 'comparisons' | 'research' | 'demo';
 
 const VIEWS: readonly { readonly view: View; readonly label: string; readonly href: string }[] = [
   { view: 'trading', label: 'Trading', href: TRADING_HREF },
   { view: 'models', label: 'Models', href: modelsHref() },
   { view: 'comparisons', label: 'Comparisons', href: comparisonsHref() },
   { view: 'research', label: 'Research', href: researchHref() },
+  // Only a demo workspace's build has its guide (ADR 0025).
+  ...(DEMO_ENABLED ? [{ view: 'demo' as const, label: 'Guide', href: DEMO_HREF }] : []),
 ];
 
 export function AppShell({

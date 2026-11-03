@@ -1379,7 +1379,36 @@ Build a real-data-to-paper-account vertical slice in small, verified increments:
       made. The pilot plan of five ten-minute AAPL/SPY windows (four new,
       one existing) awaits free quotes and a human budget decision; until
       then the one real recording is verified and correctly refused for a
-      multi-session study.
+      multi-session study. The five-session pilot was later prepared under `data/real-pilot`, with
+      AAPL and SPY studies that the auditors pass (PR #29).
+17. **Complete (PR #30):** strategy diagnostics explain each walk-forward
+    run's PnL exactly (spread, fees, rounding, and the final bid mark) and its
+    decisions by cohort, without refitting or running anything, checked by an
+    independent standard-library auditor
+    ([docs/strategy-diagnostics.md](docs/strategy-diagnostics.md), ADR 0024).
+18. **Implemented, awaiting review:** a demo-ready local workspace
+    ([docs/demo-workspace.md](docs/demo-workspace.md), ADR 0025).
+    - **Replay.** The paper-trading server replays a verified normalized
+      dataset in every API build (`--replay-dataset`), refusing a dataset
+      that does not verify completely or does not match its stream and
+      instruments, and labelling a synthetic one as invented prices.
+    - **Seed.** A production producer and a versioned, deterministic
+      synthetic scenario of three historical sessions and a later 40-minute
+      playback session. One seed command runs the existing builders end to
+      end, each study and the diagnostics passing its independent auditor:
+      datasets, labels, baselines, two registered versions, a comparison, a
+      collection, walk-forward studies, and strategy diagnostics. It then
+      publishes a content-addressed navigation manifest with asserted
+      chronology.
+    - **One command.** `python3.12 tools/demo/chronos_demo.py start` runs a
+      foreground supervisor on an owned root, toolchain, ports, and Compose
+      PostgreSQL. Migrations are applied and verified explicitly. Each session
+      has its own database, and a session reopens as history, never a
+      rewind. Hard-kill orphans are refused, never killed.
+    - **Guide.** A demo-build-only guide of three flows over the real views.
+      It starts nothing and computes nothing.
+    - **Acceptance.** A real-stack browser and lifecycle suite, run natively
+      on Linux in CI.
 
 The repository currently implements type-specific fixed-point price, money,
 and quantity values; provider-independent market-event types; structured
@@ -1446,10 +1475,14 @@ reviewed and merged, as item 14 describes, and walk-forward evaluation with
 cost and latency scenarios is complete, as item 15 describes. Authorized
 acquisition of further real recordings for those studies is implemented,
 reviewed, and accepted, with real multi-session results pending a budget decision,
-as item 16 describes. Chronos does not yet implement boosted-tree or temporal models,
-authentication, or the Experiments and Data areas of the web application. A
-first, controlled model-driven deployment to dedicated paper accounts is
-implemented, as item 13 describes.
+as item 16 describes, and strategy diagnostics explain those studies' runs
+exactly, as item 17 describes. A one-command, isolated demo workspace with a
+guide through manual trading, model evaluation and paper deployment, and
+strategy diagnostics on real services over a synthetic scenario is
+implemented, as item 18 describes. Chronos does not yet implement
+boosted-tree or temporal models, authentication, or the Experiments and Data
+areas of the web application. A first, controlled model-driven deployment to
+dedicated paper accounts is implemented, as item 13 describes.
 
 ## 20. Post-submission OCaml learning and translation
 
